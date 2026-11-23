@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Syntax check Host and Client artifacts
+        run: |
+          node --check index.js
+          node --check client.js
+      - name: Run 30 end-to-end Smoke & Guardrail tests
+        run: node tools/smoke.mjs
+      - name: Run Tarball & Remote Install verification gate
+        run: node tools/verify-install.mjs

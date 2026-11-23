@@ -1,0 +1,66 @@
+{
+  "name": "dsh-swarm",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness out-of-tree Swarm plugin: 3-file append-only blackboard (board.jsonl, members.json, swarm.json + plan.json), zero-token swarm_wait with Stop-Hook race lock, polite 4-6 concurrency gate, and strict format guardrails for glm5.3 / deepseek4.1f.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MISTYEYE2088/dsh-swarm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MISTYEYE2088/dsh-swarm/issues"
+  },
+  "homepage": "https://github.com/MISTYEYE2088/dsh-swarm#readme",
+  "type": "module",
+  "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "src",
+    "tools",
+    "cordis.patch.yml",
+    "SPEC.md",
+    "README.md",
+    "README.zh.md",
+    "CHANGELOG.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node tools/smoke.mjs",
+    "test:boot": "node tools/boot-check.mjs /mnt/c/portable_software/dsh/deepseek-harness/vendor/cordis",
+    "verify:install": "node tools/verify-install.mjs"
+  },
+  "engines": {
+    "node": ">=22.19"
+  },
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "swarm",
+    "multi-agent",
+    "blackboard"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-session",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "compatibility": {
+      "dshReleases": {
+        "0.2.0-rc.2": "compatible"
+      }
+    }
+  }
+}
