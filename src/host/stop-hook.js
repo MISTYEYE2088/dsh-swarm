@@ -78,8 +78,7 @@ export function handleTurnStopping({
     }
   }
 
-  // Case 2: Safeguard — worker, architect, or verifier finished its step
-  // without calling `swarm_wait`.
+  // Case 2: Safeguard — worker, architect, or verifier finished its step without calling `swarm_wait`.
   if (
     (member.role === 'worker' || member.role === 'architect' || member.role === 'verifier')
     && turnState
@@ -87,7 +86,7 @@ export function handleTurnStopping({
     && (turnState.unparkedBlockCount ?? 0) < maxUnparkedBlocks
   ) {
     turnState.unparkedBlockCount = (turnState.unparkedBlockCount ?? 0) + 1
-    const notice = `Stop hook blocked termination: 你尚未调用 post_board 汇报结果，也没有调用 swarm_wait({"since": ${member.last_read_seq ?? 0}}) 进入休眠！请先发帖交接，然后必须调用 swarm_wait 结束本轮。`
+    const notice = `Stop hook blocked termination: you have not called swarm_wait({"since": ${member.last_read_seq ?? 0}, "mentions_only": true}) to park! Post your handoff via post_board (with a meaningful title) if needed, then end your turn by calling swarm_wait.`
     agent.steer(buildSwarmSystemMessage(notice, 'Stop hook: missing swarm_wait'))
     return {
       blocked: true,
@@ -116,7 +115,6 @@ export function statusOf(member, {
     return { status: 'daemon', stepSummary: 'Background watchdog timer (0 token standby)' }
   }
 
-  // Surface any recorded turn/adapter error immediately instead of masking it as 'working' or 'waiting'
   if (member.last_error) {
     const code = member.last_error.code || 'ERROR'
     const msg = member.last_error.message || String(member.last_error)
@@ -143,7 +141,6 @@ export function statusOf(member, {
     }
   }
 
-  // Inspect tail of sessionEvents (analogous to reading the tail of transcript.jsonl)
   let latestStepSummary = null
   let lastTurnClosed = true
   let lastTurnError = null
@@ -211,7 +208,6 @@ export function statusOf(member, {
   const createdMs = member.created_at ? Date.parse(member.created_at) : NaN
   const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : 0
 
-  // Distinguish never-started / zombie members from genuinely parked `waiting` members
   if (member.role !== 'coordinator' && turns === 0 && lastPost === 0) {
     if (member.spawned_live_agent === true && !liveAgent) {
       return {

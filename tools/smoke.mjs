@@ -182,7 +182,7 @@ async function test_plan_json_size_guard() {
 async function test_validator_rejects_excessive_concurrency() {
   const bad = validateSwarmInit({ title: 'Invalid swarm', concurrency_limit: 0 })
   assert.equal(bad.ok, false)
-  assert.match(bad.error, /正整数/)
+  assert.match(bad.error, /positive integer/i)
 
   // High concurrency and large worker batch (no artificial cap) must succeed
   const high = validateSwarmInit({ title: 'Large parallel swarm', concurrency_limit: 16 })
@@ -251,23 +251,23 @@ async function test_validator_rejects_unaddressed_worker_post() {
     verifier: { role: 'verifier', killed: false },
   }
   const res = validatePostBoard(
-    { text: 'I finished checking the templates and found a bug.' },
+    { title: 'Template check findings ready', text: 'I finished checking the templates and found a bug.' },
     members,
     'worker-1',
   )
   assert.equal(res.ok, false)
-  assert.match(res.error, /必须至少点名一个接收人/)
+  assert.match(res.error, /must address at least one recipient/)
 }
 
 async function test_validator_rejects_channel_main_broadcast() {
   const members = { coordinator: { role: 'coordinator', killed: false } }
   const res = validatePostBoard(
-    { text: 'Hello @#main everyone wake up!' },
+    { title: 'Broadcast to main channel test', text: 'Hello @#main everyone wake up!' },
     members,
     'coordinator',
   )
   assert.equal(res.ok, false)
-  assert.match(res.error, /严禁发送 @#main/)
+  assert.match(res.error, /Forbidden @#main/)
 }
 
 async function test_validator_rejects_mentioning_killed_member() {
@@ -277,12 +277,12 @@ async function test_validator_rejects_mentioning_killed_member() {
     'new-worker': { role: 'worker', killed: false },
   }
   const res = validatePostBoard(
-    { text: '@old-worker please check this', mentions: ['old-worker'] },
+    { title: 'Follow-up check on dead worker', text: '@old-worker please check this', mentions: ['old-worker'] },
     members,
     'coordinator',
   )
   assert.equal(res.ok, false)
-  assert.match(res.error, /已经被销毁（killed）/)
+  assert.match(res.error, /retired \(killed\)/)
 }
 
 async function test_validator_blocks_wait_ahead_of_last_read_seq() {
@@ -750,7 +750,7 @@ async function test_client_tokenize_board_text() {
   assert.ok(loadedMod, 'client.js did not register with window.__ModuleLoader__')
   assert.deepEqual([...loadedMod.inject], ['slots'])
 
-  const tokens = loadedMod.tokenizeBoardText('请 @verifier 对照 #5 和 #6 在 @#render 频道复核')
+  const tokens = loadedMod.tokenizeBoardText('Please @verifier review #5 and #6 in @#render channel')
   assert.equal(tokens.some(t => t.kind === 'mention' && t.target === 'verifier'), true)
   assert.equal(tokens.some(t => t.kind === 'ref' && t.seq === 5), true)
   assert.equal(tokens.some(t => t.kind === 'ref' && t.seq === 6), true)
@@ -1046,11 +1046,11 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.0/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.1/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
-  // R6: @monitor is auto-registered in members.json and can be mentioned in post_board;
+  // R6: @monitor can be mentioned in post_board;
   // verifier waiting on a silent worker must NOT be false-flagged as stalled!
   runtime.store.registerMemberWithBrief('sess-r0', {
     name: 'worker-1',
@@ -1074,7 +1074,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
   assert.equal(stallWhileWorkerSilent.target, 'worker-1', 'Verifier must not be blamed while worker-1 has last_post_seq=0')
 
   const mentionMonitorCheck = validatePostBoard(
-    { text: '@monitor 已知悉状态，继续等待', mentions: ['monitor'] },
+    { title: 'Acknowledge watchdog status', text: '@monitor acknowledged status, continuing wait', mentions: ['monitor'] },
     runtime.store.readMembers('sess-r0'),
     'coordinator',
   )
@@ -1103,14 +1103,14 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.0/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.1/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
 
   // R8: Posting [done] archives the 4-file blackboard into swarm/archive/<id>_.../
   const doneRes = await registeredTools.get('post_board').execute(
-    { text: '[done] 测试完成并归档', kind: 'done', mentions: ['coordinator'] },
+    { title: 'Close swarm and archive artifacts', text: '[done] Test run complete and archived', kind: 'done', mentions: ['coordinator'] },
     { agent: callerAgent },
   )
   assert.equal(doneRes.ok, true)
@@ -1184,7 +1184,7 @@ async function test_concurrent_post_board_and_session_events_zero_duplicates() {
       // Interleave concurrent session/event tool calls right alongside post_board calls
       onEvent({ id: `sess-stress__w-${w}` }, { type: 'tool/call', seq: k, data: { name: 'read', arguments: '{}' } })
       jobs.push(postTool.execute(
-        { text: `@coordinator worker ${w} step ${k} completed cleanly`, mentions: ['coordinator'], kind: 'report' },
+        { title: `Worker ${w} step ${k} milestone`, text: `@coordinator worker ${w} step ${k} completed cleanly`, mentions: ['coordinator'], kind: 'report' },
         { agent: wAgent },
       ))
     }
@@ -1200,7 +1200,7 @@ async function test_concurrent_post_board_and_session_events_zero_duplicates() {
 
   // Retry identical post -> deduplicated cleanly without creating #45!
   const dupRes = await postTool.execute(
-    { text: '@coordinator worker 1 step 1 completed cleanly', mentions: ['coordinator'], kind: 'report' },
+    { title: 'Worker 1 step 1 milestone', text: '@coordinator worker 1 step 1 completed cleanly', mentions: ['coordinator'], kind: 'report' },
     { agent: { id: 'sess-stress__w-1' } },
   )
   assert.equal(dupRes.ok, true)
@@ -1246,7 +1246,7 @@ async function test_atomic_swarm_add_rollback_and_never_started_kill_releases_na
     { agent: coordAgent },
   )
   assert.equal(failRes.ok, false)
-  assert.match(failRes.text, /已自动回滚/)
+  assert.match(failRes.text, /rolled back/)
   assert.equal(runtime.store.readMembers('sess-atom')['arch-v2'], undefined)
   assert.equal(runtime.store.readBoard('sess-atom').length, 0)
 
@@ -1349,7 +1349,7 @@ async function test_noise_reduction_wake_kinds_escalate_silent_and_prose_mention
   const workerAgent = { id: 'sess-noise__impl-a' }
   // 1. Routine report @coordinator -> filtered by wake_kinds, does NOT wake Coordinator!
   const repRes = await registeredTools.get('post_board').execute(
-    { text: '@coordinator 常规进度更新，顺便提一下下一波的 @future-qa 成员', mentions: ['coordinator'], kind: 'report' },
+    { title: 'Routine core progress with future QA note', text: '@coordinator Routine progress note; next wave @future-qa will review', mentions: ['coordinator'], kind: 'report' },
     { agent: workerAgent },
   )
   assert.equal(repRes.ok, true)
@@ -1360,7 +1360,7 @@ async function test_noise_reduction_wake_kinds_escalate_silent_and_prose_mention
 
   // 2. Same kind `report` with `escalate: true` -> bypasses wake_kinds and wakes Coordinator!
   const escRes = await registeredTools.get('post_board').execute(
-    { text: '@coordinator 紧急升级：环境端口冲突需要拍板', mentions: ['coordinator'], kind: 'report', escalate: true },
+    { title: 'Escalation: test port conflict blocks run', text: '@coordinator Urgent escalation: port conflict needs decision', mentions: ['coordinator'], kind: 'report', escalate: true },
     { agent: workerAgent },
   )
   assert.equal(escRes.ok, true)
@@ -1369,7 +1369,7 @@ async function test_noise_reduction_wake_kinds_escalate_silent_and_prose_mention
 
   // 3. Silent log post with empty mentions -> allowed!
   const silentRes = await registeredTools.get('post_board').execute(
-    { text: '本地中间测试日志已保存至 scratch/out.log', silent: true, kind: 'report' },
+    { title: 'Saved intermediate trace log to scratch', text: 'Intermediate test log saved to scratch/out.log', silent: true, kind: 'report' },
     { agent: workerAgent },
   )
   assert.equal(silentRes.ok, true)
@@ -1404,14 +1404,14 @@ async function test_merge_gate_reject_approve_override_and_supersedes_read_filte
 
   // QA posts a rejection
   const rejRes = await postTool.execute(
-    { text: '@impl-core [REJECT] 射程断言未通过，请修复', mentions: ['impl-core'], kind: 'review', verdict: 'reject' },
+    { title: 'REJECT: tower range assertion failed', text: '@impl-core [REJECT] Tower range assertion failed; please fix', mentions: ['impl-core'], kind: 'review', verdict: 'reject' },
     { agent: qaAgent },
   )
   assert.equal(rejRes.ok, true)
 
   // Coordinator tries to post `[done]` while rejection is open -> BLOCKED by runtime gate!
   const blockedDone = await postTool.execute(
-    { text: '[done] 尝试直接结案', kind: 'done', mentions: ['coordinator'] },
+    { title: 'Attempt premature swarm close', text: '[done] Trying to close before fix', kind: 'done', mentions: ['coordinator'] },
     { agent: coordAgent },
   )
   assert.equal(blockedDone.ok, false)
@@ -1419,7 +1419,7 @@ async function test_merge_gate_reject_approve_override_and_supersedes_read_filte
 
   // QA posts a new decision superseding the rejection AND approves
   const appRes = await postTool.execute(
-    { text: '@coordinator [VERDICT: ALL PASS] 复测通过', mentions: ['coordinator'], kind: 'review', verdict: 'approve', supersedes: [rejRes.seq] },
+    { title: 'ALL PASS: range fix verified across suite', text: '@coordinator [VERDICT: ALL PASS] Retest passed', mentions: ['coordinator'], kind: 'review', verdict: 'approve', supersedes: [rejRes.seq] },
     { agent: qaAgent },
   )
   assert.equal(appRes.ok, true)
@@ -1436,7 +1436,7 @@ async function test_merge_gate_reject_approve_override_and_supersedes_read_filte
 
   // Now `[done]` succeeds!
   const okDone = await postTool.execute(
-    { text: '[done] 全部门禁通过，结案归档', kind: 'done', mentions: ['coordinator'] },
+    { title: 'All gates passed; closing and archiving swarm', text: '[done] All gates passed; archived', kind: 'done', mentions: ['coordinator'] },
     { agent: coordAgent },
   )
   assert.equal(okDone.ok, true)
@@ -1497,6 +1497,131 @@ async function test_project_root_subdir_git_worktree_isolation() {
   assert.equal(killClean.ok, true)
 }
 
+// ---------------------------------------------------------------------------
+// 9. v0.3.1 Meaningful Titles, Round-Table Topology Aging, and Zero-CJK Guard
+// ---------------------------------------------------------------------------
+
+async function test_validator_enforces_meaningful_post_title() {
+  const members = {
+    coordinator: { role: 'coordinator', killed: false },
+    'impl-1': { role: 'worker', killed: false },
+  }
+  const missingTitle = validatePostBoard(
+    { text: '@coordinator Completed work cleanly', mentions: ['coordinator'] },
+    members,
+    'impl-1',
+  )
+  assert.equal(missingTitle.ok, false)
+  assert.match(missingTitle.error, /title/)
+
+  const genericTitle = validatePostBoard(
+    { title: 'Update', text: '@coordinator Completed work cleanly', mentions: ['coordinator'] },
+    members,
+    'impl-1',
+  )
+  assert.equal(genericTitle.ok, false)
+  assert.match(genericTitle.error, /generic/i)
+
+  const goodTitle = validatePostBoard(
+    { title: 'Freeze combat tick API and pass 24 smoke tests', text: '@coordinator Ready for QA review', mentions: ['coordinator'] },
+    members,
+    'impl-1',
+  )
+  assert.equal(goodTitle.ok, true)
+  assert.equal(goodTitle.value.title, 'Freeze combat tick API and pass 24 smoke tests')
+}
+
+async function test_client_round_table_edge_aging_and_layout() {
+  const code = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedMod = null
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load(spec) { loadedMod = spec.factory(() => null) },
+      },
+    },
+    console: { info() {}, warn() {}, error() {} },
+    Set,
+    Map,
+    Object,
+    Array,
+    Number,
+    String,
+    Symbol,
+    Math,
+  }
+  vm.runInNewContext(code, sandbox, { filename: 'client.js' })
+
+  // 1. Verify aging style: step 0 = bright yellow #facc15 @ opacity 1, older steps darken & fade out, >= 8 disappears
+  const latest = loadedMod.computeEdgeVisualStyle(0)
+  assert.equal(latest.visible, true)
+  assert.equal(latest.isLatest, true)
+  assert.equal(latest.color, '#facc15')
+  assert.equal(latest.opacity, 1.0)
+
+  let prevOpacity = latest.opacity
+  for (let age = 1; age < 8; age += 1) {
+    const st = loadedMod.computeEdgeVisualStyle(age)
+    assert.equal(st.visible, true)
+    assert.equal(st.isLatest, false)
+    assert.ok(st.opacity < prevOpacity, `opacity must strictly decrease at age=${age}`)
+    prevOpacity = st.opacity
+  }
+  const gone = loadedMod.computeEdgeVisualStyle(8)
+  assert.equal(gone.visible, false)
+  assert.equal(gone.opacity, 0)
+
+  // 2. Verify Round-Table layout pins coordinator at 12 o'clock and orders latest yellow edge last (top z-order)
+  const members = [
+    { name: 'impl-ui', role: 'worker', status: 'working', killed: false },
+    { name: 'coordinator', role: 'coordinator', status: 'waiting', killed: false },
+    { name: 'arch-lead', role: 'architect', status: 'waiting', killed: false },
+    { name: 'qa-gate', role: 'verifier', status: 'waiting', killed: false },
+  ]
+  const events = []
+  for (let seq = 1; seq <= 10; seq += 1) {
+    events.push({
+      seq,
+      from: seq % 2 === 0 ? 'arch-lead' : 'impl-ui',
+      to: seq % 2 === 0 ? 'impl-ui' : 'qa-gate',
+      kind: 'report',
+      title: `Round ${seq} update`,
+    })
+  }
+  const layout = loadedMod.computeRoundTableLayout(members, events, 10)
+  assert.equal(layout.seats[0].name, 'coordinator', 'Coordinator must sit at 12 o\'clock (index 0)')
+  assert.equal(layout.seats.length, 4)
+  // Floors 1 and 2 are >= 8 steps old (ages 9 and 8) and must have faded out completely!
+  assert.equal(layout.edges.some(e => e.seq <= 2), false)
+  assert.equal(layout.edges.length, 8)
+  const topEdge = layout.edges[layout.edges.length - 1]
+  assert.equal(topEdge.seq, 10)
+  assert.equal(topEdge.style.isLatest, true)
+  assert.equal(topEdge.style.color, '#facc15')
+}
+
+async function test_plugin_runtime_contains_zero_cjk_characters() {
+  const rootDir = fileURLToPath(new URL('..', import.meta.url))
+  const runtimeFiles = [
+    'index.js',
+    'client.js',
+    'src/host/store.js',
+    'src/host/validators.js',
+    'src/host/stop-hook.js',
+    'src/host/monitor.js',
+    'src/host/prompts.js',
+    'src/host/tools.js',
+    'src/host/worktree.js',
+    'src/host/concurrency-gate.js',
+  ]
+  const cjkRegex = /[\u4e00-\u9fff]/
+  for (const rel of runtimeFiles) {
+    const content = fs.readFileSync(path.join(rootDir, rel), 'utf8')
+    const match = cjkRegex.exec(content)
+    assert.equal(match, null, `${rel} must contain zero CJK characters (found "${match?.[0]}" at index ${match?.index})`)
+  }
+}
+
 // Run all tests
 try {
   await runTest('test_atomic_store_roundtrip', test_atomic_store_roundtrip)
@@ -1539,6 +1664,9 @@ try {
   await runTest('test_noise_reduction_wake_kinds_escalate_silent_and_prose_mentions', test_noise_reduction_wake_kinds_escalate_silent_and_prose_mentions)
   await runTest('test_merge_gate_reject_approve_override_and_supersedes_read_filter', test_merge_gate_reject_approve_override_and_supersedes_read_filter)
   await runTest('test_project_root_subdir_git_worktree_isolation', test_project_root_subdir_git_worktree_isolation)
+  await runTest('test_validator_enforces_meaningful_post_title', test_validator_enforces_meaningful_post_title)
+  await runTest('test_client_round_table_edge_aging_and_layout', test_client_round_table_edge_aging_and_layout)
+  await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.1 (2026-11-23)
+
+- **Mandatory Meaningful Board Titles & Collapsible Rightbar Cards**:
+  - `post_board` now requires a meaningful `title` (`4..100` chars; rejects empty or generic placeholders like `"update"` / `"report"` / `"done"`), stored on every `board.jsonl` post and rendered in `read_board` and `edgeEvents`.
+  - In the `Crs0CG_rightbarCol` Board tab (`client.js`), all messages render **collapsed by default** showing `#seq · title`, author/badges, timestamp, and an explicit Expand/Collapse (`▸ Open` / `▾ Hide`) toggle button immediately to the right of the timestamp (plus `Expand All` / `Collapse All` and auto-expand on `#seq` jumps).
+- **100% English Runtime & UI (Zero CJK Characters)**:
+  - Translated all prompts (`src/host/prompts.js`), tool descriptions/outputs (`src/host/tools.js`), validators (`src/host/validators.js`), watchdog alerts (`src/host/monitor.js`), stop-hook notices (`src/host/stop-hook.js`), worktree errors (`src/host/worktree.js`), host entry (`index.js`), and browser UI (`client.js`) to clean English so multilingual models respond in the user's own language instead of being nudged by plugin strings.
+- **Round-Table SVG Topology with Aging Yellow-to-Faded Arrows**:
+  - Replaced the abstract list in the Topology tab with an interactive **Round-Table SVG** (`computeRoundTableLayout` + `computeEdgeVisualStyle`): members sit evenly around the blackboard circle (`coordinator` pinned at 12 o'clock), the latest round's directed arrow(s) render in **bright yellow (`#facc15`, opacity `1.0`)** with a `#seq` pill on top, and each older step progressively darkens and lowers opacity until fading out completely.
+
 ## 0.3.0 (2026-11-23)
 
 - **P0 Reliability — Zero False Board Errors & Duplicate Posts (D-01)**:

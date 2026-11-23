@@ -36,6 +36,21 @@ export function formatTime(now = new Date()) {
   return now.toISOString().replace('T', ' ').slice(0, 19)
 }
 
+/** Derive a concise fallback title from the first meaningful line of a post body. */
+export function deriveFallbackTitle(text, fallback = 'Board update') {
+  if (typeof text !== 'string' || text.trim().length === 0) return fallback
+  const firstLine = text
+    .split('\n')
+    .map(l => l.trim())
+    .find(l => l.length > 0) || ''
+  const cleaned = firstLine
+    .replace(/^(?:@#?[a-z0-9][a-z0-9_-]*\s*)+/i, '')
+    .replace(/^#+\s*/, '')
+    .trim()
+  if (cleaned.length >= 4) return cleaned.slice(0, 96)
+  return firstLine.slice(0, 96) || fallback
+}
+
 /** Resolve default swarm storage root under DSH_HOME or ~/.dsh/swarm. */
 export function defaultSwarmRoot(env = process.env) {
   const dshHome = typeof env.DSH_HOME === 'string' && env.DSH_HOME.length > 0
@@ -68,8 +83,6 @@ export function writeJsonAtomicSync(filePath, value) {
         if (attempt < delays.length) sleepSync(delays[attempt])
       }
     }
-    // Final Windows-NTFS fallback: if antivirus/indexer held a rename lock on the target,
-    // write directly in place so we never lose state or crash after board.jsonl succeeded.
     if (lastErr && RETRYABLE_FS_CODES.has(lastErr.code)) {
       fs.writeFileSync(filePath, payload, 'utf8')
       return
@@ -478,7 +491,7 @@ export class SwarmStore {
     return null
   }
 
-  // #FUNC Append one post or channel control frame to `board.jsonl` with a monotonic `seq`.
+  // #FUNC Append one post (with a meaningful `title`) or channel control frame to `board.jsonl` with a monotonic `seq`.
   // #NOT  Does not allow duplicate seq numbers or multi-line unescaped JSON records.
   // #EDGE-IN Mentioning `@group` expands to all active members of that group → test_post_board_group_and_cursor
   // #WHY  `last_post_seq` is updated on the author's member record here so the Watchdog can distinguish real replies from failed turns.
@@ -528,6 +541,9 @@ export class SwarmStore {
       const supersedes = Array.isArray(entry.supersedes)
         ? [...new Set(entry.supersedes.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1 && n < nextSeq))]
         : []
+      const resolvedTitle = typeof entry.title === 'string' && entry.title.trim().length > 0
+        ? entry.title.trim().slice(0, 100)
+        : deriveFallbackTitle(entry.text, entry.kind ? `${entry.kind} update` : 'Board update')
 
       record = {
         seq: nextSeq,
@@ -538,6 +554,7 @@ export class SwarmStore {
         ...(allChannelMentions.length > 0 ? { channel_mentions: allChannelMentions } : {}),
         refs,
         kind: entry.kind ?? 'report',
+        title: resolvedTitle,
         ...(entry.verdict && VALID_VERDICTS.includes(entry.verdict) ? { verdict: entry.verdict } : {}),
         ...(supersedes.length > 0 ? { supersedes } : {}),
         ...(entry.escalate === true ? { escalate: true } : {}),
@@ -589,7 +606,10 @@ export class SwarmStore {
       ? Boolean(spec.can_block_merge)
       : (role === 'verifier' || role === 'architect')
 
-    // First post the public brief on board.jsonl so every member and verifier can cite its #seq
+    const briefTitle = typeof spec.title === 'string' && spec.title.trim()
+      ? spec.title.trim().slice(0, 100)
+      : `Brief: @${spec.name} (${role})`
+
     const briefPost = this.appendBoardRecord(swarmId, {
       type: 'post',
       agent: spec.parent ?? 'coordinator',
@@ -597,6 +617,7 @@ export class SwarmStore {
       mentions: [spec.name],
       skip_prose_mention_extraction: true,
       kind: 'brief',
+      title: briefTitle,
       text: `@${spec.name} ${spec.brief}`,
     })
 
@@ -616,7 +637,7 @@ export class SwarmStore {
       workspace_mode: spec.workspace_mode ?? 'inherit',
       worktree_path: spec.worktree_path ?? null,
       base_commit: spec.base_commit ?? null,
-      baseline_tree: spec.baseline_tree ?? null,
+      baseline_tree: spec.baseline_commit ?? spec.baseline_tree ?? null,
       fork_from: spec.fork_from ?? null,
       spawned_live_agent: spec.spawned_live_agent === true,
       wake_mode: 'working',
@@ -638,8 +659,6 @@ export class SwarmStore {
       created_at: nowIso,
     }
 
-    // Opening-brief noise guard: any sibling worker that hasn't posted yet and hasn't read beyond
-    // the opening brief batch gets its `last_read_seq` bumped past this brief too.
     const records = this.readBoard(swarmId)
     const allBriefsSoFar = records.every(r => r.type === 'control' || r.kind === 'brief')
     if (allBriefsSoFar) {
@@ -657,8 +676,6 @@ export class SwarmStore {
 
   /**
    * Compute unresolved `[REJECT]` merge-gate blocks from active members with `can_block_merge === true`.
-   * A reviewer's rejection stays active until that reviewer posts `verdict: "approve"` (or a review
-   * containing `[VERDICT: ALL PASS]` / `[APPROVE]`) or until the rejection post is superseded.
    */
   computeActiveRejections(swarmId) {
     const records = this.readBoard(swarmId)
@@ -687,6 +704,7 @@ export class SwarmStore {
             seq: rec.seq,
             reviewer: rec.agent,
             role: author.role,
+            title: rec.title || deriveFallbackTitle(text, 'Rejection'),
             mentions: rec.mentions ?? [],
             time: rec.time,
             summary: text.slice(0, 180),
@@ -722,11 +740,7 @@ export class SwarmStore {
     return readJsonSync(this.pathsOf(swarmId).planJson, null)
   }
 
-  /**
-   * Copy `swarm.json`, `board.jsonl`, `members.json`, and `plan.json` into
-   * `<baseDir>/archive/<swarmId>_gen<gen>_<timestamp>_<reason>/` so evidence
-   * is preserved even after a swarm closes or resets.
-   */
+  /** Copy blackboard files into `<baseDir>/archive/<swarmId>_gen<gen>_<timestamp>_<reason>/`. */
   archiveSwarm(swarmId, reason = 'done') {
     if (!this.exists(swarmId)) return null
     const srcPaths = this.pathsOf(swarmId)
@@ -745,11 +759,7 @@ export class SwarmStore {
     return archiveDir
   }
 
-  /**
-   * Resolve which active members are addressed by a board post,
-   * accounting for `@name`, `@group`, `@#channel` (via event-sourced `replayChannelsAt`),
-   * `@all`, and members with `wake_mode === 'anything'`.
-   */
+  /** Resolve which active members are addressed by a board post. */
   resolveTargetsForPost(swarmId, postRecord) {
     if (!postRecord || postRecord.type === 'control') return []
     if (postRecord.silent === true) return []
@@ -764,19 +774,16 @@ export class SwarmStore {
 
     for (const [name, member] of Object.entries(members)) {
       if (member.killed) continue
-      if (name === postRecord.agent) continue // Never self-wake
+      if (name === postRecord.agent) continue
 
-      // 1. Direct @name
       if (mentionedTokens.has(name)) {
         targets.add(name)
         continue
       }
-      // 2. Sharded group @group (e.g. @fixer wakes fixer-1, fixer-2)
       if (member.group && mentionedTokens.has(member.group)) {
         targets.add(name)
         continue
       }
-      // 3. @#channel (wakes members subscribed to that channel at this seq)
       const subs = new Set(channelState.subscriptionsOf(name))
       let channelHit = false
       for (const ch of mentionedChannels) {
@@ -789,12 +796,10 @@ export class SwarmStore {
         targets.add(name)
         continue
       }
-      // 4. @all (wakes everyone except monitor)
       if (isAll && member.role !== 'monitor') {
         targets.add(name)
         continue
       }
-      // 5. Members sleeping in `anything` mode on a subscribed channel
       if (member.wake_mode === 'anything' && subs.has(postRecord.channel || 'main')) {
         targets.add(name)
       }
@@ -803,10 +808,7 @@ export class SwarmStore {
     return [...targets]
   }
 
-  /**
-   * Partition addressed members into `wakeTargets` vs `silentTargets` using each recipient's
-   * `wake_kinds` filter (from `swarm_wait`) and the post's `escalate` flag.
-   */
+  /** Partition addressed members into `wakeTargets` vs `silentTargets` using `wake_kinds` and `escalate`. */
   resolveWakeRoutingForPost(swarmId, postRecord) {
     if (!postRecord || postRecord.type === 'control' || postRecord.silent === true) {
       return { wakeTargets: [], silentTargets: [] }
@@ -832,10 +834,7 @@ export class SwarmStore {
     return { wakeTargets, silentTargets }
   }
 
-  /**
-   * Query unread posts for `memberName` after `sinceSeq` on subscribed channels
-   * (or any post that directly `@mentioned` the member), optionally filtering by `wakeKinds`.
-   */
+  /** Query unread posts for `memberName` after `sinceSeq` on subscribed channels. */
   queryVisiblePosts(swarmId, memberName, sinceSeq = 0, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)

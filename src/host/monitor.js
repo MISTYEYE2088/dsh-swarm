@@ -48,7 +48,8 @@ export function detectMemberHealthIssues({
         target: 'coordinator',
         seq: member.brief_seq ?? 0,
         signature: `member_error:${name}:${errCode}`,
-        prompt: `@coordinator [WATCHDOG_ALERT] 成员 @${name} 执行异常中止 (${errCode}: ${errMsg})，turns=${member.turn_count ?? 0}，last_post_seq=${member.last_post_seq ?? 0}。请调用 swarm_status 查看详情，执行模型热切 (swarm_model) 或 swarm_kill 清理后降级处理。`,
+        title: `Watchdog alert: @${name} crashed (${errCode})`,
+        prompt: `@coordinator [WATCHDOG_ALERT] Member @${name} aborted with an error (${errCode}: ${errMsg}), turns=${member.turn_count ?? 0}, last_post_seq=${member.last_post_seq ?? 0}. Inspect via swarm_status, hot-swap via swarm_model, or retire via swarm_kill.`,
       })
       continue
     }
@@ -67,7 +68,8 @@ export function detectMemberHealthIssues({
         target: 'coordinator',
         seq: member.brief_seq ?? 0,
         signature: `member_zombie:${name}:${member.brief_seq ?? 0}`,
-        prompt: `@coordinator [WATCHDOG_ALERT] 成员 @${name} 疑似僵尸/未启动（status=${liveness.status}, turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}, 已创建 ${Math.round(ageMs / 1000)}s）。请调用 swarm_status 核查，并用 swarm_kill 清理（从未启动的成员将直接释放原名可立即重建）。`,
+        title: `Watchdog alert: @${name} zombie/never-started`,
+        prompt: `@coordinator [WATCHDOG_ALERT] Member @${name} appears to be a zombie / never started (status=${liveness.status}, turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}, age=${Math.round(ageMs / 1000)}s). Inspect via swarm_status and clean up via swarm_kill (never-started members release their name for reuse).`,
       })
     }
   }
@@ -119,11 +121,11 @@ export function detectSwarmStall({
       target: first.target,
       seq: first.seq || latestPost?.seq || 0,
       signature: first.signature,
+      title: first.title,
       prompt: first.prompt,
     }
   }
 
-  // For global stall checks, skip (0 token cost) if ANY non-monitor member is currently working, queued, or freshly starting
   for (const [name, member] of Object.entries(members)) {
     if (member.killed || member.role === 'monitor') continue
     const liveness = typeof getMemberLiveness === 'function'
@@ -146,7 +148,8 @@ export function detectSwarmStall({
       target: 'coordinator',
       seq: 0,
       signature: 'all_idle_no_posts:coordinator:0',
-      prompt: '@coordinator [stall] 黑板尚无任何任务帖子且全员处于空闲状态，请派发任务或结束 Swarm。',
+      title: 'Stall alert: empty board and all members idle',
+      prompt: '@coordinator [stall] The board has no posts yet and all members are idle. Dispatch tasks or close the Swarm.',
     }
   }
 
@@ -167,7 +170,8 @@ export function detectSwarmStall({
       target,
       seq: latestPost.seq,
       signature: `orphan_report:${target}:${latestPost.seq}`,
-      prompt: `@${target} [stall] @${latestPost.agent} 在 #${latestPost.seq} 提交了结果但未点名接收人，请查阅 #${latestPost.seq} 并推进。`,
+      title: `Stall alert: unaddressed post #${latestPost.seq} by @${latestPost.agent}`,
+      prompt: `@${target} [stall] @${latestPost.agent} posted #${latestPost.seq} without addressing a recipient. Please inspect #${latestPost.seq} and advance the workflow.`,
     }
   }
 
@@ -185,7 +189,8 @@ export function detectSwarmStall({
         target: 'coordinator',
         seq: newestToCoord.seq,
         signature: `coordinator_unread:coordinator:${newestToCoord.seq}`,
-        prompt: `@coordinator [stall] 成员 @${newestToCoord.agent} 已在 #${newestToCoord.seq} 向你汇报，全组当前处于等待状态，请调用 read_board 查阅并推进。`,
+        title: `Stall alert: unread report #${newestToCoord.seq} for @coordinator`,
+        prompt: `@coordinator [stall] Member @${newestToCoord.agent} reported to you at #${newestToCoord.seq} while the entire team is idle. Call read_board and advance.`,
       }
     }
   }
@@ -201,7 +206,6 @@ export function detectSwarmStall({
     for (const targetName of targets) {
       const targetMember = members[targetName]
       if (!targetMember || targetMember.killed || targetMember.role === 'monitor') continue
-      // Do NOT false-alarm a verifier on its opening brief while upstream workers have not posted any report yet!
       if (targetMember.role === 'verifier' && post.kind === 'brief' && hasSilentActiveWorkers) {
         continue
       }
@@ -212,7 +216,8 @@ export function detectSwarmStall({
           target: targetName,
           seq: post.seq,
           signature: `mentioned_silent:${targetName}:${post.seq}`,
-          prompt: `@${targetName} [stall] 你在 #${post.seq} 被 @${post.agent} 点名，但至今尚未发帖回复（last_post_seq=${targetMember.last_post_seq ?? 0}）。请调用 read_board({"since": ${targetMember.last_read_seq ?? 0}}) 查看并交卷，或 @coordinator 说明阻塞原因。`,
+          title: `Stall alert: @${targetName} has not replied to #${post.seq}`,
+          prompt: `@${targetName} [stall] You were mentioned by @${post.agent} at #${post.seq} but have not replied (last_post_seq=${targetMember.last_post_seq ?? 0}). Call read_board({"since": ${targetMember.last_read_seq ?? 0}}) and respond, or @coordinator if blocked.`,
         }
       }
     }
@@ -225,7 +230,8 @@ export function detectSwarmStall({
     target: 'coordinator',
     seq: latestPost.seq,
     signature: `all_idle:coordinator:${latestPost.seq}`,
-    prompt: `@coordinator [stall] 全组停在 #${latestPost.seq} 且无活跃成员在运行，请检查 git status 或各成员进度，推进下一波或发 [done] 收官。`,
+    title: `Stall alert: all members idle after #${latestPost.seq}`,
+    prompt: `@coordinator [stall] All members are idle at #${latestPost.seq}. Check progress, launch the next wave, or post [done] to close.`,
   }
 }
 
@@ -253,8 +259,8 @@ export class SwarmMonitorDaemon {
     this.onAutoNudge = onAutoNudge
     this.getMemberLiveness = getMemberLiveness
 
-    this.nudgeCounts = new Map() // signature -> count
-    this.autoNudgedZombies = new Set() // signature -> already retried once
+    this.nudgeCounts = new Map()
+    this.autoNudgedZombies = new Set()
     this.quietTicks = 0
     this.alertsPosted = 0
     this.lastCheckAt = null
@@ -351,6 +357,7 @@ export class SwarmMonitorDaemon {
       this.alertsPosted += 1
       await this.onPostStall({
         target: first.target,
+        title: first.title,
         text: first.prompt,
         kind: 'alert',
         escalate: true,
@@ -419,16 +426,19 @@ export class SwarmMonitorDaemon {
     }
 
     let text = diagnosis.prompt
+    let title = diagnosis.title || `Stall alert: ${diagnosis.kind}`
     let target = diagnosis.target
     if (count === MAX_NUDGES_PER_STALL && target !== 'coordinator') {
       target = 'coordinator'
-      text = `@coordinator [stall] 成员 @${diagnosis.target} 针对 #${diagnosis.seq} 已连续催醒 ${MAX_NUDGES_PER_STALL} 次仍无响应，可能模型卡死或异常退出。请检查 git status 或调用 swarm_model / 新建成员接替。`
+      title = `Stall escalation: @${diagnosis.target} unresponsive after ${MAX_NUDGES_PER_STALL} nudges`
+      text = `@coordinator [stall] Member @${diagnosis.target} did not respond to #${diagnosis.seq} after ${MAX_NUDGES_PER_STALL} nudges. Check git status, hot-swap model via swarm_model, or replace via swarm_kill + swarm_add.`
     }
 
     if (typeof this.onPostStall === 'function') {
       this.alertsPosted += 1
       await this.onPostStall({
         target,
+        title,
         text,
         kind: 'alert',
         escalate: true,

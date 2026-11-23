@@ -1,13 +1,7 @@
 // dsh-swarm Host half (Node ESM entry).
 //
-// Coordinates:
-//   1. Four-file plain-text blackboard (`swarm.json`, `board.jsonl`, `members.json`, `plan.json`)
-//      with Windows-NTFS-resilient atomic writes and lock-serialized telemetry flushing
-//   2. Polite shared-cluster `ConcurrencyGate` on `llm/stream` (P0..P3 priority, AIMD on 429)
-//   3. Zero-idle-token `swarm_wait` (`concludeTurn`) + `agent/turn-stopping` Stop-Hook race lock
-//   4. Deterministic host-side Watchdog (`SwarmMonitorDaemon`: 30s health probes + 120s stall checks)
-//   5. Strict format & semantic validators + Peer-Accountability Org-Contract SOP prompts
-//   6. Live `swarm` SessionProjection & `/api/dsh-swarm/*` HTTP bridge for the Browser UI
+// Strictly English-only runtime messages so consuming agents always reply in the
+// user's own language.
 //
 // Boot safety rule (host-plugin-reference.md §3 & §9):
 //   - Deliberately exports NO `Config` (Cordis validates `Config` as a Standard Schema).
@@ -20,21 +14,21 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-import { SwarmStore, defaultSwarmRoot, formatTime } from './src/host/store.js'
+import { SwarmStore, defaultSwarmRoot, formatTime, deriveFallbackTitle } from './src/host/store.js'
 import { ConcurrencyGate, PRIORITY, isConcurrencyFailure } from './src/host/concurrency-gate.js'
 import { handleTurnStopping, statusOf, buildSwarmSystemMessage } from './src/host/stop-hook.js'
 import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.0'
+export const PLUGIN_VERSION = '0.3.1'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.0'
+    if (!fs.existsSync(headFile)) return 'release-0.3.1'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -42,7 +36,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.3.0'
+    return 'release-0.3.1'
   }
 }
 
@@ -191,7 +185,7 @@ export function createSwarmWebRoutes(runtime) {
           if (action === 'concurrency') {
             const limit = Math.floor(Number(body.limit))
             if (!Number.isInteger(limit) || limit < 1) {
-              sendJson(res, 400, { ok: false, error: '并发槽位数必须是 >= 1 的正整数' })
+              sendJson(res, 400, { ok: false, error: 'Concurrency slot limit must be a positive integer >= 1' })
               return
             }
             concurrencyGate.setLimit(limit)
@@ -217,9 +211,12 @@ export function createSwarmWebRoutes(runtime) {
           if (action === 'post') {
             const text = String(body.text ?? '').trim()
             if (!text) {
-              sendJson(res, 400, { ok: false, error: '消息内容不能为空' })
+              sendJson(res, 400, { ok: false, error: 'Message body cannot be empty' })
               return
             }
+            const explicitTitle = typeof body.title === 'string' && body.title.trim()
+              ? body.title.trim().slice(0, 100)
+              : deriveFallbackTitle(text, 'Operator note')
             const result = await store.withLock(targetSwarmId, async () => {
               if (!store.exists(targetSwarmId)) {
                 store.initSwarm(targetSwarmId, {
@@ -232,6 +229,7 @@ export function createSwarmWebRoutes(runtime) {
                 type: 'post',
                 agent: String(body.agent || 'coordinator'),
                 actor_kind: 'HUMAN',
+                title: explicitTitle,
                 channel: String(body.channel || 'main'),
                 kind: String(body.kind || 'decision'),
                 mentions: Array.isArray(body.mentions) ? body.mentions : undefined,
@@ -281,13 +279,13 @@ export function applyWith(ctx, config, deps = {}) {
 
   const store = deps.store ?? new SwarmStore(swarmRoot)
   const disposers = []
-  const sessionEventsByAgent = new Map() // sessionId -> recent SessionEvent[]
-  const memberTelemetry = new Map() // sessionId -> { swarmId, memberName, turn_count, tool_call_count, last_turn_at, last_tool_call_at, last_tool_name, last_error, phase }
-  const pendingTelemetryFlushes = new Map() // swarmId -> Timeout
-  const memberHandles = new Map() // `${swarmId}:${memberName}` -> AgentHandle
-  const agentMembership = new Map() // agentSessionId -> { swarmId, memberName, role }
-  const turnStates = new Map() // agentSessionId -> { calledSwarmWait: boolean, unparkedBlockCount: number }
-  const monitorDaemons = new Map() // swarmId -> SwarmMonitorDaemon
+  const sessionEventsByAgent = new Map()
+  const memberTelemetry = new Map()
+  const pendingTelemetryFlushes = new Map()
+  const memberHandles = new Map()
+  const agentMembership = new Map()
+  const turnStates = new Map()
+  const monitorDaemons = new Map()
 
   const concurrencyGate = deps.concurrencyGate ?? new ConcurrencyGate({
     limit: settings.defaultConcurrency,
@@ -494,7 +492,7 @@ export function applyWith(ctx, config, deps = {}) {
       }
 
       if (parentRoute.provider && parentRoute.model) {
-        addRoute(parentRoute.provider, parentRoute.model, `${parentRoute.model} (当前会话模型)`)
+        addRoute(parentRoute.provider, parentRoute.model, `${parentRoute.model} (current session model)`)
       }
 
       try {
@@ -784,7 +782,7 @@ export function applyWith(ctx, config, deps = {}) {
 
       handle.agent.steer(
         buildSwarmSystemMessage(
-          `[Swarm Brief #${briefPost.seq}] 你已被任命为 @${memberName} (${member.role})。\n\n${fullBrief}\n\n你的游标已初始化至 last_read_seq=${member.last_read_seq}（已自动跳过开局其他成员的任务书噪音）。请开始执行任务，完成后调用 post_board 汇报并调用 swarm_wait({"since": <最新seq>}) 休眠。`,
+          `[Swarm Brief #${briefPost.seq}] You have been assigned as @${memberName} (${member.role}).\n\n${fullBrief}\n\nYour cursor is initialized to last_read_seq=${member.last_read_seq} (opening sibling brief noise skipped). Execute your assignment, post your handoff via post_board (with a meaningful title), and park via swarm_wait({"since": <latestSeq>, "mentions_only": true}).`,
           `Brief #${briefPost.seq} for @${memberName}`,
         ),
       )
@@ -836,7 +834,6 @@ export function applyWith(ctx, config, deps = {}) {
       const unreachable = []
       const silentMentions = [...silentTargets]
 
-      // If someone explicitly mentioned `@monitor`, trigger an immediate Watchdog health check
       if ((postRecord.mentions ?? []).includes('monitor')) {
         const daemon = monitorDaemons.get(swarmId)
         if (daemon) {
@@ -861,7 +858,8 @@ export function applyWith(ctx, config, deps = {}) {
             ...curr,
             last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
           }))
-          const wakeText = `[board] the latest message is #${postRecord.seq} from @${postRecord.agent} (kind=${postRecord.kind}, channel=#${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
+          const titlePart = postRecord.title ? ` "${postRecord.title}"` : ''
+          const wakeText = `[board] New message #${postRecord.seq}${titlePart} from @${postRecord.agent} (kind=${postRecord.kind}, channel=#${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
           } else {
@@ -945,7 +943,7 @@ export function applyWith(ctx, config, deps = {}) {
         memberAlive = Boolean(resumed?.agent)
         resumed.agent.steer(
           buildSwarmSystemMessage(
-            `[Swarm Model Switch] 你的运行模型已热切换为 ${nextProvider}/${nextModel}（原因：${reason}）。请调用 read_board({"since": ${m.last_read_seq ?? 0}}) 继续未完成的工作。`,
+            `[Swarm Model Switch] Your active model has been hot-swapped to ${nextProvider}/${nextModel} (reason: ${reason}). Call read_board({"since": ${m.last_read_seq ?? 0}}) and resume your unfinished work.`,
             `Swarm model switched to ${nextModel}`,
           ),
         )
@@ -1004,19 +1002,20 @@ export function applyWith(ctx, config, deps = {}) {
           if (!liveAgent || typeof liveAgent.steer !== 'function') return false
           liveAgent.steer(
             buildSwarmSystemMessage(
-              `[Watchdog Auto-Nudge] 你已被任命为 @${memberName} (Brief #${m.brief_seq ?? 1})，但超过 60s 尚未产生任何进展。请立即调用 read_board({"since": 0}) 开始执行任务！`,
+              `[Watchdog Auto-Nudge] You were assigned as @${memberName} (Brief #${m.brief_seq ?? 1}), but showed no activity after 60s. Call read_board({"since": 0}) and begin immediately.`,
               `Watchdog auto-nudge for @${memberName}`,
             ),
           )
           return true
         },
-        onPostStall: async ({ target, text, kind, refs, escalate }) => {
+        onPostStall: async ({ target, title, text, kind, refs, escalate }) => {
           await store.withLock(swarmId, async () => {
             if (!store.exists(swarmId)) return
             const postRecord = store.appendBoardRecord(swarmId, {
               type: 'post',
               agent: 'monitor',
               channel: 'main',
+              title: title || `Watchdog alert for @${target}`,
               mentions: [target],
               skip_prose_mention_extraction: true,
               refs,
@@ -1046,7 +1045,7 @@ export function applyWith(ctx, config, deps = {}) {
     },
   }
 
-  // 1. Subscribe to `session/event` for transcript liveness (`statusOf`), lock-safe telemetry, and error alerting
+  // 1. Subscribe to `session/event` for transcript liveness, lock-safe telemetry, and error alerting
   const reportedErrorSignatures = new Set()
   function resolveMemberForSessionId(sid) {
     if (!sid) return null
@@ -1157,11 +1156,12 @@ export function applyWith(ctx, config, deps = {}) {
                 type: 'post',
                 agent: 'monitor',
                 channel: 'main',
+                title: `Runtime error: @${memberName} (${failure.code})`,
                 mentions: ['coordinator'],
                 skip_prose_mention_extraction: true,
                 kind: 'alert',
                 escalate: true,
-                text: `@coordinator [RUNTIME_ERROR] 成员 @${memberName} 在第 ${failure.turn} 轮执行异常中止：${failure.message} (code=${failure.code})。请调用 swarm_status 查看并执行 swarm_model 切换可用模型或 swarm_kill 清理后降级！`,
+                text: `@coordinator [RUNTIME_ERROR] Member @${memberName} aborted on turn ${failure.turn}: ${failure.message} (code=${failure.code}). Inspect via swarm_status and run swarm_model or swarm_kill.`,
               })
               await runtime.dispatchPostWakeups(swarmId, alertPost)
               runtime.notifyProjectionChanged(swarmId)

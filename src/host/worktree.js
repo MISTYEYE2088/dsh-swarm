@@ -115,7 +115,7 @@ export async function createIsolatedWorktree({
   if (!headRes.ok) {
     return {
       ok: false,
-      error: `主工作区 (${mainCwd}) 不是有效的 Git 仓库或尚无 commit: ${headRes.stderr.trim()}`,
+      error: `Workspace (${mainCwd}) is not a valid Git repository or has no commits yet: ${headRes.stderr.trim()}`,
     }
   }
   const headSha = headRes.stdout.trim()
@@ -127,11 +127,10 @@ export async function createIsolatedWorktree({
   if (!addRes.ok) {
     return {
       ok: false,
-      error: `创建 git worktree 失败: ${addRes.stderr.trim()}`,
+      error: `Failed to create git worktree: ${addRes.stderr.trim()}`,
     }
   }
 
-  // Sync dirty working tree (staged, unstaged, untracked) from mainCwd into targetDir
   const statusRes = await runGit(['status', '--porcelain=v1', '-z', '--untracked-files=all'], { cwd: mainCwd })
   const dirtyEntries = statusRes.ok ? parsePorcelainZero(statusRes.stdout) : []
 
@@ -146,8 +145,6 @@ export async function createIsolatedWorktree({
     }
   }
 
-  // Snapshot the synced dirty baseline as a temporary local commit inside the detached worktree
-  // so `git diff <baselineCommit>` shows ONLY the worker's own edits!
   let baselineCommit = headSha
   if (dirtyEntries.length > 0) {
     await runGit(['add', '-A'], { cwd: targetDir })
@@ -178,7 +175,6 @@ export async function diffWorktree({ worktreePath, baselineCommit }) {
   if (!worktreePath || !fs.existsSync(worktreePath)) {
     return { ok: false, hasChanges: false, files: [], patch: '', error: 'worktree path does not exist' }
   }
-  // Stage intent-to-add for untracked files so `git diff` includes new files created by the worker
   await runGit(['add', '-N', '.'], { cwd: worktreePath })
   const ref = baselineCommit || 'HEAD'
   const nameRes = await runGit(['diff', '--name-status', ref], { cwd: worktreePath })
@@ -220,7 +216,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
       action: 'apply',
       applied: false,
       files: [],
-      message: '该成员工作区没有任何增量修改，无需合并。',
+      message: 'No incremental edits in this worktree; nothing to land.',
     }
   }
 
@@ -234,7 +230,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
       action: 'apply',
       applied: false,
       files: diff.files,
-      error: `合并预检 (git apply --check) 发现冲突，主工作区保持未修改: ${checkRes.stderr.trim()}`,
+      error: `Merge preflight (git apply --check) detected conflicts; main workspace left untouched: ${checkRes.stderr.trim()}`,
     }
   }
 
@@ -248,7 +244,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
       action: 'apply',
       applied: false,
       files: diff.files,
-      error: `应用补丁失败: ${applyRes.stderr.trim()}`,
+      error: `Failed to apply patch: ${applyRes.stderr.trim()}`,
     }
   }
 
@@ -257,7 +253,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
     action: 'apply',
     applied: true,
     files: diff.files,
-    message: `已成功将 ${diff.files.length} 个文件的修改合并回主工作区。`,
+    message: `Successfully landed changes across ${diff.files.length} file(s) into main workspace.`,
   }
 }
 
@@ -274,7 +270,7 @@ export async function removeIsolatedWorktree({ mainCwd, worktreePath, baselineCo
         ok: false,
         unmerged: true,
         files: diff.files,
-        error: `工作区 (${worktreePath}) 仍有 ${diff.files.length} 个未合并的文件修改: ${diff.files.join(', ')}`,
+        error: `Worktree (${worktreePath}) still has ${diff.files.length} unmerged file change(s): ${diff.files.join(', ')}`,
       }
     }
   }

@@ -1,9 +1,8 @@
 // Model-facing Swarm tools, `/swarm` slash command, and `swarm` SessionProjection.
 //
-// All tool parameter and output schemas strictly conform to DSH's enforced
-// JSON Schema subset (`packages/core/tools/src/json-schema.ts`), and every tool
-// return value is normalized through `toLosslessJson()` so DSH's
-// `snapshotToolValue` check can NEVER fail after a write has committed.
+// Strictly English-only so consuming agents never get nudged into switching response
+// languages. All tool return payloads pass through `toLosslessJson()` so DSH's
+// lossless JSON validation can never fail after a write commits.
 
 import fs from 'node:fs'
 import path from 'node:path'
@@ -12,6 +11,7 @@ import {
   replayChannelsAt,
   extractScreenshotsFromPosts,
   computeSupersededMap,
+  deriveFallbackTitle,
   VALID_POST_KINDS,
   VALID_VERDICTS,
 } from './store.js'
@@ -36,7 +36,7 @@ const TEXT_OUTPUT_SCHEMA = Object.freeze({
 })
 
 // #FUNC Recursively normalize any JS value into strictly lossless plain JSON (no `undefined` properties, no extra props on arrays, no `NaN`/`Infinity`).
-// #NOT  Never returns non-plain arrays or objects with `undefined` values that DSH `snapshotToolValue` rejects as non-lossless JSON.
+// #NOT  Never returns non-plain arrays or objects with `undefined` values that fail lossless JSON validation.
 // #EDGE-IN An array with a non-enumerable property and an object with `undefined` fields are stripped cleanly → test_tool_outputs_are_strictly_lossless_json
 // #WHY  `toLosslessJson` strips `undefined` fields, non-index array props, and non-finite numbers via `Number.isFinite` so DSH tool result validation never fails after disk writes commit.
 export function toLosslessJson(value) {
@@ -195,27 +195,32 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     })
   }
 
-  // Compute directed @mention graph edges for every post so the UI Replay slider
-  // can filter edges up to any historical `seq <= replaySeq`.
+  // Compute directed @mention graph edges for every post so the Round-Table Topology
+  // view can render aging arrows and latest-round titles up to any `replaySeq`.
   const edgeEvents = []
   for (const rec of records) {
     if (!rec || rec.type === 'control' || rec.silent === true) continue
     const targets = store.resolveTargetsForPost(swarmId, rec)
+    const recTitle = rec.title || deriveFallbackTitle(rec.text, rec.kind || 'post')
     for (const target of targets) {
       edgeEvents.push({
         seq: rec.seq,
         from: rec.agent,
         to: target,
         kind: rec.kind,
+        title: recTitle,
+        time: rec.time || '',
       })
     }
   }
 
-  const annotatedPosts = records.slice(-250).map(rec => (
-    rec && rec.type !== 'control' && supersededMap.has(rec.seq)
-      ? { ...rec, superseded_by: supersededMap.get(rec.seq) }
-      : rec
-  ))
+  const annotatedPosts = records.slice(-250).map((rec) => {
+    if (!rec || rec.type === 'control') return rec
+    const withTitle = rec.title ? rec : { ...rec, title: deriveFallbackTitle(rec.text, rec.kind || 'post') }
+    return supersededMap.has(rec.seq)
+      ? { ...withTitle, superseded_by: supersededMap.get(rec.seq) }
+      : withTitle
+  })
 
   return {
     runtime: typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null,
@@ -236,8 +241,8 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
   }
 }
 
-// #FUNC Construct all 10 Swarm model tools with strict format checking, atomic spawn/rollback, noise filtering, merge gate, and guaranteed lossless JSON output.
-// #NOT  Never throws raw unhandled exceptions for malformed model inputs; never returns non-lossless JSON payloads.
+// #FUNC Construct all 10 Swarm model tools with strict format checking, mandatory meaningful titles, atomic spawn/rollback, noise filtering, merge gate, and guaranteed lossless JSON output.
+// #NOT  Never throws raw unhandled exceptions for malformed model inputs; never returns non-lossless JSON payloads or Chinese strings.
 // #EDGE-IN Calling `swarm_wait` with valid `since` invokes `exec.concludeTurn()` to end the turn at 0 idle token cost → test_swarm_wait_concludes_turn
 // #WHY  `concludeTurn` is the native DSH `ToolRunContext` hook that stops `agent-loop` from issuing another LLM request after `swarm_wait` returns `DONE`.
 export function createSwarmTools(runtime) {
@@ -285,7 +290,7 @@ export function createSwarmTools(runtime) {
         if (!fs.existsSync(candidate) || !fs.statSync(candidate).isDirectory()) {
           return {
             ok: false,
-            text: `[FORMAT_ERROR: swarm_init] 指定的 project_root "${check.value.project_root}" (解析为 "${candidate}") 不存在或不是目录。`,
+            text: `[FORMAT_ERROR: swarm_init] project_root "${check.value.project_root}" (resolved to "${candidate}") does not exist or is not a directory.`,
           }
         }
         effectiveRoot = candidate
@@ -297,7 +302,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.0', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.1', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -328,18 +333,18 @@ export function createSwarmTools(runtime) {
         runtime.notifyProjectionChanged(swarmId)
 
         const gitNote = gitSupported
-          ? `AVAILABLE (git_root="${gitProbe.stdout.trim()}"；可使用 workspace="share"|"branch"|"inherit")`
+          ? `AVAILABLE (git_root="${gitProbe.stdout.trim()}"; workspace="share"|"branch"|"inherit" supported)`
           : (childGitRepos.length > 0
-              ? `UNAVAILABLE at "${effectiveRoot}"，但探测到子目录 Git 仓库：[${childGitRepos.join(', ')}]。如需启用 workspace="share" 隔离避免互相打断验证，请重新调用 swarm_init 并传入 project_root="<子目录名>"！`
-              : `UNAVAILABLE (当前目录非 Git 仓库，所有成员请使用 workspace="inherit")`)
+              ? `UNAVAILABLE at "${effectiveRoot}", but discovered child git repo(s): [${childGitRepos.join(', ')}]. Call swarm_init with project_root="<subdir>" to unlock isolated worktrees (workspace="share").`
+              : `UNAVAILABLE (not a git repository; members must use workspace="inherit")`)
 
         const envNotes = [
           `[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
-          `[WORKSPACE_PREFLIGHT] project_root="${effectiveRoot}" · git_worktree=${gitNote}`,
-          `[SLOTS_SEMANTICS] concurrency_limit=${swarm.concurrency_limit} 限制的是“模型在途并发请求槽位数”，≠ 最大成员人数上限；可按需创建更多成员由 ConcurrencyGate 自动排队调度。`,
+          `[WORKSPACE_PREFLIGHT] project_root="${effectiveRoot}" | git_worktree=${gitNote}`,
+          `[SLOTS_SEMANTICS] concurrency_limit=${swarm.concurrency_limit} caps in-flight LLM requests (NOT max member count); ConcurrencyGate queues excess streams automatically.`,
         ]
         if (isWslUnc) {
-          envNotes.push(`[WSL_UNC_HINT] 当前工作区为 Windows WSL UNC 路径 (${effectiveRoot})：DSH 内置 workflow 工具在 UNC 路径下会因 Win32 ACL 限制报错，请统一使用 swarm_add 派生进程内 Swarm 成员。`)
+          envNotes.push(`[WSL_UNC_HINT] Workspace is a Windows WSL UNC path (${effectiveRoot}): built-in DSH workflow fails on Win32 ACL checks; use swarm_add for in-process Swarm members.`)
         }
 
         return {
@@ -350,7 +355,7 @@ export function createSwarmTools(runtime) {
           discovered_child_git_repos: childGitRepos,
           is_wsl_unc: isWslUnc,
           runtime: fp,
-          text: `[swarm_init OK] Swarm "${swarm.title}" 已初始化（swarm_id=${swarmId}, gen=${swarm.generation ?? 1}, 模型在途并发槽=${swarm.concurrency_limit}, 默认路由=${swarm.default_provider}/${swarm.default_model}）。\n${envNotes.join('\n')}\n接下来请调用 swarm_plan 写入波次计划，再调用 swarm_add 添加成员（Watchdog 已自动运行，无需手动建 monitor）。`,
+          text: `[swarm_init OK] Initialized Swarm "${swarm.title}" (swarm_id=${swarmId}, gen=${swarm.generation ?? 1}, llm_slots=${swarm.concurrency_limit}, route=${swarm.default_provider}/${swarm.default_model}).\n${envNotes.join('\n')}\nNext: call swarm_plan to publish wave/track plan, then spawn members with swarm_add (Watchdog runs automatically; do not spawn monitor).`,
         }
       })
     },
@@ -403,14 +408,14 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         if (!store.exists(swarmId)) {
-          return { ok: false, text: '[FORMAT_ERROR: swarm_plan] 请先调用 swarm_init 初始化 Swarm，再调用 swarm_plan。' }
+          return { ok: false, text: '[FORMAT_ERROR: swarm_plan] Swarm is not initialized. Call swarm_init first.' }
         }
         const plan = store.writePlan(swarmId, check.value)
         runtime.notifyProjectionChanged(swarmId)
         return {
           ok: true,
           plan,
-          text: `[swarm_plan OK] plan.json 已更新（当前第 ${plan.current_wave} 波，共 ${plan.tracks.length} 条轨道）。`,
+          text: `[swarm_plan OK] Updated plan.json (wave ${plan.current_wave}, ${plan.tracks.length} track(s)).`,
         }
       })
     },
@@ -446,7 +451,6 @@ export function createSwarmTools(runtime) {
         const createdRows = []
         const mainCwd = swarmMeta.project_root || rootAgent?.session?.header?.cwd || process.cwd()
 
-        // 1. Resolve model route ONCE up front before any disk or session mutation
         const resolvedRoute = typeof runtime.resolveModelRoute === 'function'
           ? await runtime.resolveModelRoute({
               requestedProvider: spec.provider,
@@ -478,7 +482,7 @@ export function createSwarmTools(runtime) {
               mode: spec.workspace,
             })
             if (!wtRes.ok) {
-              return { ok: false, text: `[WORKTREE_ERROR: swarm_add] 为 @${memberName} 创建隔离工作区失败: ${wtRes.error}` }
+              return { ok: false, text: `[WORKTREE_ERROR: swarm_add] Failed to provision isolated worktree for @${memberName}: ${wtRes.error}` }
             }
             worktreeInfo = wtRes
           }
@@ -499,7 +503,7 @@ export function createSwarmTools(runtime) {
             last_read_seq: plannedBriefSeq,
           }
 
-          // 2. Atomic spawn: create the live DSH child session FIRST before committing to members.json/board.jsonl!
+          // 1. Atomic spawn: create the live DSH child session FIRST before committing to disk
           let handle = null
           try {
             if (typeof runtime.createMemberAgent === 'function') {
@@ -525,11 +529,11 @@ export function createSwarmTools(runtime) {
             return {
               ok: false,
               error: { code: spawnErr?.code || 'SPAWN_FAILED', message: String(spawnErr?.message ?? spawnErr) },
-              text: `[SPAWN_ERROR: swarm_add] 创建成员 @${memberName} 的子会话失败，已自动回滚（未写入黑板、未锁死名字 "${memberName}"）：${String(spawnErr?.message ?? spawnErr)}`,
+              text: `[SPAWN_ERROR: swarm_add] Failed to spawn child session for @${memberName}; rolled back cleanly (no board post written, name "${memberName}" not locked): ${String(spawnErr?.message ?? spawnErr)}`,
             }
           }
 
-          // 3. Now commit brief & member record to disk (and rollback if steering fails)
+          // 2. Commit brief & member record (rollback if steering fails)
           let committed = null
           try {
             committed = store.registerMemberWithBrief(swarmId, {
@@ -561,7 +565,6 @@ export function createSwarmTools(runtime) {
                 rootAgent,
               })
             } else if (!handle && typeof runtime.spawnMemberAgent === 'function') {
-              // Compatibility fallback for custom runtimes that only provide spawnMemberAgent
               handle = await runtime.spawnMemberAgent({
                 swarmId,
                 memberName,
@@ -589,11 +592,10 @@ export function createSwarmTools(runtime) {
             return {
               ok: false,
               error: { code: commitErr?.code || 'COMMIT_FAILED', message: String(commitErr?.message ?? commitErr) },
-              text: `[SPAWN_ERROR: swarm_add] 成员 @${memberName} 启动阶段异常，已自动回滚并释放名字 "${memberName}"：${String(commitErr?.message ?? commitErr)}`,
+              text: `[SPAWN_ERROR: swarm_add] Failed while activating @${memberName}; rolled back and released name "${memberName}": ${String(commitErr?.message ?? commitErr)}`,
             }
           }
 
-          // 4. Brief settle window (100ms) so fast synchronous/adapter errors (e.g. NO_ADAPTER) surface immediately
           if (handle) {
             await new Promise(resolve => setTimeout(resolve, 100))
           }
@@ -609,7 +611,7 @@ export function createSwarmTools(runtime) {
             return {
               ok: false,
               error: latestMember.last_error,
-              text: `[SPAWN_RUNTIME_ERROR: swarm_add] 成员 @${memberName} 已创建但首轮启动即发生错误 (${latestMember.last_error.code}: ${latestMember.last_error.message})！请检查模型路由 (${latestMember.applied_provider}/${latestMember.applied_model})，调用 swarm_model 切换为可用模型或 swarm_kill 清理后降级，切勿调用 swarm_wait 死等！`,
+              text: `[SPAWN_RUNTIME_ERROR: swarm_add] Member @${memberName} failed immediately on Turn 1 (${latestMember.last_error.code}: ${latestMember.last_error.message}). Check route (${latestMember.applied_provider}/${latestMember.applied_model}), call swarm_model to switch, or swarm_kill to retire. Do NOT park in swarm_wait!`,
             }
           }
 
@@ -639,7 +641,7 @@ export function createSwarmTools(runtime) {
           active_members: activeCount,
           llm_slots: llmSlots,
           created: createdRows,
-          text: `[swarm_add OK] 已创建并启动：${summary}。（当前活跃成员=${activeCount} 人 / 模型在途并发槽位=${llmSlots}）`,
+          text: `[swarm_add OK] Spawned and briefed: ${summary}. (active_members=${activeCount} / llm_slots=${llmSlots})`,
         }
       })
     },
@@ -647,10 +649,11 @@ export function createSwarmTools(runtime) {
 
   const postBoardTool = makeTool({
     name: 'post_board',
-    description: 'Post a message to board.jsonl (with built-in idempotency dedup, optional `silent: true` logging, `escalate: true` wakeup override, `verdict` for review/merge gates, and `supersedes` to obsolete earlier floors). Always cite floor numbers like #5.',
+    description: 'Post a message to board.jsonl. REQUIRES a concise, meaningful `title` (4..100 chars, shown on collapsed board cards) plus `text`. Supports idempotency dedup, `silent: true`, `escalate: true`, `verdict` (merge gate), and `supersedes`. Always cite floors with #seq.',
     isConcurrencySafe: true,
     parameters: {
       properties: {
+        title: { type: 'string', description: 'REQUIRED meaningful one-line summary title (4..100 chars, e.g. "Freeze combat state schema with 5 ADR overrides"). Never use generic words like "update" or "report".' },
         text: { type: 'string', description: 'Markdown message body (6..4000 chars). Use #seq to cite earlier floors and @name to wake recipients.' },
         mentions: { type: 'array', items: { type: 'string' }, description: 'Target member names (e.g. ["qa-gate"] or ["coordinator"]).' },
         refs: { type: 'array', items: { type: 'integer' }, description: 'Referenced floor numbers (e.g. [5, 6]).' },
@@ -660,18 +663,18 @@ export function createSwarmTools(runtime) {
         supersedes: { type: 'array', items: { type: 'integer' }, description: 'Optional list of earlier floor numbers obsoleted by this post (solves concurrent decision races).' },
         escalate: { type: 'boolean', description: 'If true, bypasses recipients\' `wake_kinds` filter to force immediate wakeup.' },
         silent: { type: 'boolean', description: 'If true, logs this post to board.jsonl without waking anyone (allows empty `mentions`).' },
-        idempotency_key: { type: 'string', description: 'Optional client-supplied unique key to prevent duplicate posts on retry.' },
+        idempotency_key: { type: 'string', description: 'Optional unique key to prevent duplicate posts on retry.' },
         override_reason: { type: 'string', description: 'Optional PM reason to explicitly override active `[REJECT]` gates when posting `[done]`.' },
         control_action: { type: 'string', enum: ['channel.create', 'channel.subscribe', 'channel.unsubscribe', 'channel.archive'], description: 'Optional event-sourced channel control operation.' },
         control_target: { type: 'string', description: 'Optional member name for channel.subscribe / channel.unsubscribe.' },
       },
-      required: ['text'],
+      required: ['title', 'text'],
     },
     async execute(args, exec) {
       const { swarmId, callerName } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         if (!store.exists(swarmId)) {
-          return { ok: false, text: '[FORMAT_ERROR: post_board] Swarm 尚未初始化，请先调用 swarm_init。' }
+          return { ok: false, text: '[FORMAT_ERROR: post_board] Swarm is not initialized. Call swarm_init first.' }
         }
         const existingMembers = store.readMembers(swarmId)
         const records = store.readBoard(swarmId)
@@ -690,7 +693,7 @@ export function createSwarmTools(runtime) {
           return {
             ok: true,
             seq: ctrlRec.seq,
-            text: `[post_board CONTROL OK] 已写入频道控制帧 #${ctrlRec.seq} (${ctrlRec.action} #${ctrlRec.channel})。`,
+            text: `[post_board CONTROL OK] Wrote control frame #${ctrlRec.seq} (${ctrlRec.action} #${ctrlRec.channel}).`,
           }
         }
 
@@ -700,20 +703,18 @@ export function createSwarmTools(runtime) {
         const val = check.value
         const isDonePost = val.kind === 'done' || val.text.includes('[done]')
 
-        // Merge/Done gate: block `[done]` if active `[REJECT]` blocks from verifier/architect remain unresolved
         if (isDonePost) {
           const activeRejections = store.computeActiveRejections(swarmId)
           if (activeRejections.length > 0 && !val.override_reason) {
-            const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role})`).join('; ')
+            const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
             return {
               ok: false,
               blocked_by_rejections: activeRejections,
-              text: `[GATE_BLOCKED: post_board] 结案被阻断！当前存在 ${activeRejections.length} 条未解除的验收拒绝：[${list}]。请先让对应评审方复测并发布 verdict="approve"（或 supersedes 作废该拒绝），若 PM 确需强行放行请传入 override_reason 参数说明理由。`,
+              text: `[GATE_BLOCKED: post_board] Closing blocked by ${activeRejections.length} unresolved rejection(s): [${list}]. Have the reviewer re-verify and post verdict="approve" (or supersede the rejection), or pass override_reason to explicitly override.`,
             }
           }
         }
 
-        // Idempotency / duplicate post protection
         const dup = store.findDuplicatePost(swarmId, {
           agent: callerName,
           channel: val.channel,
@@ -726,10 +727,11 @@ export function createSwarmTools(runtime) {
             ok: true,
             deduplicated: true,
             seq: dup.seq,
+            title: dup.title,
             woken: [],
             unreachable: [],
             silent_mentions: [],
-            text: `[post_board DEDUPLICATED] 检测到重复投递，已直接返回既有楼层 #${dup.seq}（未重复写入黑板，未重复唤醒成员）。`,
+            text: `[post_board DEDUPLICATED] Duplicate submission matched existing floor #${dup.seq} ("${dup.title}"); skipped duplicate write and wakeup.`,
           }
         }
 
@@ -740,6 +742,7 @@ export function createSwarmTools(runtime) {
         const postRecord = store.appendBoardRecord(swarmId, {
           type: 'post',
           agent: callerName,
+          title: val.title,
           channel: val.channel,
           mentions: val.mentions,
           channel_mentions: val.channel_mentions,
@@ -770,30 +773,30 @@ export function createSwarmTools(runtime) {
 
         const notes = []
         if (val.silent) {
-          notes.push('沉默落板 (silent=true，未唤醒任何人)')
+          notes.push('silent=true (no recipients woken)')
         } else if (wokenTargets.length > 0) {
-          notes.push(`实际唤醒: ${wokenTargets.map(n => '@' + n).join(', ')}`)
+          notes.push(`woken: ${wokenTargets.map(n => '@' + n).join(', ')}`)
         } else {
-          notes.push('无成员被唤醒')
+          notes.push('no recipients woken')
         }
         if (silentMentions.length > 0) {
-          notes.push(`已被对方 wake_kinds 降噪过滤(未唤醒): ${silentMentions.map(n => '@' + n).join(', ')}`)
+          notes.push(`filtered by wake_kinds: ${silentMentions.map(n => '@' + n).join(', ')}`)
         }
         if (unreachableTargets.length > 0) {
-          notes.push(`未唤醒(无存活实例): ${unreachableTargets.map(n => '@' + n).join(', ')}`)
+          notes.push(`unreachable (no live instance): ${unreachableTargets.map(n => '@' + n).join(', ')}`)
         }
         if (val.ignored_prose_mentions.length > 0) {
-          notes.push(`已忽略正文中的未注册提及: ${val.ignored_prose_mentions.map(n => '@' + n).join(', ')}`)
+          notes.push(`ignored unregistered prose @tokens: ${val.ignored_prose_mentions.map(n => '@' + n).join(', ')}`)
         }
         if (postRecord.supersedes && postRecord.supersedes.length > 0) {
-          notes.push(`已声明作废旧楼层: ${postRecord.supersedes.map(s => '#' + s).join(', ')}`)
+          notes.push(`supersedes: ${postRecord.supersedes.map(s => '#' + s).join(', ')}`)
         }
         if (postRecord.verdict) {
           notes.push(`verdict=${postRecord.verdict}`)
         }
 
         const archiveNote = archivePath
-          ? `\n[SWARM_ARCHIVED] 本场 Swarm 完整现场已归档至：${archivePath}`
+          ? `\n[SWARM_ARCHIVED] Archived blackboard artifacts to: ${archivePath}`
           : ''
         const fp = typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null
         const fpNote = (archivePath && fp) ? `\n[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})` : ''
@@ -802,12 +805,13 @@ export function createSwarmTools(runtime) {
           ok: true,
           deduplicated: false,
           seq: postRecord.seq,
+          title: postRecord.title,
           woken: wokenTargets,
           silent_mentions: silentMentions,
           unreachable: unreachableTargets,
           ignored_prose_mentions: val.ignored_prose_mentions,
           ...(archivePath ? { archive_path: archivePath } : {}),
-          text: `[post_board OK] 已发布到黑板 #${postRecord.seq} (channel=#${postRecord.channel}, kind=${postRecord.kind}; ${notes.join('；')})。你的 last_read_seq 已更新为 ${postRecord.seq}。${archiveNote}${fpNote}${!archivePath ? ` 若本轮工作已完成，请调用 swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) 进入休眠。` : ''}`,
+          text: `[post_board OK] Posted #${postRecord.seq} "${postRecord.title}" (channel=#${postRecord.channel}, kind=${postRecord.kind}; ${notes.join('; ')}). Your last_read_seq is now ${postRecord.seq}.${archiveNote}${fpNote}${!archivePath ? ` If your turn is done, call swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) to park.` : ''}`,
         }
       })
     },
@@ -832,7 +836,7 @@ export function createSwarmTools(runtime) {
       const { swarmId, callerName } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         if (!store.exists(swarmId)) {
-          return { ok: false, text: '[FORMAT_ERROR: read_board] Swarm 尚未初始化。' }
+          return { ok: false, text: '[FORMAT_ERROR: read_board] Swarm is not initialized.' }
         }
         const members = store.readMembers(swarmId)
         const caller = members[callerName]
@@ -875,15 +879,15 @@ export function createSwarmTools(runtime) {
           posts = posts.slice(-limitNum)
         }
 
-        const annotatedPosts = posts.map(p => (
-          p && p.type !== 'control' && supersededMap.has(p.seq)
-            ? { ...p, superseded_by: supersededMap.get(p.seq) }
-            : p
-        ))
+        const annotatedPosts = posts.map((p) => {
+          if (!p || p.type === 'control') return p
+          const withTitle = p.title ? p : { ...p, title: deriveFallbackTitle(p.text, p.kind || 'post') }
+          return supersededMap.has(p.seq)
+            ? { ...withTitle, superseded_by: supersededMap.get(p.seq) }
+            : withTitle
+        })
 
         const headSeq = store.headSeq(swarmId)
-        // Advance `last_read_seq` to `headSeq` when doing an unfiltered read; when filtered by
-        // `kinds`/`agent`/`limit`, preserve `last_read_seq` unless the caller had no filters hiding alerts.
         const isFilteredView = hasKindFilter || hasAgentFilter || hasLimit
         const newReadSeq = isFilteredView
           ? (caller?.last_read_seq ?? 0)
@@ -897,7 +901,7 @@ export function createSwarmTools(runtime) {
         runtime.notifyProjectionChanged(swarmId)
 
         const formatted = annotatedPosts.length === 0
-          ? `(自 #${sinceSeq} 以来没有匹配的新帖子；当前黑板最新楼层为 #${headSeq})`
+          ? `(No matching posts after #${sinceSeq}; board head is #${headSeq})`
           : annotatedPosts.map((p) => {
               if (p.type === 'control') {
                 return `#${p.seq} [CONTROL ${p.time}] @${p.agent}: ${p.action} #${p.channel} ${p.target ? '-> @' + p.target : ''}`
@@ -906,15 +910,15 @@ export function createSwarmTools(runtime) {
               if (p.verdict) badges.push(`verdict=${p.verdict}`)
               if (p.escalate) badges.push('ESCALATE')
               if (p.silent) badges.push('SILENT')
-              if (p.superseded_by) badges.push(`⚠️ SUPERSEDED by #${p.superseded_by}`)
+              if (p.superseded_by) badges.push(`SUPERSEDED by #${p.superseded_by}`)
               const badgeText = badges.length > 0 ? ` [${badges.join(' | ')}]` : ''
-              return `#${p.seq} [${p.time}] [#${p.channel || 'main'}] @${p.agent} (${p.kind})${badgeText}:\n${p.text}`
+              return `#${p.seq} [${p.time}] [#${p.channel || 'main'}] @${p.agent} (${p.kind}) — ${p.title}${badgeText}\n${p.text}`
             }).join('\n\n---\n\n')
 
         const swarmMeta = store.readSwarm(swarmId)
         const filterNote = isFilteredView
-          ? `（过滤视图${truncatedCount > 0 ? `，已截断前 ${truncatedCount} 条` : ''}；last_read_seq 保持 #${newReadSeq}）`
-          : `（已读至最新楼层 #${newReadSeq}）`
+          ? ` (filtered view${truncatedCount > 0 ? `, truncated ${truncatedCount} older` : ''}; last_read_seq stays #${newReadSeq})`
+          : ` (advanced last_read_seq to #${newReadSeq})`
         return {
           ok: true,
           swarm_id: swarmId,
@@ -923,7 +927,7 @@ export function createSwarmTools(runtime) {
           last_read_seq: newReadSeq,
           count: annotatedPosts.length,
           posts: annotatedPosts,
-          text: `[read_board OK] (swarm_id=${swarmId}, gen=${swarmMeta?.generation ?? 1}) 返回 ${annotatedPosts.length} 条记录${filterNote}：\n\n${formatted}`,
+          text: `[read_board OK] (swarm_id=${swarmId}, gen=${swarmMeta?.generation ?? 1}) Returned ${annotatedPosts.length} record(s)${filterNote}:\n\n${formatted}`,
         }
       })
     },
@@ -944,7 +948,7 @@ export function createSwarmTools(runtime) {
       const { swarmId, callerName } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         if (!store.exists(swarmId)) {
-          return { ok: false, text: '[FORMAT_ERROR: swarm_wait] Swarm 尚未初始化。' }
+          return { ok: false, text: '[FORMAT_ERROR: swarm_wait] Swarm is not initialized.' }
         }
         const members = store.readMembers(swarmId)
         const member = members[callerName]
@@ -958,7 +962,6 @@ export function createSwarmTools(runtime) {
           wakeKinds: wake_kinds,
         })
 
-        // If matching posts already arrived after `since`, do NOT sleep — return them right now!
         if (pending.length > 0) {
           const newest = pending[pending.length - 1].seq
           if (member) {
@@ -970,16 +973,15 @@ export function createSwarmTools(runtime) {
             }))
           }
           runtime.notifyProjectionChanged(swarmId)
-          const preview = pending.map(p => `#${p.seq} @${p.agent} (${p.kind}): ${p.text}`).join('\n---\n')
+          const preview = pending.map(p => `#${p.seq} @${p.agent} (${p.kind}) — ${p.title || deriveFallbackTitle(p.text)}:\n${p.text}`).join('\n---\n')
           return {
             ok: true,
             status: 'NEW_MESSAGES_ARRIVED',
             posts: pending,
-            text: `[swarm_wait BLOCKED] 在 #${since} 之后已有 ${pending.length} 条匹配的新消息到达（最新 #${newest}），已取消休眠并为你直接加载：\n\n${preview}\n\n请处理这些新消息后再调用 swarm_wait({"since": ${newest}})。`,
+            text: `[swarm_wait BLOCKED] ${pending.length} matching post(s) arrived after #${since} (latest #${newest}); parking canceled and loaded below:\n\n${preview}\n\nHandle them before calling swarm_wait({"since": ${newest}}).`,
           }
         }
 
-        // Otherwise, park the member at 0 token cost and conclude the turn immediately!
         if (member) {
           store.updateMember(swarmId, callerName, m => ({
             ...m,
@@ -1018,12 +1020,12 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.0', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.1', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
           runtime: fp,
-          text: `当前会话尚未启动 Swarm。[Runtime: dsh-swarm v${fp.version} @ ${fp.commit}, loaded=${fp.loaded_at}]`,
+          text: `No active Swarm in this session. [Runtime: dsh-swarm v${fp.version} @ ${fp.commit}, loaded=${fp.loaded_at}]`,
         }
       }
       const snap = buildSwarmProjectionSnapshot({ store, swarmId, runtime })
@@ -1033,20 +1035,20 @@ export function createSwarmTools(runtime) {
         ? `Watchdog: ${wd.active ? 'ACTIVE' : 'SLEEPING'} (health=${wd.healthIntervalSec}s, stall=${wd.stallIntervalSec}s, alerts=${wd.alertsPosted}${wd.lastCheckAt ? ', last_check=' + wd.lastCheckAt : ''})`
         : 'Watchdog: standby'
       const rejLine = snap.activeRejections.length > 0
-        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role})`).join(', ')}`
+        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role}): ${r.title}`).join(', ')}`
         : 'Active Merge-Gate Rejections: none'
 
       const lines = [
         `Runtime: dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
         `Swarm: "${snap.swarm.title}" (id=${swarmId}, gen=${snap.swarm.generation ?? 1}, status=${snap.swarm.status}, head=#${snap.headSeq}${snap.swarm.project_root ? ', project_root=' + snap.swarm.project_root : ''})`,
-        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} active (configured=${snap.concurrency.configuredLimit}, queued=${snap.concurrency.queued}, 429_hits=${snap.concurrency.rateLimitHits}) [注：限制的是在途 LLM 请求数，≠ 活跃成员数]`,
-        `Members Summary: ${ms.totalActive} active (${ms.working} working, ${ms.queued} queued, ${ms.waiting} waiting, ${ms.starting} starting, ${ms.zombie} zombie, ${ms.error} error) · ${ms.killed} killed`,
+        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} active (configured=${snap.concurrency.configuredLimit}, queued=${snap.concurrency.queued}, 429_hits=${snap.concurrency.rateLimitHits}) [caps in-flight LLM requests, NOT active member count]`,
+        `Members Summary: ${ms.totalActive} active (${ms.working} working, ${ms.queued} queued, ${ms.waiting} waiting, ${ms.starting} starting, ${ms.zombie} zombie, ${ms.error} error) | ${ms.killed} killed`,
         wdLine,
         rejLine,
         `Channels: ${snap.channels.map(c => '#' + c).join(', ')}`,
         'Roster:',
         ...snap.members.map(m => (
-          `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '· ' + m.stepSummary : ''}`
+          `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '| ' + m.stepSummary : ''}`
         )),
       ]
       return {
@@ -1077,10 +1079,10 @@ export function createSwarmTools(runtime) {
         const targetName = String(args?.name ?? '').trim()
         const target = members[targetName]
         if (!target || target.killed) {
-          return { ok: false, text: `[FORMAT_ERROR: swarm_model] 成员 "@${targetName}" 不存在或已销毁。` }
+          return { ok: false, text: `[FORMAT_ERROR: swarm_model] Member "@${targetName}" does not exist or is retired.` }
         }
         if (callerName !== 'coordinator' && target.parent !== callerName && callerName !== targetName) {
-          return { ok: false, text: `[PERMISSION_ERROR: swarm_model] @${callerName} 无权切换 @${targetName} 的模型。` }
+          return { ok: false, text: `[PERMISSION_ERROR: swarm_model] @${callerName} is not authorized to hot-swap @${targetName}.` }
         }
         const nextProvider = typeof args.provider === 'string' && args.provider.trim() ? args.provider.trim() : target.applied_provider
         const nextModel = String(args.model).trim()
@@ -1101,7 +1103,7 @@ export function createSwarmTools(runtime) {
           member_alive: swapped.member_alive === true,
           turn_count: swapped.turn_count ?? 0,
           last_turn_at: swapped.last_turn_at ?? null,
-          text: `[swarm_model OK] @${targetName} 模型已热切为 ${swapped.provider}/${swapped.model} (member_alive=${swapped.member_alive === true}, turn_count=${swapped.turn_count ?? 0}, last_turn_at=${swapped.last_turn_at ?? 'none'})。`,
+          text: `[swarm_model OK] Hot-swapped @${targetName} to ${swapped.provider}/${swapped.model} (member_alive=${swapped.member_alive === true}, turn_count=${swapped.turn_count ?? 0}, last_turn_at=${swapped.last_turn_at ?? 'none'}).`,
         }
       })
     },
@@ -1126,10 +1128,10 @@ export function createSwarmTools(runtime) {
         const targetName = String(args?.name ?? '').trim()
         const member = members[targetName]
         if (!member) {
-          return { ok: false, text: `[FORMAT_ERROR: swarm_land] 成员 "@${targetName}" 不存在。` }
+          return { ok: false, text: `[FORMAT_ERROR: swarm_land] Member "@${targetName}" does not exist.` }
         }
         if (member.workspace_mode === 'inherit' || !member.worktree_path) {
-          return { ok: true, text: `[swarm_land] @${targetName} 使用的是 inherit 共享工作区，修改已直接在主工作区中，无需合并。` }
+          return { ok: true, text: `[swarm_land] @${targetName} uses workspace="inherit"; edits are already in the main workspace.` }
         }
 
         if (args.action === 'apply') {
@@ -1138,11 +1140,11 @@ export function createSwarmTools(runtime) {
             ? args.override_reason.trim()
             : null
           if (activeRejections.length > 0 && !overrideReason) {
-            const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role})`).join('; ')
+            const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
             return {
               ok: false,
               blocked_by_rejections: activeRejections,
-              text: `[GATE_BLOCKED: swarm_land] 合并 @${targetName} 被门禁阻断！存在未解除的验收拒绝：[${list}]。请先修复并让评审方发 verdict="approve" 解除，或传 override_reason 强制覆盖。`,
+              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by unresolved rejection(s): [${list}]. Resolve and get verdict="approve", or pass override_reason to override.`,
             }
           }
           if (activeRejections.length > 0 && overrideReason) {
@@ -1152,7 +1154,8 @@ export function createSwarmTools(runtime) {
               kind: 'decision',
               verdict: 'override',
               silent: true,
-              text: `[GATE_OVERRIDE] @${callerName} 强制合并 @${targetName}（覆盖未解除拒绝 ${activeRejections.map(r => '#' + r.seq).join(', ')}）：${overrideReason}`,
+              title: `Gate override: land @${targetName}`,
+              text: `[GATE_OVERRIDE] @${callerName} landed @${targetName} overriding rejection(s) ${activeRejections.map(r => '#' + r.seq).join(', ')}: ${overrideReason}`,
             })
           }
         }
@@ -1171,7 +1174,7 @@ export function createSwarmTools(runtime) {
           return {
             ok: true,
             files: res.files,
-            text: `[swarm_land DIFF @${targetName}] 变更文件 (${res.files.length}): ${res.files.join(', ') || '无'}\n\n${res.patch.slice(0, 6000)}`,
+            text: `[swarm_land DIFF @${targetName}] Changed files (${res.files.length}): ${res.files.join(', ') || 'none'}\n\n${res.patch.slice(0, 6000)}`,
           }
         }
         store.updateMember(swarmId, targetName, m => ({ ...m, landed: true }))
@@ -1205,18 +1208,18 @@ export function createSwarmTools(runtime) {
         const targetName = String(args?.name ?? '').trim()
         const rawTarget = members[targetName]
         if (!rawTarget) {
-          return { ok: false, text: `[FORMAT_ERROR: swarm_kill] 成员 "@${targetName}" 不存在。` }
+          return { ok: false, text: `[FORMAT_ERROR: swarm_kill] Member "@${targetName}" does not exist.` }
         }
         if (targetName === 'coordinator') {
-          return { ok: false, text: '[FORMAT_ERROR: swarm_kill] 不能销毁 coordinator 主会话。' }
+          return { ok: false, text: '[FORMAT_ERROR: swarm_kill] Cannot retire the coordinator root session.' }
         }
         if (rawTarget.killed) {
-          return { ok: true, text: `[swarm_kill] @${targetName} 已经是 killed 状态。` }
+          return { ok: true, text: `[swarm_kill] @${targetName} is already retired (killed).` }
         }
         if (callerName !== 'coordinator' && rawTarget.parent !== callerName) {
           return {
             ok: false,
-            text: `[PERMISSION_ERROR: swarm_kill] 权限拒绝：@${callerName} 只能销毁自己招的帮手，无权销毁 @${targetName}（由 @${rawTarget.parent} 创建）。`,
+            text: `[PERMISSION_ERROR: swarm_kill] @${callerName} may only retire members it spawned; @${targetName} was spawned by @${rawTarget.parent}.`,
           }
         }
 
@@ -1236,7 +1239,7 @@ export function createSwarmTools(runtime) {
           if (!rmRes.ok) {
             return {
               ok: false,
-              text: `[SAFETY_BLOCK: swarm_kill] 成员 @${targetName} 的独立工作区还有未合并的修改 (${(rmRes.files ?? []).join(', ')})！直接 kill 会永久删除其代码。\n请先调用 swarm_land({"name": "${targetName}", "action": "apply"}) 合并代码，或确认废弃后传 {"name": "${targetName}", "force": true}。`,
+              text: `[SAFETY_BLOCK: swarm_kill] @${targetName} still has unmerged worktree changes (${(rmRes.files ?? []).join(', ')}). Run swarm_land({"name": "${targetName}", "action": "apply"}) first, or pass force=true to discard intentionally.`,
             }
           }
         } else if (target.worktree_path && target.worktree_path !== mainCwd) {
@@ -1264,7 +1267,7 @@ export function createSwarmTools(runtime) {
           return {
             ok: true,
             name_released: true,
-            text: `[swarm_kill OK] 未曾运行的成员 @${targetName} (turns=0, post=#0) 已清理，名字 "${targetName}" 已释放可直接复用。`,
+            text: `[swarm_kill OK] Cleaned up never-started member @${targetName} (turns=0, post=#0); name "${targetName}" has been released for reuse.`,
           }
         }
 
@@ -1278,12 +1281,12 @@ export function createSwarmTools(runtime) {
         }))
         runtime.notifyProjectionChanged(swarmId)
 
-        const handoverNote = handoverTo ? `（责任已交接给 @${handoverTo}${killReason ? '：' + killReason : ''}）` : ''
+        const handoverNote = handoverTo ? ` (handed over to @${handoverTo}${killReason ? ': ' + killReason : ''})` : ''
         return {
           ok: true,
           name_released: false,
           handover_to: handoverTo,
-          text: `[swarm_kill OK] 成员 @${targetName} 已退役并清理工作区${handoverNote}（因已留下历史楼层，名字 "${targetName}" 永久保留以维护溯源链）。`,
+          text: `[swarm_kill OK] Retired @${targetName} and cleaned up its worktree${handoverNote} (name tombstoned to preserve board history).`,
         }
       })
     },
@@ -1306,7 +1309,7 @@ export function createSwarmTools(runtime) {
 /** Detect if the user already specified a concurrency limit in `/swarm <task>`. */
 function extractInlineConcurrency(rawText) {
   if (!rawText) return null
-  const m = /(?:(\d+)\s*(?:并发|槽位?|slots?)|(?:concurrency|并发(?:数|槽位?)?)\s*[:=：]?\s*(\d+))/i.exec(rawText)
+  const m = /(?:(\d+)\s*(?:slots?|concurrency)|(?:concurrency|slots?)\s*[:=]?\s*(\d+))/i.exec(rawText)
   if (!m) return null
   const num = Number(m[1] || m[2])
   return Number.isInteger(num) && num >= 1 ? num : null
@@ -1330,13 +1333,13 @@ export function createSwarmCommand(runtime) {
 
       if (raw === 'status' || raw === 'board') {
         if (!store.exists(swarmId)) {
-          return { kind: 'success', text: '当前会话尚未启动 Swarm。使用 `/swarm <任务描述>` 启动。' }
+          return { kind: 'success', text: 'No active Swarm in this session. Start one with `/swarm <task>`.' }
         }
         const snap = buildSwarmProjectionSnapshot({ store, swarmId, runtime })
         const ms = snap.memberSummary
         return {
           kind: 'success',
-          text: `🐝 Swarm "${snap.swarm.title}" (${snap.swarm.status}) · 成员 ${ms.totalActive}人 (${ms.working} working / ${ms.waiting} waiting / ${ms.zombie} zombie) · LLM在途槽 ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} · 黑板 #${snap.headSeq}`,
+          text: `Swarm "${snap.swarm.title}" (${snap.swarm.status}) | Members: ${ms.totalActive} (${ms.working} working / ${ms.waiting} waiting / ${ms.zombie} zombie) | LLM Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} | Board: #${snap.headSeq}`,
         }
       }
 
@@ -1344,14 +1347,14 @@ export function createSwarmCommand(runtime) {
       if (concMatch) {
         const limit = Number(concMatch[1])
         if (!Number.isInteger(limit) || limit < 1) {
-          return { kind: 'error', text: '模型并发槽位数必须是 >= 1 的正整数。' }
+          return { kind: 'error', text: 'LLM concurrency slot limit must be a positive integer >= 1.' }
         }
         concurrencyGate.setLimit(limit)
         if (store.exists(swarmId)) {
           store.updateSwarm(swarmId, { concurrency_limit: limit, concurrency_confirmed: true })
           runtime.notifyProjectionChanged(swarmId)
         }
-        return { kind: 'success', text: `[dsh-swarm] 已将模型在途并发槽位热更新为 ${limit}。` }
+        return { kind: 'success', text: `[dsh-swarm] Updated in-flight LLM concurrency slots to ${limit}.` }
       }
 
       const discovered = typeof runtime.discoverAvailableModels === 'function'
@@ -1383,26 +1386,26 @@ export function createSwarmCommand(runtime) {
 
       const kickoffPrompt = [
         `[USER INVOKED /swarm]`,
-        `任务描述：${raw || '请协助完成任务'}`,
+        `Task request: ${raw || 'Assist with the user task'}`,
         ``,
-        `【当前 DSH 环境真实模型路由（严禁捏造 provider="internal"！）】`,
-        `- 当前主会话模型：\`${currentRouteText}\``,
-        `- 当前 DSH 已注册可用模型：\`${availableRoutesList}\``,
-        ...(inlineConc !== null ? [`- 已从用户指令识别到并发槽位：\`${inlineConc}\`（无需再重复确认并发数！）`] : []),
+        `[DISCOVERED DSH MODEL ROUTES — never invent provider="internal"]`,
+        `- Active session model: \`${currentRouteText}\``,
+        `- Registered available routes: \`${availableRoutesList}\``,
+        ...(inlineConc !== null ? [`- Parsed inline concurrency slots from user input: \`${inlineConc}\` (do not re-ask concurrency)`] : []),
         ``,
-        `【PM 开工必问（一次问完；用户已明确给出的参数绝不重复确认！）】`,
-        `你是产品经理态（用户才是老板）。用一次 ask_user_question 只确认以下尚未明确的项：`,
-        `1. **真正目标**：这次真正想产出的核心价值是什么？（代码 / 架构 / 评测结论 / 验证某假设）`,
-        `2. **验收底线**：什么程度算“够了”？（能跑 / 真浏览器通过 / 可上线 / 流程跑通）`,
-        `3. **范围与禁区**：明确不做什么。`,
-        `4. **模型在途并发槽位（≠ 最大成员人数）与模型偏好**：仅在用户尚未指定时询问；默认推荐沿用当前会话模型 (${currentRouteText})。`,
+        `[PM PHASE-0 ALIGNMENT — ask once, only missing items, reply in the user's language]`,
+        `You are in Product Manager mode (the user is the boss). Use a single ask_user_question call to clarify only what is still unspecified:`,
+        `1. True Goal: What exact deliverable matters most? (code / architecture / benchmark / hypothesis test)`,
+        `2. Acceptance Bar: What counts as done?`,
+        `3. Scope & Non-Goals: What should explicitly be excluded?`,
+        `4. In-Flight LLM Slots (NOT max member count) & Model Preference: only ask if the user did not already specify; recommend inheriting the active session model (${currentRouteText}).`,
         ``,
-        `【组织契约提醒】不写架构/业务代码/测试工具！需要多人协作时组建权责对等团队（可配 role="architect" / "worker" / "verifier"），通过弱争斗与 2 轮协商收敛，休眠时用 swarm_wait({ wake_kinds: ["alert","question","decision","review"] }) 降噪。`,
+        `[ORG CONTRACT REMINDER] Do NOT write architecture docs, production code, or test harness scripts yourself. Spawn peer-accountable roles (architect / worker / verifier), require meaningful titles on every post_board call, and park with swarm_wait({ wake_kinds: ["alert","question","decision","review"] }) for low noise.`,
       ].join('\n')
       agent.steer(buildSwarmSystemMessage(kickoffPrompt, 'Swarm kickoff'))
       return {
         kind: 'success',
-        text: `🐝 已进入 Swarm 产品经理协调模式（当前会话模型: ${currentRouteText}${inlineConc ? `, 识别并发槽=${inlineConc}` : ''}），正在对齐目标与开工条件...`,
+        text: `Swarm Coordinator mode activated (session model: ${currentRouteText}${inlineConc ? `, inline slots=${inlineConc}` : ''}). Aligning goals and launch parameters...`,
       }
     },
   }
