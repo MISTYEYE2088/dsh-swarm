@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "DeepSeek Harness out-of-tree Swarm plugin: 3-file append-only blackboard (board.jsonl, members.json, swarm.json + plan.json), zero-token swarm_wait with Stop-Hook race lock, polite 4-6 concurrency gate, and strict format guardrails for glm5.3 / deepseek4.1f.",
   "license": "MIT",
   "repository": {

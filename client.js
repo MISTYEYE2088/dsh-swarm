@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.1'
+    var VERSION = '0.3.2'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -193,10 +193,10 @@ window.__ModuleLoader__.load({
         if (!ev || typeof ev.seq !== 'number' || ev.seq > limit) continue
         visibleEvents.push(ev)
         seqSet.add(ev.seq)
-        if (ev.from && !memberMap.has(ev.from)) {
+        if (ev.from && ev.from !== '__table__' && !memberMap.has(ev.from)) {
           memberMap.set(ev.from, { name: ev.from, role: ev.from === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
         }
-        if (ev.to && !memberMap.has(ev.to)) {
+        if (ev.to && ev.to !== '__table__' && !memberMap.has(ev.to)) {
           memberMap.set(ev.to, { name: ev.to, role: ev.to === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
         }
       }
@@ -239,18 +239,20 @@ window.__ModuleLoader__.load({
         seqToAge[distinctSeqs[q]] = (distinctSeqs.length - 1) - q
       }
 
-      // Keep the latest event per directed pair within each step; drop edges faded past maxSteps
       var agedEdges = []
       for (var e = 0; e < visibleEvents.length; e += 1) {
         var item = visibleEvents[e]
         var age = seqToAge[item.seq]
         var style = computeEdgeVisualStyle(age, maxSteps)
         if (!style.visible) continue
-        if (!seatByName[item.from] || !seatByName[item.to]) continue
+        var isBroadcast = item.broadcast === true || item.to === '__table__'
+        if (!seatByName[item.from]) continue
+        if (!isBroadcast && !seatByName[item.to]) continue
         agedEdges.push({
           seq: item.seq,
           from: item.from,
-          to: item.to,
+          to: isBroadcast ? '__table__' : item.to,
+          broadcast: isBroadcast,
           kind: item.kind || 'report',
           title: item.title || '',
           time: item.time || '',
@@ -289,10 +291,6 @@ window.__ModuleLoader__.load({
       highlightedSeq: null,
       expandedSeqs: {}, // seq -> true (all posts collapsed by default)
       replaySeq: null, // null means LIVE (headSeq)
-      composerTitle: '',
-      composerText: '',
-      composerChannel: 'main',
-      posting: false,
       loading: false,
       selectedSwarmId: null,
       resolvedSwarmId: null,
@@ -960,6 +958,8 @@ window.__ModuleLoader__.load({
           if (p.agent !== m && mentions.indexOf(m) === -1) return false
         }
         return true
+      }).sort(function (a, b) {
+        return (b.seq || 0) - (a.seq || 0)
       })
       var expandedMap = ui.expandedSeqs || {}
       var expandedCount = filtered.filter(function (p) { return Boolean(expandedMap[p.seq]) }).length
@@ -984,7 +984,7 @@ window.__ModuleLoader__.load({
           React.createElement(
             'div',
             { style: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap' } },
-            React.createElement('span', null, filtered.length + ' post(s) · collapsed by default'),
+            React.createElement('span', null, filtered.length + ' post(s) · newest first · collapsed'),
             ui.filterMember || ui.filterChannel
               ? React.createElement(
                   'button',
@@ -1047,7 +1047,7 @@ window.__ModuleLoader__.load({
                   textAlign: 'center',
                 },
               },
-              'No board posts yet. Post from the bar below or run /swarm <task> in the main composer.',
+              'No board posts yet. Run /swarm <task> in the main composer to start.',
             )
           : filtered.map(function (p) {
               var isHighlighted = ui.highlightedSeq === p.seq
@@ -1292,6 +1292,8 @@ window.__ModuleLoader__.load({
         { cx: 170, cy: 152, seatR: 102, maxSteps: MAX_VISIBLE_EDGE_STEPS },
       )
       var nodeR = 16
+      var tableR = 54
+      var latestIsBroadcast = layout.latestEdges.some(function (ed) { return ed.broadcast === true || ed.to === '__table__' })
       var markerColors = [
         '#facc15',
         '#d97706',
@@ -1436,16 +1438,16 @@ window.__ModuleLoader__.load({
                 )
               }),
             ),
-            // Center round table ring
+            // Center round table ring (highlights yellow when latest round is @all broadcast to center)
             React.createElement('circle', {
               cx: layout.cx,
               cy: layout.cy,
-              r: 58,
-              fill: 'var(--dsw-alias-bg-layer-3)',
-              fillOpacity: 0.45,
-              stroke: 'var(--dsw-alias-border-l2)',
-              strokeWidth: 1,
-              strokeDasharray: '4 3',
+              r: tableR,
+              fill: latestIsBroadcast ? 'rgba(250, 204, 21, 0.08)' : 'var(--dsw-alias-bg-layer-3)',
+              fillOpacity: latestIsBroadcast ? 1 : 0.45,
+              stroke: latestIsBroadcast ? '#facc15' : 'var(--dsw-alias-border-l2)',
+              strokeWidth: latestIsBroadcast ? 1.8 : 1,
+              strokeDasharray: latestIsBroadcast ? 'none' : '4 3',
             }),
             React.createElement('circle', {
               cx: layout.cx,
@@ -1461,7 +1463,7 @@ window.__ModuleLoader__.load({
                 x: layout.cx,
                 y: layout.cy - 4,
                 textAnchor: 'middle',
-                fill: 'var(--dsw-alias-label-secondary)',
+                fill: latestIsBroadcast ? '#fef08a' : 'var(--dsw-alias-label-secondary)',
                 fontSize: '11',
                 fontWeight: '600',
               },
@@ -1476,15 +1478,20 @@ window.__ModuleLoader__.load({
                 fill: 'var(--dsw-alias-label-tertiary)',
                 fontSize: '9.5',
               },
-              layout.totalRounds + ' round(s)',
+              latestIsBroadcast ? '@all broadcast' : (layout.totalRounds + ' round(s)'),
             ),
-            // Directed curved arrows (oldest dark faint first -> latest bright yellow on top!)
+            // Directed arrows (oldest dark faint first -> latest bright yellow on top!)
             layout.edges.map(function (ed, idx) {
               var fromSeat = layout.seatByName[ed.from]
-              var toSeat = layout.seatByName[ed.to]
-              if (!fromSeat || !toSeat || ed.from === ed.to) return null
-              var dx = toSeat.x - fromSeat.x
-              var dy = toSeat.y - fromSeat.y
+              if (!fromSeat) return null
+              var isBroadcast = ed.broadcast === true || ed.to === '__table__'
+              var toX = isBroadcast ? layout.cx : (layout.seatByName[ed.to] && layout.seatByName[ed.to].x)
+              var toY = isBroadcast ? layout.cy : (layout.seatByName[ed.to] && layout.seatByName[ed.to].y)
+              if (typeof toX !== 'number' || typeof toY !== 'number') return null
+              if (!isBroadcast && ed.from === ed.to) return null
+
+              var dx = toX - fromSeat.x
+              var dy = toY - fromSeat.y
               var dist = Math.sqrt(dx * dx + dy * dy) || 1
               var ux = dx / dist
               var uy = dy / dist
@@ -1493,14 +1500,24 @@ window.__ModuleLoader__.load({
 
               var sx = fromSeat.x + ux * (nodeR + 3)
               var sy = fromSeat.y + uy * (nodeR + 3)
-              var ex = toSeat.x - ux * (nodeR + 8)
-              var ey = toSeat.y - uy * (nodeR + 8)
-              var curveOffset = Math.min(28, Math.max(12, dist * 0.16))
-              var qcx = (sx + ex) / 2 + nx * curveOffset
-              var qcy = (sy + ey) / 2 + ny * curveOffset
-              var pathD = 'M ' + sx.toFixed(1) + ' ' + sy.toFixed(1) + ' Q ' + qcx.toFixed(1) + ' ' + qcy.toFixed(1) + ' ' + ex.toFixed(1) + ' ' + ey.toFixed(1)
-              var midX = 0.25 * sx + 0.5 * qcx + 0.25 * ex
-              var midY = 0.25 * sy + 0.5 * qcy + 0.25 * ey
+              var endPad = isBroadcast ? (tableR + 6) : (nodeR + 8)
+              var ex = toX - ux * endPad
+              var ey = toY - uy * endPad
+              var pathD
+              var midX
+              var midY
+              if (isBroadcast) {
+                pathD = 'M ' + sx.toFixed(1) + ' ' + sy.toFixed(1) + ' L ' + ex.toFixed(1) + ' ' + ey.toFixed(1)
+                midX = (sx + ex) / 2
+                midY = (sy + ey) / 2
+              } else {
+                var curveOffset = Math.min(28, Math.max(12, dist * 0.16))
+                var qcx = (sx + ex) / 2 + nx * curveOffset
+                var qcy = (sy + ey) / 2 + ny * curveOffset
+                pathD = 'M ' + sx.toFixed(1) + ' ' + sy.toFixed(1) + ' Q ' + qcx.toFixed(1) + ' ' + qcy.toFixed(1) + ' ' + ex.toFixed(1) + ' ' + ey.toFixed(1)
+                midX = 0.25 * sx + 0.5 * qcx + 0.25 * ex
+                midY = 0.25 * sy + 0.5 * qcy + 0.25 * ey
+              }
 
               return React.createElement(
                 'g',
@@ -1652,7 +1669,7 @@ window.__ModuleLoader__.load({
                   React.createElement(
                     'div',
                     { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } },
-                    '@' + ed.from + ' -> @' + ed.to + ' (' + ed.kind + ')',
+                    '@' + ed.from + ' -> ' + (ed.broadcast || ed.to === '__table__' ? 'Round Table (@all)' : '@' + ed.to) + ' (' + ed.kind + ')',
                   ),
                   ed.title
                     ? React.createElement(
@@ -1680,22 +1697,6 @@ window.__ModuleLoader__.load({
         || sessionId
         || 'default-swarm'
       var swarmsList = Array.isArray(ui.swarmsList) ? ui.swarmsList : []
-
-      function submitComposerPost() {
-        var curr = uiStore.getSnapshot()
-        var txt = String(curr.composerText || '').trim()
-        var ttl = String(curr.composerTitle || '').trim()
-        if (!txt) return
-        updateUi({ composerTitle: '', composerText: '', posting: true })
-        postSwarmAction({
-          action: 'post',
-          sessionId: sessionId,
-          swarmId: targetSwarmId,
-          title: ttl || undefined,
-          text: txt,
-          channel: curr.filterChannel || 'main',
-        }).then(function () { updateUi({ posting: false }) })
-      }
 
       return React.createElement(
         'div',
@@ -1915,86 +1916,6 @@ window.__ModuleLoader__.load({
                 ? renderGraphTab(snap, ui)
                 : renderBoardTab(snap, ui),
         ),
-        ui.activeTab === 'board'
-          ? React.createElement(
-              'div',
-              {
-                style: {
-                  flex: '0 0 auto',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  gap: '6px',
-                  padding: '8px 12px',
-                  borderTop: '0.5px solid var(--dsw-alias-border-l3)',
-                  background: 'var(--dsw-alias-bg-layer-1)',
-                },
-              },
-              React.createElement('input', {
-                type: 'text',
-                value: ui.composerTitle || '',
-                placeholder: 'Title (meaningful summary, optional for human post)...',
-                onChange: function (e) { updateUi({ composerTitle: e.target.value }) },
-                style: {
-                  width: '100%',
-                  boxSizing: 'border-box',
-                  height: '26px',
-                  padding: '0 9px',
-                  borderRadius: '6px',
-                  border: '0.5px solid var(--dsw-alias-border-l2)',
-                  background: 'var(--dsw-alias-bg-layer-2)',
-                  color: 'var(--dsw-alias-label-primary)',
-                  fontSize: '11.5px',
-                },
-              }),
-              React.createElement(
-                'div',
-                { style: { display: 'flex', gap: '6px' } },
-                React.createElement('input', {
-                  type: 'text',
-                  value: ui.composerText || '',
-                  placeholder: 'Post to board (e.g. @verifier check #1)...',
-                  onChange: function (e) { updateUi({ composerText: e.target.value }) },
-                  onKeyDown: function (e) {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault()
-                      submitComposerPost()
-                    }
-                  },
-                  style: {
-                    flex: 1,
-                    minWidth: 0,
-                    height: '30px',
-                    padding: '0 10px',
-                    borderRadius: '6px',
-                    border: '0.5px solid var(--dsw-alias-border-l2)',
-                    background: 'var(--dsw-alias-bg-layer-2)',
-                    color: 'var(--dsw-alias-label-primary)',
-                    fontSize: '12px',
-                  },
-                }),
-                React.createElement(
-                  'button',
-                  {
-                    type: 'button',
-                    disabled: ui.posting,
-                    onClick: submitComposerPost,
-                    style: {
-                      height: '30px',
-                      padding: '0 12px',
-                      borderRadius: '6px',
-                      border: '0.5px solid var(--dsw-alias-border-l2)',
-                      background: 'var(--dsw-alias-bg-layer-3)',
-                      color: 'var(--dsw-alias-label-primary)',
-                      fontSize: '12px',
-                      fontWeight: 500,
-                      cursor: 'pointer',
-                    },
-                  },
-                  'Send',
-                ),
-              ),
-            )
-          : null,
       )
     }
 

@@ -1046,7 +1046,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.1/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.2/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1103,7 +1103,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.1/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.2/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -1598,6 +1598,72 @@ async function test_client_round_table_edge_aging_and_layout() {
   assert.equal(topEdge.seq, 10)
   assert.equal(topEdge.style.isLatest, true)
   assert.equal(topEdge.style.color, '#facc15')
+
+  // 3. Verify `@all` broadcast edges route to `__table__` without creating a `__table__` seat
+  const bcEvents = [
+    ...events,
+    { seq: 11, from: 'coordinator', to: '__table__', broadcast: true, kind: 'decision', title: 'Global freeze announcement' },
+  ]
+  const bcLayout = loadedMod.computeRoundTableLayout(members, bcEvents, 11)
+  assert.equal(bcLayout.seats.some(s => s.name === '__table__'), false)
+  assert.equal(bcLayout.latestEdges.length, 1)
+  assert.equal(bcLayout.latestEdges[0].to, '__table__')
+  assert.equal(bcLayout.latestEdges[0].broadcast, true)
+}
+
+async function test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center() {
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-rt-edges') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-rt', session: { header: { id: 'sess-rt', cwd: tempRoot } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'RT Edges', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'arch-lead', role: 'architect', brief: '[OWNERSHIP] docs\n[FORBIDDEN] src\n[DONE_CRITERIA] arch' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-ui', role: 'worker', brief: '[OWNERSHIP] ui\n[FORBIDDEN] docs\n[DONE_CRITERIA] ui' },
+    { agent: coordAgent },
+  )
+
+  const postTool = registeredTools.get('post_board')
+  // Peer-to-peer post from impl-ui to arch-lead (coordinator has wake_mode='anything' by default!)
+  const p2p = await postTool.execute(
+    { title: 'UI interface proposal for combat HUD', text: '@arch-lead Please review UI state proposal', mentions: ['arch-lead'], kind: 'question' },
+    { agent: { id: 'sess-rt__impl-ui' } },
+  )
+  assert.equal(p2p.ok, true)
+
+  // @all broadcast from coordinator -> must route to `__table__` center
+  const bc = await postTool.execute(
+    { title: 'Wave 1 freeze announcement to all', text: '@all Freeze wave 1 scope now', mentions: ['all'], kind: 'decision' },
+    { agent: coordAgent },
+  )
+  assert.equal(bc.ok, true)
+
+  // Retire impl-ui (killed: true) and verify historical peer edge impl-ui -> arch-lead is STILL preserved!
+  await registeredTools.get('swarm_kill').execute({ name: 'impl-ui' }, { agent: coordAgent })
+  const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })
+  const edges = statusRes.snapshot.edgeEvents
+
+  const p2pEdges = edges.filter(e => e.seq === p2p.seq)
+  assert.equal(p2pEdges.length, 1, 'Peer post must NOT fan out spuriously to coordinator')
+  assert.equal(p2pEdges[0].from, 'impl-ui')
+  assert.equal(p2pEdges[0].to, 'arch-lead')
+
+  const bcEdges = edges.filter(e => e.seq === bc.seq)
+  assert.equal(bcEdges.length, 1)
+  assert.equal(bcEdges[0].from, 'coordinator')
+  assert.equal(bcEdges[0].to, '__table__')
+  assert.equal(bcEdges[0].broadcast, true)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -1666,6 +1732,7 @@ try {
   await runTest('test_project_root_subdir_git_worktree_isolation', test_project_root_subdir_git_worktree_isolation)
   await runTest('test_validator_enforces_meaningful_post_title', test_validator_enforces_meaningful_post_title)
   await runTest('test_client_round_table_edge_aging_and_layout', test_client_round_table_edge_aging_and_layout)
+  await runTest('test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center', test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

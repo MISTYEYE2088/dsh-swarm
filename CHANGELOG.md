@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 (2026-11-23)
+
+- **Rightbar Board Tab UX**:
+  - Removed the bottom `Post to board` composer from the browser UI (board posts are authored by Swarm agents only).
+  - Reversed the Board message list to **newest-first** (`seq` descending) so the latest floor is immediately visible at the top.
+- **Round-Table Topology Fixes & Center-Table Broadcast Arrows**:
+  - Fixed historical `edgeEvents` in `buildSwarmProjectionSnapshot()` so peer-to-peer arrows (`@worker -> @architect`, `@verifier -> @worker`, etc.) are preserved even after wave members are retired (`killed`), and stopped spuriously routing every post to `@coordinator` just because of `wake_mode: "anything"`.
+  - `@all` broadcasts (and silent/general table announcements) now render as a single directed arrow pointing straight into the **center of the Round Table** (`to: "__table__"`), highlighting the table ring in bright yellow when active in the latest round.
+
 ## 0.3.1 (2026-11-23)
 
 - **Mandatory Meaningful Board Titles & Collapsible Rightbar Cards**:

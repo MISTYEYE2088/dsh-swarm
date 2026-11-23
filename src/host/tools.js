@@ -195,22 +195,76 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     })
   }
 
-  // Compute directed @mention graph edges for every post so the Round-Table Topology
-  // view can render aging arrows and latest-round titles up to any `replaySeq`.
+  // Compute historical directed @mention topology edges for every post so the Round-Table
+  // view shows true peer-to-peer exchanges (preserving later-killed members, omitting spurious
+  // `wake_mode === 'anything'` coordinator fanout, and routing `@all` / broadcasts to `__table__`).
   const edgeEvents = []
   for (const rec of records) {
-    if (!rec || rec.type === 'control' || rec.silent === true) continue
-    const targets = store.resolveTargetsForPost(swarmId, rec)
+    if (!rec || rec.type === 'control') continue
     const recTitle = rec.title || deriveFallbackTitle(rec.text, rec.kind || 'post')
-    for (const target of targets) {
+    const rawMentions = Array.isArray(rec.mentions) ? rec.mentions : []
+    const rawChannels = Array.isArray(rec.channel_mentions) ? rec.channel_mentions : []
+
+    if (rec.silent === true || rawMentions.includes('all')) {
       edgeEvents.push({
         seq: rec.seq,
         from: rec.agent,
-        to: target,
+        to: '__table__',
+        broadcast: true,
         kind: rec.kind,
         title: recTitle,
         time: rec.time || '',
       })
+      continue
+    }
+
+    const peerTargets = new Set()
+    for (const token of rawMentions) {
+      if (!token || token === rec.agent || token === 'monitor') continue
+      if (members[token]) {
+        peerTargets.add(token)
+        continue
+      }
+      // Expand @group to all members of that group (including later-killed historical members)
+      for (const [mName, mObj] of Object.entries(members)) {
+        if (mName !== rec.agent && mObj && mObj.group === token) {
+          peerTargets.add(mName)
+        }
+      }
+    }
+    if (rawChannels.length > 0) {
+      const chAtSeq = replayChannelsAt(records, rec.seq)
+      for (const mName of Object.keys(members)) {
+        if (mName === rec.agent) continue
+        const subs = new Set(chAtSeq.subscriptionsOf(mName))
+        if (rawChannels.some(ch => ch !== 'main' && subs.has(ch))) {
+          peerTargets.add(mName)
+        }
+      }
+    }
+
+    if (peerTargets.size === 0) {
+      edgeEvents.push({
+        seq: rec.seq,
+        from: rec.agent,
+        to: '__table__',
+        broadcast: true,
+        kind: rec.kind,
+        title: recTitle,
+        time: rec.time || '',
+      })
+    } else {
+      for (const target of peerTargets) {
+        edgeEvents.push({
+          seq: rec.seq,
+          from: rec.agent,
+          to: target,
+          broadcast: false,
+          kind: rec.kind,
+          title: recTitle,
+          time: rec.time || '',
+        })
+      }
     }
   }
 
@@ -302,7 +356,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.1', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.2', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -1020,7 +1074,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.1', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.2', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
