@@ -15,16 +15,39 @@
 //   - `apply(ctx, config)` wraps `applyWith(ctx, config)` in `try/catch` so an unexpected
 //     runtime failure never costs the user their DSH profile.
 
+import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 
-import { SwarmStore, defaultSwarmRoot } from './src/host/store.js'
+import { SwarmStore, defaultSwarmRoot, formatTime } from './src/host/store.js'
 import { ConcurrencyGate, PRIORITY, isConcurrencyFailure } from './src/host/concurrency-gate.js'
 import { handleTurnStopping, statusOf, buildSwarmSystemMessage } from './src/host/stop-hook.js'
 import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
+
+export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_LOADED_AT = new Date().toISOString()
+
+function detectGitCommit() {
+  try {
+    const dir = path.dirname(fileURLToPath(import.meta.url))
+    const headFile = path.join(dir, '.git', 'HEAD')
+    if (!fs.existsSync(headFile)) return 'release-0.2.0'
+    const head = fs.readFileSync(headFile, 'utf8').trim()
+    if (head.startsWith('ref: ')) {
+      const refPath = path.join(dir, '.git', head.slice(5).trim())
+      if (fs.existsSync(refPath)) return fs.readFileSync(refPath, 'utf8').trim().slice(0, 8)
+    }
+    return head.slice(0, 8)
+  } catch {
+    return 'release-0.2.0'
+  }
+}
+
+export const PLUGIN_COMMIT = detectGitCommit()
 
 export {
   SwarmStore,
@@ -336,12 +359,43 @@ export function applyWith(ctx, config, deps = {}) {
       turnStates.set(agentId, state)
     },
 
+    getRuntimeFingerprint() {
+      return {
+        version: PLUGIN_VERSION,
+        commit: PLUGIN_COMMIT,
+        loaded_at: PLUGIN_LOADED_AT,
+        swarm_root: swarmRoot,
+      }
+    },
+
+    getService(name, rootAgent) {
+      return rootAgent?.ctx?.get?.(name) ?? ctx.get?.(name)
+    },
+
     getParentModelRoute(rootAgent) {
       const reqCfg = rootAgent?.session?.requestHeader?.()?.config
       const agentOpts = rootAgent?.options
-      const defSel = ctx.get?.('agentDefaultModel')?.currentSelection?.()
-      const provider = reqCfg?.provider ?? agentOpts?.provider ?? defSel?.provider ?? ''
-      const model = reqCfg?.model ?? agentOpts?.model ?? defSel?.model ?? ''
+      const defSel = runtime.getService('agentDefaultModel', rootAgent)?.currentSelection?.()
+      let evProvider = ''
+      let evModel = ''
+      if (rootAgent?.id) {
+        const recent = sessionEventsByAgent.get(rootAgent.id) ?? []
+        for (let i = recent.length - 1; i >= 0; i -= 1) {
+          const ev = recent[i]
+          if (ev?.type === 'request/context' && ev.data?.provider) {
+            evProvider = ev.data.provider
+            evModel = ev.data.model ?? ''
+            break
+          }
+          if (ev?.type === 'request/header' && ev.data?.header?.config?.provider) {
+            evProvider = ev.data.header.config.provider
+            evModel = ev.data.header.config.model ?? ''
+            break
+          }
+        }
+      }
+      const provider = reqCfg?.provider ?? agentOpts?.provider ?? (evProvider || undefined) ?? defSel?.provider ?? ''
+      const model = reqCfg?.model ?? agentOpts?.model ?? (evModel || undefined) ?? defSel?.model ?? ''
       const maxTokens = reqCfg?.maxTokens ?? agentOpts?.maxTokens
       const reasoningEffort = reqCfg?.reasoningEffort ?? agentOpts?.reasoningEffort ?? defSel?.reasoningEffort
       return {
@@ -375,7 +429,7 @@ export function applyWith(ctx, config, deps = {}) {
 
       // Check DSH subagentModelSelection settings if configured
       try {
-        const subSel = ctx.get?.('subagentModelSelection')?.current?.()
+        const subSel = runtime.getService('subagentModelSelection', rootAgent)?.current?.()
         if (subSel && Array.isArray(subSel.allowedModels)) {
           for (const r of subSel.allowedModels) {
             addRoute(r.provider, r.model)
@@ -387,7 +441,7 @@ export function applyWith(ctx, config, deps = {}) {
 
       // Query registered providers and advertised models from ctx.llm
       try {
-        const llm = ctx.get?.('llm')
+        const llm = runtime.getService('llm', rootAgent)
         if (llm && typeof llm.listProviders === 'function') {
           const providers = llm.listProviders() ?? []
           for (const p of providers) {
@@ -426,31 +480,31 @@ export function applyWith(ctx, config, deps = {}) {
       }
 
       const isInherit = (val) => !val || val === 'inherit' || val === 'default' || val === 'current' || val === 'internal'
+      // R1/R4: Never allow sentinel values ('internal', 'inherit', 'default') to stay in rawProvider/rawModel!
       if (isInherit(rawModel)) {
         const fallbackModel = !isInherit(swarmMeta?.default_model)
           ? swarmMeta.default_model
           : parentRoute.model
-        rawModel = fallbackModel || rawModel
+        rawModel = isInherit(fallbackModel) ? '' : (fallbackModel || '')
       }
       if (isInherit(rawProvider)) {
         const fallbackProv = !isInherit(swarmMeta?.default_provider)
           ? swarmMeta.default_provider
           : parentRoute.provider
-        rawProvider = fallbackProv || rawProvider
+        rawProvider = isInherit(fallbackProv) ? '' : (fallbackProv || '')
       }
 
-      const llm = ctx.get?.('llm')
+      const llm = runtime.getService('llm', rootAgent)
       const registeredProviders = (llm && typeof llm.listProviders === 'function')
-        ? (llm.listProviders() ?? []).map(p => p.id)
+        ? (llm.listProviders() ?? []).map(p => p.id).filter(Boolean)
         : []
 
       if (registeredProviders.length > 0) {
-        const providerValid = registeredProviders.includes(rawProvider)
-        // Find matching route in discovered catalog
+        const providerValid = Boolean(rawProvider) && registeredProviders.includes(rawProvider)
         const exactMatch = routes.find(r => (
           (!providerValid || r.provider === rawProvider)
           && (r.model === rawModel || r.label === `${rawProvider}/${rawModel}`)
-        )) ?? routes.find(r => r.model.toLowerCase() === rawModel.toLowerCase())
+        )) ?? routes.find(r => rawModel && r.model.toLowerCase() === rawModel.toLowerCase())
           ?? routes.find(r => (
             rawModel
             && !isInherit(rawModel)
@@ -462,20 +516,30 @@ export function applyWith(ctx, config, deps = {}) {
           rawProvider = exactMatch.provider
           rawModel = exactMatch.model
         } else if (!providerValid) {
-          // Never allow an unregistered provider (like "internal") to reach DSH agent-loop!
-          rawProvider = parentRoute.provider || registeredProviders[0] || rawProvider
-          if (isInherit(rawModel) && parentRoute.model) {
+          rawProvider = (parentRoute.provider && registeredProviders.includes(parentRoute.provider))
+            ? parentRoute.provider
+            : (registeredProviders[0] || '')
+          if (!rawModel && parentRoute.model) {
             rawModel = parentRoute.model
           }
         }
+      } else {
+        // R4: Even when llm.listProviders() is absent or empty, fall back to parentRoute and strip sentinels
+        if (!rawProvider && parentRoute.provider && !isInherit(parentRoute.provider)) {
+          rawProvider = parentRoute.provider
+        }
+        if (!rawModel && parentRoute.model && !isInherit(parentRoute.model)) {
+          rawModel = parentRoute.model
+        }
       }
 
-      const finalProvider = rawProvider || parentRoute.provider || ''
-      const finalModel = rawModel || parentRoute.model || ''
+      const finalProvider = isInherit(rawProvider) ? '' : (rawProvider || '')
+      const finalModel = isInherit(rawModel) ? '' : (rawModel || '')
       const routeChanged = finalProvider !== parentRoute.provider || finalModel !== parentRoute.model
       return {
         provider: finalProvider,
         model: finalModel,
+        registeredProviders,
         ...(parentRoute.maxTokens !== undefined ? { maxTokens: parentRoute.maxTokens } : {}),
         ...(!routeChanged && parentRoute.reasoningEffort !== undefined
           ? { reasoningEffort: parentRoute.reasoningEffort }
@@ -615,7 +679,7 @@ export function applyWith(ctx, config, deps = {}) {
         verifierName,
       })
 
-      const agentsSvc = ctx.get?.('agents')
+      const agentsSvc = runtime.getService('agents', rootAgent)
       if (agentsSvc && typeof agentsSvc.create === 'function') {
         let seedEvents
         let inheritedEventCount
@@ -701,19 +765,35 @@ export function applyWith(ctx, config, deps = {}) {
       const targets = store.resolveTargetsForPost(swarmId, postRecord)
       const members = store.readMembers(swarmId)
       const woken = []
+      const unreachable = []
 
       for (const targetName of targets) {
+        if (targetName === 'monitor') {
+          const daemon = monitorDaemons.get(swarmId)
+          if (daemon) daemon.notifyBoardActivity(postRecord)
+          if (members.monitor) {
+            store.updateMember(swarmId, 'monitor', curr => ({
+              ...curr,
+              last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
+              last_read_seq: Math.max(curr.last_read_seq ?? 0, postRecord.seq),
+            }))
+          }
+          woken.push('monitor')
+          continue
+        }
         const m = members[targetName]
-        if (!m || m.killed) continue
+        if (!m || m.killed) {
+          unreachable.push(targetName)
+          continue
+        }
         const handle = memberHandles.get(`${swarmId}:${targetName}`)
         const liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
 
-        store.updateMember(swarmId, targetName, curr => ({
-          ...curr,
-          last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
-        }))
-
         if (liveAgent && typeof liveAgent.steer === 'function') {
+          store.updateMember(swarmId, targetName, curr => ({
+            ...curr,
+            last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
+          }))
           const wakeText = `[board] the latest message is #${postRecord.seq} from @${postRecord.agent} (channel #${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
@@ -724,9 +804,12 @@ export function applyWith(ctx, config, deps = {}) {
             }))
             liveAgent.steer(buildSwarmSystemMessage(wakeText, `Board wakeup #${postRecord.seq}`))
           }
+          woken.push(targetName)
+        } else {
+          unreachable.push(targetName)
         }
-        woken.push(targetName)
       }
+      Object.defineProperty(woken, 'unreachable', { value: unreachable, enumerable: false })
       return woken
     },
 
@@ -761,6 +844,7 @@ export function applyWith(ctx, config, deps = {}) {
         memberHandles.delete(key)
       }
 
+      let memberAlive = false
       if (agentsSvc && typeof agentsSvc.resume === 'function') {
         const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
         const rolePrompt = renderRolePrompt(m.role, {
@@ -792,6 +876,7 @@ export function applyWith(ctx, config, deps = {}) {
           }),
         })
         memberHandles.set(key, resumed)
+        memberAlive = Boolean(resumed?.agent)
         resumed.agent.steer(
           buildSwarmSystemMessage(
             `[Swarm Model Switch] 你的运行模型已热切换为 ${nextProvider}/${nextModel}（原因：${reason}）。请调用 read_board({"since": ${m.last_read_seq ?? 0}}) 继续未完成的工作。`,
@@ -800,13 +885,22 @@ export function applyWith(ctx, config, deps = {}) {
         )
       }
 
-      store.updateMember(swarmId, memberName, curr => ({
+      const updatedMember = store.updateMember(swarmId, memberName, curr => ({
         ...curr,
         applied_provider: nextProvider,
         applied_model: nextModel,
+        last_error: null,
+        phase: 'RUNNING',
       }))
 
-      return { ok: true, provider: nextProvider, model: nextModel }
+      return {
+        ok: true,
+        provider: nextProvider,
+        model: nextModel,
+        member_alive: memberAlive,
+        turn_count: updatedMember.turn_count ?? 0,
+        last_turn_at: updatedMember.last_turn_at ?? null,
+      }
     },
 
     async disposeMemberAgent(swarmId, memberName) {
@@ -860,7 +954,47 @@ export function applyWith(ctx, config, deps = {}) {
     },
   }
 
-  // 1. Subscribe to `session/event` for transcript liveness (`statusOf`) and turn bookkeeping
+  // 1. Subscribe to `session/event` for transcript liveness (`statusOf`), turn telemetry, and error alerting (R2/R3)
+  const reportedErrorSignatures = new Set()
+  function resolveMemberForSessionId(sid) {
+    if (!sid) return null
+    const direct = agentMembership.get(sid)
+    if (direct) return direct
+    if (typeof sid === 'string' && sid.includes('__')) {
+      const [swId, mName] = sid.split('__')
+      if (swId && mName && store.exists(swId)) {
+        return { swarmId: swId, memberName: mName, role: store.readMembers(swId)[mName]?.role ?? 'worker' }
+      }
+    }
+    return null
+  }
+
+  function extractEventFailure(event) {
+    if (!event || typeof event !== 'object') return null
+    if (event.type === 'turn/end' && event.data?.reason?.kind === 'error') {
+      const err = event.data.reason.error ?? event.data.reason.failure ?? event.data.reason
+      return {
+        code: err?.code ?? 'TURN_ERROR',
+        message: err?.message ?? String(err),
+        turn: event.data?.turn ?? 1,
+      }
+    }
+    if (event.type === 'assistant/attempt' && Array.isArray(event.data?.stream)) {
+      for (const item of event.data.stream) {
+        const chunk = item?.chunk
+        if (chunk?.type === 'finish' && chunk?.reason?.kind === 'error') {
+          const failure = chunk.reason.failure ?? chunk.reason.error ?? chunk.reason
+          return {
+            code: failure?.code ?? 'LLM_ERROR',
+            message: failure?.message ?? String(failure),
+            turn: event.data?.turn ?? 1,
+          }
+        }
+      }
+    }
+    return null
+  }
+
   const disposeSessionEvent = ctx.on('session/event', (session, event) => {
     const sid = session?.id
     if (!sid || !event) return
@@ -876,6 +1010,60 @@ export function applyWith(ctx, config, deps = {}) {
       turnStates.set(sid, { calledSwarmWait: false, unparkedBlockCount: 0 })
     } else if (event.type === 'turn/end') {
       turnStates.delete(sid)
+    }
+
+    const mapped = resolveMemberForSessionId(sid)
+    if (mapped && store.exists(mapped.swarmId)) {
+      const { swarmId, memberName } = mapped
+      try {
+        if (event.type === 'turn/start') {
+          store.updateMember(swarmId, memberName, m => ({
+            ...m,
+            turn_count: (m.turn_count ?? 0) + 1,
+            last_turn_at: formatTime(),
+          }))
+        } else if (event.type === 'tool/call') {
+          store.updateMember(swarmId, memberName, m => ({
+            ...m,
+            tool_call_count: (m.tool_call_count ?? 0) + 1,
+            last_tool_call_at: formatTime(),
+            last_tool_name: event.data?.name ?? 'tool',
+            last_error: null,
+            phase: 'RUNNING',
+          }))
+        } else {
+          const failure = extractEventFailure(event)
+          if (failure && memberName !== 'coordinator') {
+            const errRecord = {
+              code: failure.code,
+              message: failure.message,
+              turn: failure.turn,
+              time: formatTime(),
+            }
+            store.updateMember(swarmId, memberName, m => ({
+              ...m,
+              last_error: errRecord,
+              phase: 'ERROR',
+            }))
+            const sig = `${sid}:${failure.turn}:${failure.code}:${failure.message}`
+            if (!reportedErrorSignatures.has(sig)) {
+              reportedErrorSignatures.add(sig)
+              const alertPost = store.appendBoardRecord(swarmId, {
+                type: 'post',
+                agent: 'monitor',
+                channel: 'main',
+                mentions: ['coordinator'],
+                kind: 'alert',
+                text: `@coordinator [RUNTIME_ERROR] 成员 @${memberName} 在第 ${failure.turn} 轮执行异常中止：${failure.message} (code=${failure.code})。请调用 swarm_status 查看并执行 swarm_model 切换可用模型或降级处理，切勿无限等待！`,
+              })
+              void runtime.dispatchPostWakeups(swarmId, alertPost)
+              runtime.notifyProjectionChanged(swarmId)
+            }
+          }
+        }
+      } catch {
+        // Ignore if member record was not yet flushed
+      }
     }
   })
   if (typeof disposeSessionEvent === 'function') disposers.push(disposeSessionEvent)

@@ -50,6 +50,23 @@ export function detectSwarmStall({ store, swarmId, getMemberLiveness }) {
     }
   }
 
+  // Condition 0: A member crashed with a runtime/adapter error (`last_error`) -> alert Coordinator immediately
+  for (const [name, member] of Object.entries(members)) {
+    if (member.killed || member.role === 'monitor' || member.role === 'coordinator') continue
+    if (member.last_error) {
+      const errCode = member.last_error.code || 'ERROR'
+      const errMsg = member.last_error.message || String(member.last_error)
+      return {
+        stalled: true,
+        kind: 'member_error',
+        target: 'coordinator',
+        seq: latestPost?.seq ?? 0,
+        signature: `member_error:${name}:${errCode}`,
+        prompt: `@coordinator [stall] 成员 @${name} 执行异常中止 (${errCode}: ${errMsg})，turn_count=${member.turn_count ?? 0}，last_post_seq=${member.last_post_seq ?? 0}。请调用 swarm_status 查看详情，执行模型热切 (swarm_model)、重建成员或降级处理。`,
+      }
+    }
+  }
+
   if (!latestPost) {
     return {
       stalled: true,
@@ -101,12 +118,19 @@ export function detectSwarmStall({ store, swarmId, getMemberLiveness }) {
   }
 
   // Condition 3: A member was @mentioned at #M, is now waiting, and its `last_post_seq < M`
+  const hasSilentActiveWorkers = Object.values(members).some(
+    m => !m.killed && m.role === 'worker' && (m.last_post_seq ?? 0) === 0,
+  )
   for (let i = nonControlPosts.length - 1; i >= 0; i -= 1) {
     const post = nonControlPosts[i]
     const targets = store.resolveTargetsForPost(swarmId, post)
     for (const targetName of targets) {
       const targetMember = members[targetName]
       if (!targetMember || targetMember.killed || targetMember.role === 'monitor') continue
+      // R6: Do NOT false-alarm a verifier on its opening brief while upstream workers have not posted any report yet!
+      if (targetMember.role === 'verifier' && post.kind === 'brief' && hasSilentActiveWorkers) {
+        continue
+      }
       if ((targetMember.last_post_seq ?? 0) < post.seq) {
         return {
           stalled: true,

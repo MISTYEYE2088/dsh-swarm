@@ -99,14 +99,37 @@ export function validateSwarmInit(args) {
 // #EDGE-IN A brief missing `[OWNERSHIP]` or `[FORBIDDEN]` or `[DONE_CRITERIA]` is rejected → test_validator_enforces_three_part_brief
 // #WHY  `REQUIRED_BRIEF_TAGS` forces `glm5.3` and `deepseek4.1f` to state explicit file boundaries so parallel workers do not overwrite each other's files.
 export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerName = 'coordinator') {
-  if (!swarmMeta || swarmMeta.concurrency_confirmed !== true) {
+  if (!swarmMeta) {
+    return formatError(
+      'swarm_add',
+      'Swarm 状态不存在或已被清理（swarm.json 未找到）！请先调用 ask_user_question 询问并发数与模型偏好，再调用 swarm_init 初始化黑板。',
+      {
+        title: '任务标题',
+        concurrency_limit: 4,
+        default_model: 'inherit',
+      },
+      '请先调用 ask_user_question 再调用 swarm_init！',
+    )
+  }
+  if (swarmMeta.status === 'DONE') {
+    return formatError(
+      'swarm_add',
+      `当前 Swarm (${swarmMeta.swarm_id}, gen=${swarmMeta.generation ?? 1}) 已结案 (status=DONE)！如需开启新一轮 Swarm，请重新调用 swarm_init。`,
+      {
+        title: swarmMeta.title || '新一轮任务',
+        concurrency_limit: swarmMeta.concurrency_limit || 4,
+        default_model: swarmMeta.default_model || 'inherit',
+      },
+    )
+  }
+  if (swarmMeta.concurrency_confirmed !== true) {
     return formatError(
       'swarm_add',
       '尚未向用户确认本次 Swarm 的并发限额！在调用 swarm_add 建人之前，你必须先调用 ask_user_question 询问用户需要几个并发（如 4 / 6 / 自定义），然后调用 swarm_init 设置 concurrency_limit。',
       {
         title: '任务标题',
         concurrency_limit: 4,
-        default_model: 'deepseek4.1f',
+        default_model: 'inherit',
       },
       '请先调用 ask_user_question 再调用 swarm_init！',
     )
@@ -312,13 +335,19 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
   )
 
   for (const target of memberMentions) {
-    if (target === 'all') continue
+    if (target === 'all' || target === 'monitor') continue
     if (activeGroups.has(target)) continue
     const record = existingMembers[target]
+    const rosterSummary = activeNames
+      .map(n => {
+        const rm = existingMembers[n]
+        return `@${n}[${rm?.role ?? 'worker'}, post=#${rm?.last_post_seq ?? 0}${rm?.last_tool_call_at ? ', active=' + rm.last_tool_call_at : ''}]`
+      })
+      .join(', ')
     if (!record) {
       return formatError(
         'post_board',
-        `点名的目标 "@${target}" 不存在！当前存活可点名成员为：${activeNames.map(n => '@' + n).join(', ')}`,
+        `点名的目标 "@${target}" 不存在！当前存活可点名成员为：${rosterSummary}`,
         {
           mentions: ['coordinator'],
           text: `@coordinator ${text}`,
@@ -328,7 +357,7 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     if (record.killed) {
       return formatError(
         'post_board',
-        `点名的目标 "@${target}" 已经被销毁（killed），无法接收消息！当前存活可点名成员为：${activeNames.map(n => '@' + n).join(', ')}`,
+        `点名的目标 "@${target}" 已经被销毁（killed），无法接收消息！当前存活可点名成员为：${rosterSummary}`,
         {
           mentions: ['coordinator'],
           text: text.replaceAll(`@${target}`, '@coordinator'),

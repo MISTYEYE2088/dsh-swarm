@@ -1005,6 +1005,107 @@ async function test_subagent_creation_inherits_real_model_preset_and_durable_add
   assert.equal(parentEvents.some(e => e.type === 'subagent/catalog' && e.data.childId === `${rootAgent.id}__engine-core` && e.data.mode === 'continuable'), true)
 }
 
+async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
+  const listeners = new Map()
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on(ev, fn) {
+      listeners.set(ev, fn)
+      return () => listeners.delete(ev)
+    },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') {
+        return {
+          register(t) { registeredTools.set(t.name, t); return () => {} },
+        }
+      }
+      return undefined
+    },
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-r0-r8') }, { log: () => {}, warn: () => {} })
+  const callerAgent = {
+    id: 'sess-r0',
+    options: { provider: 'opencode-go', model: 'deepseek-v4.1-flash' },
+    session: { header: { id: 'sess-r0', cwd: tempRoot } },
+  }
+
+  // R0 & R1: swarm_init prints runtime fingerprint and resolves real route from parent options even when llm is absent
+  const initRes = await registeredTools.get('swarm_init').execute(
+    { title: 'R0-R8 Test', concurrency_limit: 4, default_provider: 'internal', default_model: 'inherit' },
+    { agent: callerAgent },
+  )
+  assert.equal(initRes.ok, true)
+  assert.match(initRes.text, /dsh-swarm v0\.2\.0/)
+  assert.equal(initRes.swarm.default_provider, 'opencode-go')
+  assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
+
+  // R6: @monitor is auto-registered in members.json and can be mentioned in post_board;
+  // verifier waiting on a silent worker must NOT be false-flagged as stalled!
+  runtime.store.registerMemberWithBrief('sess-r0', {
+    name: 'worker-1',
+    session_id: 'sess-r0__worker-1',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+  runtime.store.registerMemberWithBrief('sess-r0', {
+    name: 'verifier-1',
+    session_id: 'sess-r0__verifier-1',
+    role: 'verifier',
+    brief: '[OWNERSHIP] test\n[FORBIDDEN] src\n[DONE_CRITERIA] wait for worker-1 report',
+  })
+
+  const stallWhileWorkerSilent = detectSwarmStall({
+    store: runtime.store,
+    swarmId: 'sess-r0',
+    getMemberLiveness: (name, m) => runtime.getMemberLiveness('sess-r0', name, m),
+  })
+  assert.equal(stallWhileWorkerSilent.stalled, true)
+  assert.equal(stallWhileWorkerSilent.target, 'worker-1', 'Verifier must not be blamed while worker-1 has last_post_seq=0')
+
+  const mentionMonitorCheck = validatePostBoard(
+    { text: '@monitor 已知悉状态，继续等待', mentions: ['monitor'] },
+    runtime.store.readMembers('sess-r0'),
+    'coordinator',
+  )
+  assert.equal(mentionMonitorCheck.ok, true)
+
+  // R2 & R3: Simulating a Turn-1 NO_ADAPTER error event on worker-1 marks status='error' and posts [RUNTIME_ERROR] alert
+  const onSessionEvent = listeners.get('session/event')
+  onSessionEvent(
+    { id: 'sess-r0__worker-1' },
+    {
+      type: 'turn/end',
+      seq: 15,
+      data: {
+        turn: 1,
+        reason: {
+          kind: 'error',
+          error: { code: 'NO_ADAPTER', message: 'no adapter registered for provider "internal"' },
+        },
+      },
+    },
+  )
+
+  const w1Live = runtime.getMemberLiveness('sess-r0', 'worker-1')
+  assert.equal(w1Live.status, 'error')
+  assert.match(w1Live.stepSummary, /NO_ADAPTER/)
+
+  const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
+  assert.equal(statusRes.ok, true)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.2\.0/)
+  assert.match(statusRes.text, /status=error/)
+
+  // R8: Posting [done] archives the 4-file blackboard into swarm/archive/<id>_.../
+  const doneRes = await registeredTools.get('post_board').execute(
+    { text: '[done] 测试完成并归档', kind: 'done', mentions: ['coordinator'] },
+    { agent: callerAgent },
+  )
+  assert.equal(doneRes.ok, true)
+  assert.ok(doneRes.archive_path && fs.existsSync(path.join(doneRes.archive_path, 'board.jsonl')), 'Archive directory must contain board.jsonl')
+}
+
 // Run all tests
 try {
   await runTest('test_atomic_store_roundtrip', test_atomic_store_roundtrip)
@@ -1039,6 +1140,7 @@ try {
   await runTest('test_client_graph_replay_aggregation', test_client_graph_replay_aggregation)
   await runTest('test_slash_command_and_rightbar_registration', test_slash_command_and_rightbar_registration)
   await runTest('test_subagent_creation_inherits_real_model_preset_and_durable_address', test_subagent_creation_inherits_real_model_preset_and_durable_address)
+  await runTest('test_r0_to_r8_error_observability_monitor_deps_and_archive', test_r0_to_r8_error_observability_monitor_deps_and_archive)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }

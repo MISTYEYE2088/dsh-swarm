@@ -104,6 +104,19 @@ export function handleTurnStopping({
 export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [] } = {}) {
   if (!member) return { status: 'unknown', stepSummary: null }
   if (member.killed) return { status: 'killed', stepSummary: 'Killed (retired)' }
+  if (member.role === 'monitor' && member.system_builtin) {
+    return { status: 'daemon', stepSummary: 'Background watchdog timer (0 token standby)' }
+  }
+
+  // R2/R3: Surface any recorded turn/adapter error immediately instead of masking it as 'working' or 'waiting'
+  if (member.last_error) {
+    const code = member.last_error.code || 'ERROR'
+    const msg = member.last_error.message || String(member.last_error)
+    return {
+      status: 'error',
+      stepSummary: `ERROR [${code}]: ${msg}`,
+    }
+  }
 
   const sessionId = member.session_id
   if (concurrencyGate && sessionId) {
@@ -125,6 +138,7 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
   // Inspect tail of sessionEvents (analogous to reading the tail of transcript.jsonl)
   let latestStepSummary = null
   let lastTurnClosed = true
+  let lastTurnError = null
   let lastBatchHadSwarmWaitDone = false
 
   for (let i = sessionEvents.length - 1; i >= 0; i -= 1) {
@@ -132,6 +146,10 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
     if (!ev || typeof ev !== 'object') continue
     if (ev.type === 'turn/end') {
       lastTurnClosed = true
+      if (ev.data?.reason?.kind === 'error') {
+        const err = ev.data.reason.error ?? ev.data.reason.failure
+        lastTurnError = err?.message ?? 'Turn ended with error'
+      }
       break
     }
     if (ev.type === 'turn/start' || ev.type === 'step/start') {
@@ -159,6 +177,13 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
     }
   }
 
+  if (lastTurnError) {
+    return {
+      status: 'error',
+      stepSummary: `ERROR: ${lastTurnError}`,
+    }
+  }
+
   if (liveAgent && liveAgent.status === 'running' && !lastBatchHadSwarmWaitDone) {
     return {
       status: 'working',
@@ -173,8 +198,9 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
     }
   }
 
+  const wakeLabel = member.wake_mode === 'anything' ? 'anything' : 'mentions'
   return {
     status: 'waiting',
-    stepSummary: `Waiting since #${member.wait_since ?? member.last_read_seq ?? 0} (${member.wake_mode ?? 'mentions'})`,
+    stepSummary: `Parked since #${member.wait_since ?? member.last_read_seq ?? 0} (wake=${wakeLabel}, turns=${member.turn_count ?? 0})`,
   }
 }

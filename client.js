@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.1.0'
+    var VERSION = '0.2.0'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'

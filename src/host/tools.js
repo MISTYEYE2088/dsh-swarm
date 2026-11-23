@@ -14,7 +14,7 @@ import {
   validateSwarmPlan,
 } from './validators.js'
 import { statusOf, buildSwarmSystemMessage } from './stop-hook.js'
-import { createIsolatedWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
+import { runGit, createIsolatedWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
 
 const TEXT_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -63,17 +63,21 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
 
   const memberRows = Object.entries(members).map(([name, m]) => {
     const liveness = runtime.getMemberLiveness(swarmId, name, m)
+    const queuePos = runtime.concurrencyGate?.queuePositionOf?.(m.session_id) ?? 0
     return {
       name,
       session_id: m.session_id,
       role: m.role,
+      system_builtin: m.system_builtin === true,
       group: m.group,
       parent: m.parent,
-      phase: m.phase,
+      phase: m.last_error ? 'ERROR' : m.phase,
       killed: m.killed === true,
       status: liveness.status,
       stepSummary: liveness.stepSummary,
+      desired_provider: m.desired_provider,
       desired_model: m.desired_model,
+      applied_provider: m.applied_provider,
       applied_model: m.applied_model,
       workspace_mode: m.workspace_mode,
       worktree_path: m.worktree_path,
@@ -84,6 +88,13 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       last_nudged_seq: m.last_nudged_seq ?? 0,
       last_park_blocked_seq: m.last_park_blocked_seq ?? 0,
       last_post_seq: m.last_post_seq ?? 0,
+      turn_count: m.turn_count ?? 0,
+      tool_call_count: m.tool_call_count ?? 0,
+      last_turn_at: m.last_turn_at ?? null,
+      last_tool_call_at: m.last_tool_call_at ?? null,
+      last_tool_name: m.last_tool_name ?? null,
+      last_error: m.last_error ?? null,
+      queue_position: queuePos,
     }
   })
 
@@ -104,6 +115,7 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
   }
 
   return {
+    runtime: typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null,
     swarm,
     plan,
     headSeq,
@@ -156,9 +168,21 @@ export function createSwarmTools(runtime) {
           })
         : { provider: check.value.default_provider, model: check.value.coordinator_model }
 
+      const mainCwd = rootAgent?.session?.header?.cwd ?? process.cwd()
+      const gitProbe = await runGit(['rev-parse', '--is-inside-work-tree'], { cwd: mainCwd, timeoutMs: 4_000 })
+      const gitSupported = gitProbe.ok && gitProbe.stdout.trim() === 'true'
+      const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(mainCwd))
+      const fp = typeof runtime.getRuntimeFingerprint === 'function'
+        ? runtime.getRuntimeFingerprint()
+        : { version: '0.2.0', commit: 'HEAD', loaded_at: '' }
+
       return await store.withLock(swarmId, async () => {
+        if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
+          store.archiveSwarm(swarmId, 'before-reinit')
+        }
         const { swarm } = store.initSwarm(swarmId, {
           ...check.value,
+          status: 'ACTIVE',
           default_provider: resolvedDefault.provider || check.value.default_provider,
           default_model: resolvedDefault.model || check.value.default_model,
           coordinator_model: resolvedCoord.model || resolvedDefault.model || check.value.coordinator_model,
@@ -178,10 +202,22 @@ export function createSwarmTools(runtime) {
         concurrencyGate.setLimit(swarm.concurrency_limit)
         runtime.ensureMonitorDaemon(swarmId)
         runtime.notifyProjectionChanged(swarmId)
+
+        const envNotes = [
+          `[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
+          `[WORKSPACE_PREFLIGHT] cwd="${mainCwd}" · git_worktree=${gitSupported ? 'AVAILABLE (可使用 workspace="share"|"branch"|"inherit")' : 'UNAVAILABLE (当前目录非 Git 仓库，所有成员必须使用 workspace="inherit")'}`,
+        ]
+        if (isWslUnc) {
+          envNotes.push(`[WSL_UNC_HINT] 当前工作区为 Windows WSL UNC 路径 (${mainCwd})：DSH 内置的 workflow 工具在 UNC 路径下会因 Win32 GetNamedSecurityInfoW ACL 限制而报错 (worker-exit)。请统一使用 swarm_add 派生进程内 Swarm 成员，并在成员内使用 bash / read / write / edit 工具（bash 会在 WSL Linux 侧正常执行）。`)
+        }
+
         return {
           ok: true,
           swarm,
-          text: `[swarm_init OK] Swarm "${swarm.title}" 已初始化（swarm_id=${swarmId}，并发上限=${swarm.concurrency_limit}，默认路由=${swarm.default_provider}/${swarm.default_model}）。接下来请调用 swarm_plan 写入波次计划，再调用 swarm_add 添加成员。`,
+          git_worktree_available: gitSupported,
+          is_wsl_unc: isWslUnc,
+          runtime: fp,
+          text: `[swarm_init OK] Swarm "${swarm.title}" 已初始化（swarm_id=${swarmId}, gen=${swarm.generation ?? 1}, 并发上限=${swarm.concurrency_limit}, 默认路由=${swarm.default_provider}/${swarm.default_model}）。\n${envNotes.join('\n')}\n接下来请调用 swarm_plan 写入波次计划与拆活矩阵，再调用 swarm_add 添加成员。`,
         }
       })
     },
@@ -318,7 +354,7 @@ export function createSwarmTools(runtime) {
             brief: fullBrief,
           })
 
-          await runtime.spawnMemberAgent({
+          const handle = await runtime.spawnMemberAgent({
             swarmId,
             memberName,
             member,
@@ -327,22 +363,41 @@ export function createSwarmTools(runtime) {
             rootAgent,
           })
 
+          // R2: Give the newly steered child turn a brief settle window (100ms) so fast
+          // synchronous/adapter errors (like NO_ADAPTER which fails in ~14ms) are caught immediately!
+          if (handle) {
+            await new Promise(resolve => setTimeout(resolve, 100))
+          }
+          const latestMember = store.readMembers(swarmId)[memberName] ?? member
+          if (latestMember.last_error) {
+            runtime.notifyProjectionChanged(swarmId)
+            return {
+              ok: false,
+              error: latestMember.last_error,
+              text: `[SPAWN_RUNTIME_ERROR: swarm_add] 成员 @${memberName} 已创建但首轮启动即发生错误 (${latestMember.last_error.code}: ${latestMember.last_error.message})！请检查模型路由 (${latestMember.applied_provider}/${latestMember.applied_model})，调用 swarm_model 切换为当前会话可用模型或降级回单 Agent 处理，切勿调用 swarm_wait 死等！`,
+            }
+          }
+
           createdRows.push({
             name: memberName,
-            role: member.role,
-            model: member.applied_model,
-            workspace: member.workspace_mode,
+            session_id: latestMember.session_id,
+            role: latestMember.role,
+            provider: latestMember.applied_provider,
+            model: latestMember.applied_model,
+            workspace: latestMember.workspace_mode,
             brief_seq: briefPost.seq,
-            last_read_seq: member.last_read_seq,
+            last_read_seq: latestMember.last_read_seq,
+            spawned_live_agent: Boolean(handle),
+            turn_count: latestMember.turn_count ?? 0,
           })
         }
 
         runtime.notifyProjectionChanged(swarmId)
-        const summary = createdRows.map(r => `@${r.name} (role=${r.role}, model=${r.model}, workspace=${r.workspace}, brief=#${r.brief_seq})`).join(', ')
+        const summary = createdRows.map(r => `@${r.name} (role=${r.role}, route=${r.provider}/${r.model}, workspace=${r.workspace}, brief=#${r.brief_seq}, live=${r.spawned_live_agent})`).join(', ')
         return {
           ok: true,
           created: createdRows,
-          text: `[swarm_add OK] 已创建并派发任务书：${summary}。`,
+          text: `[swarm_add OK] 已创建并启动任务书：${summary}。`,
         }
       })
     },
@@ -400,19 +455,36 @@ export function createSwarmTools(runtime) {
           ...check.value,
         })
 
+        let archivePath = null
         if (postRecord.kind === 'done' || postRecord.text.includes('[done]')) {
           store.updateSwarm(swarmId, { status: 'DONE' })
+          archivePath = store.archiveSwarm(swarmId, 'done')
         }
 
         const wokenTargets = await runtime.dispatchPostWakeups(swarmId, postRecord)
+        const unreachableTargets = wokenTargets.unreachable ?? []
         runtime.notifyBoardActivity(swarmId, postRecord)
         runtime.notifyProjectionChanged(swarmId)
+
+        const wakeNote = wokenTargets.length > 0
+          ? `实际唤醒: ${wokenTargets.map(n => '@' + n).join(', ')}`
+          : '无成员被唤醒（本帖未触发任何活跃实例唤醒）'
+        const unreachableNote = unreachableTargets.length > 0
+          ? `；未唤醒(无存活实例): ${unreachableTargets.map(n => '@' + n).join(', ')}`
+          : ''
+        const archiveNote = archivePath
+          ? `\n[SWARM_ARCHIVED] 本场 Swarm 完整现场（board.jsonl / members.json / swarm.json / plan.json）已持久化归档至：${archivePath}`
+          : ''
+        const fp = typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null
+        const fpNote = (archivePath && fp) ? `\n[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})` : ''
 
         return {
           ok: true,
           seq: postRecord.seq,
           woken: wokenTargets,
-          text: `[post_board OK] 已发布到黑板 #${postRecord.seq} (channel=#${postRecord.channel}, 唤醒目标: ${wokenTargets.length > 0 ? wokenTargets.map(n => '@' + n).join(', ') : '无'})。你的 last_read_seq 已更新为 ${postRecord.seq}。若本轮工作已完成，请立即调用 swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) 进入休眠。`,
+          unreachable: unreachableTargets,
+          ...(archivePath ? { archive_path: archivePath } : {}),
+          text: `[post_board OK] 已发布到黑板 #${postRecord.seq} (channel=#${postRecord.channel}, ${wakeNote}${unreachableNote})。你的 last_read_seq 已更新为 ${postRecord.seq}。${archiveNote}${fpNote}${!archivePath ? ` 若本轮工作已完成，请立即调用 swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) 进入休眠。` : ''}`,
         }
       })
     },
@@ -467,13 +539,16 @@ export function createSwarmTools(runtime) {
                 : `#${p.seq} [${p.time}] [#${p.channel || 'main'}] @${p.agent} (${p.kind}):\n${p.text}`
             )).join('\n\n---\n\n')
 
+        const swarmMeta = store.readSwarm(swarmId)
         return {
           ok: true,
+          swarm_id: swarmId,
+          generation: swarmMeta?.generation ?? 1,
           head_seq: headSeq,
           last_read_seq: newReadSeq,
           count: posts.length,
           posts,
-          text: `[read_board OK] 已读至最新楼层 #${newReadSeq}（本次返回 ${posts.length} 条记录）：\n\n${formatted}`,
+          text: `[read_board OK] (swarm_id=${swarmId}, gen=${swarmMeta?.generation ?? 1}) 已读至最新楼层 #${newReadSeq}（本次返回 ${posts.length} 条记录）：\n\n${formatted}`,
         }
       })
     },
@@ -554,28 +629,37 @@ export function createSwarmTools(runtime) {
 
   const swarmStatusTool = makeTool({
     name: 'swarm_status',
-    description: 'Inspect the live Swarm roster, 5 floor cursors, real transcript liveness, and shared concurrency pool usage.',
+    description: 'Inspect the live Swarm roster, runtime version fingerprint (R0), 5 floor cursors, turn_count / last_tool_call_at / last_error telemetry, and shared concurrency pool usage.',
     isConcurrencySafe: true,
     parameters: {
       properties: {},
     },
     async execute(_args, exec) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
+      const fp = typeof runtime.getRuntimeFingerprint === 'function'
+        ? runtime.getRuntimeFingerprint()
+        : { version: '0.2.0', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
-        return { ok: false, text: '当前会话尚未启动 Swarm。' }
+        return {
+          ok: false,
+          runtime: fp,
+          text: `当前会话尚未启动 Swarm。[Runtime: dsh-swarm v${fp.version} @ ${fp.commit}, loaded=${fp.loaded_at}]`,
+        }
       }
       const snap = buildSwarmProjectionSnapshot({ store, swarmId, runtime })
       const lines = [
-        `Swarm: "${snap.swarm.title}" (status=${snap.swarm.status}, head=#${snap.headSeq})`,
+        `Runtime: dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
+        `Swarm: "${snap.swarm.title}" (id=${swarmId}, gen=${snap.swarm.generation ?? 1}, status=${snap.swarm.status}, head=#${snap.headSeq})`,
         `Concurrency Pool: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} active (configured=${snap.concurrency.configuredLimit}, queued=${snap.concurrency.queued}, 429_hits=${snap.concurrency.rateLimitHits})`,
         `Channels: ${snap.channels.map(c => '#' + c).join(', ')}`,
         'Roster:',
         ...snap.members.map(m => (
-          `  - @${m.name} [${m.role}] status=${m.status} model=${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '· ' + m.stepSummary : ''}`
+          `  - @${m.name} [${m.role}${m.system_builtin ? ':builtin' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '· ' + m.stepSummary : ''}`
         )),
       ]
       return {
         ok: true,
+        runtime: fp,
         snapshot: snap,
         text: lines.join('\n'),
       }
@@ -584,12 +668,12 @@ export function createSwarmTools(runtime) {
 
   const swarmModelTool = makeTool({
     name: 'swarm_model',
-    description: 'Hot-swap a waiting member to a different model (e.g. between deepseek4.1f and glm5.3), keeping its full conversation history.',
+    description: 'Hot-swap a member to a different model route (e.g. "inherit" or "<provider>/<model>"), keeping its full conversation history and returning liveness telemetry.',
     parameters: {
       properties: {
         name: { type: 'string', description: 'Target member name in members.json.' },
-        provider: { type: 'string', description: 'Target provider route (default: internal).' },
-        model: { type: 'string', description: 'Target model name (e.g. glm5.3 or deepseek4.1f).' },
+        provider: { type: 'string', description: 'Target registered provider route (or "inherit" to use parent session provider).' },
+        model: { type: 'string', description: 'Target model id or "<provider>/<model>" (or "inherit" to use parent session model).' },
         reason: { type: 'string', description: 'Why the model is being switched.' },
       },
       required: ['name', 'model'],
@@ -620,7 +704,12 @@ export function createSwarmTools(runtime) {
         runtime.notifyProjectionChanged(swarmId)
         return {
           ok: true,
-          text: `[swarm_model OK] @${targetName} 模型已无损热切为 ${nextProvider}/${nextModel}（保留完整对话记忆）。`,
+          applied_provider: swapped.provider,
+          applied_model: swapped.model,
+          member_alive: swapped.member_alive === true,
+          turn_count: swapped.turn_count ?? 0,
+          last_turn_at: swapped.last_turn_at ?? null,
+          text: `[swarm_model OK] @${targetName} 模型已热切为 ${swapped.provider}/${swapped.model} (member_alive=${swapped.member_alive === true}, turn_count=${swapped.turn_count ?? 0}, last_turn_at=${swapped.last_turn_at ?? 'none'})。`,
         }
       })
     },

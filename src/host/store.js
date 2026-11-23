@@ -252,9 +252,15 @@ export class SwarmStore {
     const nowIso = new Date().toISOString()
     const existing = readJsonSync(paths.swarmJson, null)
 
+    const isReinitAfterDone = existing?.status === 'DONE' && options.status === 'ACTIVE'
+    const nextGeneration = isReinitAfterDone
+      ? (Number(existing?.generation) || 1) + 1
+      : (Number(options.generation ?? existing?.generation) || 1)
+
     const swarmMeta = {
       version: 1,
       swarm_id: swarmId,
+      generation: nextGeneration,
       title: options.title ?? existing?.title ?? 'Untitled Swarm',
       backend: options.backend ?? existing?.backend ?? 'local',
       status: options.status ?? existing?.status ?? 'ACTIVE',
@@ -273,6 +279,7 @@ export class SwarmStore {
     }
 
     const members = readJsonSync(paths.membersJson, {})
+    let membersChanged = false
     if (!members.coordinator) {
       members.coordinator = {
         session_id: swarmId,
@@ -295,9 +302,52 @@ export class SwarmStore {
         last_nudged_seq: 0,
         last_park_blocked_seq: 0,
         last_post_seq: 0,
+        turn_count: 0,
+        tool_call_count: 0,
+        last_turn_at: null,
+        last_tool_call_at: null,
+        last_tool_name: null,
+        last_error: null,
         killed: false,
         created_at: nowIso,
       }
+      membersChanged = true
+    }
+    if (!members.monitor) {
+      members.monitor = {
+        session_id: `${swarmId}__monitor-daemon`,
+        role: 'monitor',
+        system_builtin: true,
+        group: null,
+        parent: 'coordinator',
+        desired_state: 'RUNNING',
+        phase: 'RUNNING',
+        desired_provider: swarmMeta.default_provider,
+        desired_model: swarmMeta.coordinator_model,
+        applied_provider: swarmMeta.default_provider,
+        applied_model: swarmMeta.coordinator_model,
+        workspace_mode: 'inherit',
+        worktree_path: null,
+        base_commit: null,
+        wake_mode: 'mentions',
+        channels: ['main'],
+        wait_since: 0,
+        last_read_seq: 0,
+        last_nudged_seq: 0,
+        last_park_blocked_seq: 0,
+        last_post_seq: 0,
+        turn_count: 0,
+        tool_call_count: 0,
+        last_turn_at: null,
+        last_tool_call_at: null,
+        last_tool_name: null,
+        last_error: null,
+        killed: false,
+        created_at: nowIso,
+      }
+      membersChanged = true
+    }
+    if (membersChanged) {
       writeJsonAtomicSync(paths.membersJson, members)
     }
 
@@ -483,6 +533,12 @@ export class SwarmStore {
       last_nudged_seq: briefPost.seq,
       last_park_blocked_seq: 0,
       last_post_seq: 0,
+      turn_count: 0,
+      tool_call_count: 0,
+      last_turn_at: null,
+      last_tool_call_at: null,
+      last_tool_name: null,
+      last_error: null,
       killed: false,
       created_at: nowIso,
     }
@@ -524,6 +580,29 @@ export class SwarmStore {
 
   readPlan(swarmId) {
     return readJsonSync(this.pathsOf(swarmId).planJson, null)
+  }
+
+  /**
+   * Copy `swarm.json`, `board.jsonl`, `members.json`, and `plan.json` into
+   * `<baseDir>/archive/<swarmId>_gen<gen>_<timestamp>_<reason>/` so evidence
+   * is preserved even after a swarm closes or resets.
+   */
+  archiveSwarm(swarmId, reason = 'done') {
+    if (!this.exists(swarmId)) return null
+    const srcPaths = this.pathsOf(swarmId)
+    const meta = this.readSwarm(swarmId)
+    const gen = meta?.generation ?? 1
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const safeId = String(swarmId).replace(/[^a-zA-Z0-9_.-]/g, '_')
+    const archiveDir = path.join(this.baseDir, 'archive', `${safeId}_gen${gen}_${stamp}_${reason}`)
+    fs.mkdirSync(archiveDir, { recursive: true })
+    for (const fileName of ['swarm.json', 'board.jsonl', 'members.json', 'plan.json']) {
+      const srcFile = path.join(srcPaths.dir, fileName)
+      if (fs.existsSync(srcFile)) {
+        fs.copyFileSync(srcFile, path.join(archiveDir, fileName))
+      }
+    }
+    return archiveDir
   }
 
   /**
