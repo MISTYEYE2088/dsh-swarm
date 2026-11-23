@@ -21,14 +21,14 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.2'
+export const PLUGIN_VERSION = '0.3.3'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.2'
+    if (!fs.existsSync(headFile)) return 'release-0.3.3'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -36,7 +36,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.3.2'
+    return 'release-0.3.3'
   }
 }
 
@@ -962,6 +962,17 @@ export function applyWith(ctx, config, deps = {}) {
         last_error: null,
         phase: 'RUNNING',
       }))
+      store.appendEvent(swarmId, {
+        type: 'member.model_switch',
+        actor: 'coordinator',
+        seq: store.headSeq(swarmId),
+        payload: {
+          name: memberName,
+          provider: nextProvider,
+          model: nextModel,
+          reason: reason ?? 'Model switched by coordinator',
+        },
+      })
 
       return {
         ok: true,

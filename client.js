@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.2'
+    var VERSION = '0.3.3'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -168,7 +168,8 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Compute Round-Table seat coordinates and aged directed arrows up to `maxSeq`. */
+    // dup-ok: legacy floor-based Round-Table layout counterpart to Kafka event-log computeRoundTableFromEvents
+    /** Compute Round-Table seat coordinates and aged directed arrows for the EXACT active seats at `maxSeq`. */
     function computeRoundTableLayout(members, edgeEvents, maxSeq, options) {
       var opts = options || {}
       var cx = opts.cx || 170
@@ -177,12 +178,12 @@ window.__ModuleLoader__.load({
       var maxSteps = opts.maxSteps || MAX_VISIBLE_EDGE_STEPS
       var limit = typeof maxSeq === 'number' && maxSeq > 0 ? maxSeq : Infinity
 
-      var memberMap = new Map()
+      var allMembersByName = new Map()
       var listMembers = Array.isArray(members) ? members : []
       for (var i = 0; i < listMembers.length; i += 1) {
         var m = listMembers[i]
         if (!m || !m.name) continue
-        memberMap.set(m.name, m)
+        allMembersByName.set(m.name, m)
       }
 
       var rawEvents = Array.isArray(edgeEvents) ? edgeEvents : []
@@ -193,11 +194,53 @@ window.__ModuleLoader__.load({
         if (!ev || typeof ev.seq !== 'number' || ev.seq > limit) continue
         visibleEvents.push(ev)
         seqSet.add(ev.seq)
-        if (ev.from && ev.from !== '__table__' && !memberMap.has(ev.from)) {
-          memberMap.set(ev.from, { name: ev.from, role: ev.from === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
+      }
+
+      var distinctSeqs = Array.from(seqSet).sort(function (a, b) { return a - b })
+      var seqToAge = {}
+      for (var q = 0; q < distinctSeqs.length; q += 1) {
+        seqToAge[distinctSeqs[q]] = (distinctSeqs.length - 1) - q
+      }
+
+      // Restore exact historically active seats at `limit`:
+      //   bornSeq <= limit AND (retiredSeq === null || limit <= retiredSeq)
+      var memberMap = new Map()
+      allMembersByName.forEach(function (meta, name) {
+        var isCoord = name === 'coordinator' || meta.role === 'coordinator'
+        var bornSeq = isCoord
+          ? 0
+          : (typeof meta.born_seq === 'number'
+              ? meta.born_seq
+              : (typeof meta.brief_seq === 'number' ? meta.brief_seq : 0))
+        var retiredSeq = isCoord
+          ? null
+          : (typeof meta.retired_seq === 'number'
+              ? meta.retired_seq
+              : (typeof meta.killed_at_seq === 'number' ? meta.killed_at_seq : null))
+        var activeAtLimit = bornSeq <= limit && (retiredSeq === null || limit <= retiredSeq)
+        if (!activeAtLimit) return
+        memberMap.set(name, {
+          name: name,
+          role: meta.role || 'worker',
+          status: (limit < Infinity && retiredSeq !== null && limit <= retiredSeq && meta.status === 'killed')
+            ? 'waiting'
+            : (meta.status || 'waiting'),
+          killed: false,
+          born_seq: bornSeq,
+          retired_seq: retiredSeq,
+        })
+      })
+
+      // Include any external speaker (e.g. watchdog `monitor`) referenced by still-visible non-faded arrows
+      for (var k = 0; k < visibleEvents.length; k += 1) {
+        var vev = visibleEvents[k]
+        var vAge = seqToAge[vev.seq]
+        if (vAge >= maxSteps) continue
+        if (vev.from && vev.from !== '__table__' && !allMembersByName.has(vev.from) && !memberMap.has(vev.from)) {
+          memberMap.set(vev.from, { name: vev.from, role: vev.from === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
         }
-        if (ev.to && ev.to !== '__table__' && !memberMap.has(ev.to)) {
-          memberMap.set(ev.to, { name: ev.to, role: ev.to === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
+        if (vev.to && vev.to !== '__table__' && !allMembersByName.has(vev.to) && !memberMap.has(vev.to)) {
+          memberMap.set(vev.to, { name: vev.to, role: vev.to === 'monitor' ? 'daemon' : 'worker', status: 'waiting', killed: false })
         }
       }
 
@@ -231,12 +274,6 @@ window.__ModuleLoader__.load({
         }
         seats.push(seatObj)
         seatByName[sName] = seatObj
-      }
-
-      var distinctSeqs = Array.from(seqSet).sort(function (a, b) { return a - b })
-      var seqToAge = {}
-      for (var q = 0; q < distinctSeqs.length; q += 1) {
-        seqToAge[distinctSeqs[q]] = (distinctSeqs.length - 1) - q
       }
 
       var agedEdges = []
@@ -283,6 +320,247 @@ window.__ModuleLoader__.load({
       }
     }
 
+    // dup-ok: Kafka event-stream replay counterpart to legacy snapshot computeRoundTableLayout
+    /** Replay Kafka-style `events.jsonl` stream up to `atOffset` to build exact Round-Table seats & aging arrows. */
+    function computeRoundTableFromEvents(events, liveMembers, atOffset, options) {
+      var opts = options || {}
+      var cx = opts.cx || 170
+      var cy = opts.cy || 152
+      var seatR = opts.seatR || 102
+      var maxSteps = opts.maxSteps || MAX_VISIBLE_EDGE_STEPS
+      var list = Array.isArray(events) ? events : []
+      var totalOffsets = list.length > 0 ? (list[list.length - 1].offset || list.length) : 0
+      var limitOffset = typeof atOffset === 'number' && atOffset > 0 ? Math.min(atOffset, totalOffsets || atOffset) : Infinity
+      var isLive = limitOffset >= totalOffsets
+
+      var liveByName = new Map()
+      if (Array.isArray(liveMembers)) {
+        for (var lm = 0; lm < liveMembers.length; lm += 1) {
+          if (liveMembers[lm] && liveMembers[lm].name) liveByName.set(liveMembers[lm].name, liveMembers[lm])
+        }
+      }
+
+      var activeMembers = new Map()
+      var allSeenMembers = new Map()
+      var subscriptions = new Map()
+      var rawEdges = []
+      var seqSet = new Set()
+      var lastEvent = null
+
+      function ensureSub(name) {
+        if (!subscriptions.has(name)) subscriptions.set(name, new Set(['main']))
+        return subscriptions.get(name)
+      }
+
+      for (var i = 0; i < list.length; i += 1) {
+        var ev = list[i]
+        if (!ev || typeof ev !== 'object') continue
+        var evOffset = typeof ev.offset === 'number' ? ev.offset : (i + 1)
+        if (evOffset > limitOffset) break
+        lastEvent = ev
+        var p = ev.payload || {}
+
+        if (ev.type === 'swarm.init') {
+          if (!activeMembers.has('coordinator')) {
+            var coord = { name: 'coordinator', role: 'coordinator', group: null, status: 'waiting', killed: false }
+            activeMembers.set('coordinator', coord)
+            allSeenMembers.set('coordinator', coord)
+            ensureSub('coordinator')
+          }
+        } else if (ev.type === 'member.spawn' && p.name) {
+          var seatObj = { name: p.name, role: p.role || 'worker', group: p.group || null, status: 'waiting', killed: false }
+          activeMembers.set(p.name, seatObj)
+          allSeenMembers.set(p.name, seatObj)
+          ensureSub(p.name)
+        } else if (ev.type === 'member.kill' && p.name) {
+          activeMembers.delete(p.name)
+        } else if (ev.type === 'board.control') {
+          var ch = typeof p.channel === 'string' ? p.channel.replace(/^#/, '') : ''
+          if (ch && ch !== 'main') {
+            if (p.action === 'channel.create' && p.agent) ensureSub(p.agent).add(ch)
+            else if (p.action === 'channel.subscribe') ensureSub(p.target || p.agent).add(ch)
+            else if (p.action === 'channel.unsubscribe') ensureSub(p.target || p.agent).delete(ch)
+          }
+        } else if (ev.type === 'board.post') {
+          var from = p.agent || ev.actor || 'coordinator'
+          var seq = p.seq || ev.seq || 0
+          var title = p.title || ''
+          var rawMentions = Array.isArray(p.mentions) ? p.mentions : []
+          var rawChannels = Array.isArray(p.channel_mentions) ? p.channel_mentions : []
+          if (seq > 0) seqSet.add(seq)
+
+          if (p.silent === true || rawMentions.indexOf('all') !== -1) {
+            rawEdges.push({
+              offset: evOffset,
+              ts_ms: ev.ts_ms || 0,
+              time: ev.time || p.time || '',
+              seq: seq,
+              from: from,
+              to: '__table__',
+              broadcast: true,
+              kind: p.kind || 'report',
+              title: title,
+            })
+          } else {
+            var targets = new Set()
+            for (var m = 0; m < rawMentions.length; m += 1) {
+              var tok = rawMentions[m]
+              if (!tok || tok === from || tok === 'monitor') continue
+              if (activeMembers.has(tok) || allSeenMembers.has(tok)) {
+                targets.add(tok)
+                continue
+              }
+              activeMembers.forEach(function (mObj, mName) {
+                if (mName !== from && mObj.group === tok) targets.add(mName)
+              })
+            }
+            if (rawChannels.length > 0) {
+              activeMembers.forEach(function (_mObj, mName) {
+                if (mName === from) return
+                var subs = ensureSub(mName)
+                for (var c = 0; c < rawChannels.length; c += 1) {
+                  if (rawChannels[c] !== 'main' && subs.has(rawChannels[c])) {
+                    targets.add(mName)
+                    break
+                  }
+                }
+              })
+            }
+            if (targets.size === 0) {
+              rawEdges.push({
+                offset: evOffset,
+                ts_ms: ev.ts_ms || 0,
+                time: ev.time || p.time || '',
+                seq: seq,
+                from: from,
+                to: '__table__',
+                broadcast: true,
+                kind: p.kind || 'report',
+                title: title,
+              })
+            } else {
+              targets.forEach(function (tName) {
+                rawEdges.push({
+                  offset: evOffset,
+                  ts_ms: ev.ts_ms || 0,
+                  time: ev.time || p.time || '',
+                  seq: seq,
+                  from: from,
+                  to: tName,
+                  broadcast: false,
+                  kind: p.kind || 'report',
+                  title: title,
+                })
+              })
+            }
+          }
+        }
+      }
+
+      if (!activeMembers.has('coordinator') && list.length > 0) {
+        activeMembers.set('coordinator', { name: 'coordinator', role: 'coordinator', group: null, status: 'waiting', killed: false })
+      }
+
+      // Overlay real-time live status only when viewing Live (latest offset)
+      if (isLive) {
+        activeMembers.forEach(function (seat, sName) {
+          var live = liveByName.get(sName)
+          if (live) seat.status = live.status || seat.status
+        })
+      }
+
+      var roleOrder = { coordinator: 0, architect: 1, verifier: 2, worker: 3, daemon: 4 }
+      var seatNames = Array.from(activeMembers.keys()).sort(function (a, b) {
+        if (a === 'coordinator') return -1
+        if (b === 'coordinator') return 1
+        var ra = roleOrder[activeMembers.get(a).role] !== undefined ? roleOrder[activeMembers.get(a).role] : 5
+        var rb = roleOrder[activeMembers.get(b).role] !== undefined ? roleOrder[activeMembers.get(b).role] : 5
+        if (ra !== rb) return ra - rb
+        return a.localeCompare(b)
+      })
+
+      var justSpawnedName = lastEvent && lastEvent.type === 'member.spawn' ? (lastEvent.payload && lastEvent.payload.name) : null
+      var justKilledName = lastEvent && lastEvent.type === 'member.kill' ? (lastEvent.payload && lastEvent.payload.name) : null
+
+      var seats = []
+      var seatByName = {}
+      var total = seatNames.length
+      for (var s = 0; s < total; s += 1) {
+        var sName = seatNames[s]
+        var angle = total === 1 ? -Math.PI / 2 : (-Math.PI / 2 + (2 * Math.PI * s) / total)
+        var sx = Math.round((cx + seatR * Math.cos(angle)) * 10) / 10
+        var sy = Math.round((cy + seatR * Math.sin(angle)) * 10) / 10
+        var meta = activeMembers.get(sName)
+        var seatEntry = {
+          name: sName,
+          role: meta.role || 'worker',
+          status: meta.status || 'waiting',
+          killed: false,
+          justSpawned: sName === justSpawnedName,
+          x: sx,
+          y: sy,
+          angle: angle,
+        }
+        seats.push(seatEntry)
+        seatByName[sName] = seatEntry
+      }
+
+      var distinctSeqs = Array.from(seqSet).sort(function (a, b) { return a - b })
+      var seqToAge = {}
+      for (var q = 0; q < distinctSeqs.length; q += 1) {
+        seqToAge[distinctSeqs[q]] = (distinctSeqs.length - 1) - q
+      }
+
+      var agedEdges = []
+      for (var e = 0; e < rawEdges.length; e += 1) {
+        var item = rawEdges[e]
+        var age = seqToAge[item.seq]
+        var style = computeEdgeVisualStyle(age, maxSteps)
+        if (!style.visible) continue
+        var isBroadcast = item.broadcast === true || item.to === '__table__'
+        if (!seatByName[item.from]) continue
+        if (!isBroadcast && !seatByName[item.to]) continue
+        agedEdges.push({
+          offset: item.offset,
+          seq: item.seq,
+          from: item.from,
+          to: isBroadcast ? '__table__' : item.to,
+          broadcast: isBroadcast,
+          kind: item.kind,
+          title: item.title,
+          time: item.time,
+          stepsAgo: age,
+          style: style,
+        })
+      }
+
+      agedEdges.sort(function (a, b) {
+        if (a.stepsAgo !== b.stepsAgo) return b.stepsAgo - a.stepsAgo
+        return a.seq - b.seq
+      })
+
+      var latestSeq = distinctSeqs.length > 0 ? distinctSeqs[distinctSeqs.length - 1] : 0
+      var latestEdges = agedEdges.filter(function (ed) { return ed.stepsAgo === 0 })
+
+      return {
+        cx: cx,
+        cy: cy,
+        seatR: seatR,
+        seats: seats,
+        seatByName: seatByName,
+        edges: agedEdges,
+        latestSeq: latestSeq,
+        latestEdges: latestEdges,
+        totalRounds: distinctSeqs.length,
+        currentOffset: lastEvent ? (lastEvent.offset || 0) : 0,
+        totalOffsets: totalOffsets,
+        currentTime: lastEvent ? (lastEvent.time || '') : '',
+        currentEvent: lastEvent,
+        justSpawnedName: justSpawnedName,
+        justKilledName: justKilledName,
+      }
+    }
+
     var uiStore = makeSource({
       drawerOpen: false,
       activeTab: 'board', // 'board' | 'overview' | 'graph'
@@ -290,7 +568,8 @@ window.__ModuleLoader__.load({
       filterChannel: null,
       highlightedSeq: null,
       expandedSeqs: {}, // seq -> true (all posts collapsed by default)
-      replaySeq: null, // null means LIVE (headSeq)
+      replaySeq: null, // fallback for legacy snapshots
+      replayOffset: null, // null means LIVE (latest Kafka event offset)
       loading: false,
       selectedSwarmId: null,
       resolvedSwarmId: null,
@@ -1282,18 +1561,48 @@ window.__ModuleLoader__.load({
       return '#64748b'
     }
 
+    function formatEventBadge(ev) {
+      if (!ev) return 'No events recorded yet'
+      var p = ev.payload || {}
+      var shortT = ev.time ? String(ev.time).slice(11, 19) || String(ev.time) : ''
+      var prefix = (shortT ? '[' + shortT + '] ' : '')
+      if (ev.type === 'member.spawn') return prefix + '+ Spawned @' + p.name + ' (' + (p.role || 'worker') + ')'
+      if (ev.type === 'member.kill') return prefix + '- Retired @' + p.name + (p.handover_to ? ' -> @' + p.handover_to : '')
+      if (ev.type === 'member.model_switch') return prefix + 'Model switch @' + p.name + ' -> ' + (p.model || '')
+      if (ev.type === 'board.post') return prefix + '#' + (p.seq || ev.seq || '?') + ' @' + (p.agent || ev.actor) + ': ' + (p.title || p.kind || 'post')
+      if (ev.type === 'swarm.init') return prefix + 'Swarm initialized (' + (p.concurrency_limit || 4) + ' slots)'
+      if (ev.type === 'swarm.done') return prefix + 'Swarm closed [done]'
+      if (ev.type === 'plan.update') return prefix + 'Plan updated (Wave ' + (p.current_wave || 1) + ')'
+      return prefix + ev.type
+    }
+
     function renderGraphTab(snap, ui) {
+      var events = snap && Array.isArray(snap.events) ? snap.events : []
+      var hasEventLog = events.length > 0
       var headSeq = (snap && snap.headSeq) || 1
-      var maxSeq = ui.replaySeq !== null ? Math.min(ui.replaySeq, headSeq) : headSeq
-      var layout = computeRoundTableLayout(
-        (snap && snap.members) || [],
-        (snap && snap.edgeEvents) || [],
-        maxSeq,
-        { cx: 170, cy: 152, seatR: 102, maxSteps: MAX_VISIBLE_EDGE_STEPS },
-      )
+      var totalOffsets = hasEventLog ? (events[events.length - 1].offset || events.length) : headSeq
+      var currentCursor = hasEventLog
+        ? (ui.replayOffset !== null ? Math.min(ui.replayOffset, totalOffsets) : totalOffsets)
+        : (ui.replaySeq !== null ? Math.min(ui.replaySeq, headSeq) : headSeq)
+      var isLive = hasEventLog ? ui.replayOffset === null : ui.replaySeq === null
+
+      var layout = hasEventLog
+        ? computeRoundTableFromEvents(
+            events,
+            (snap && snap.members) || [],
+            ui.replayOffset,
+            { cx: 170, cy: 152, seatR: 102, maxSteps: MAX_VISIBLE_EDGE_STEPS },
+          )
+        : computeRoundTableLayout(
+            (snap && snap.members) || [],
+            (snap && snap.edgeEvents) || [],
+            currentCursor,
+            { cx: 170, cy: 152, seatR: 102, maxSteps: MAX_VISIBLE_EDGE_STEPS },
+          )
       var nodeR = 16
       var tableR = 54
       var latestIsBroadcast = layout.latestEdges.some(function (ed) { return ed.broadcast === true || ed.to === '__table__' })
+      var shortClock = layout.currentTime ? (String(layout.currentTime).slice(11, 19) || String(layout.currentTime)) : ''
       var markerColors = [
         '#facc15',
         '#d97706',
@@ -1305,17 +1614,25 @@ window.__ModuleLoader__.load({
         '#2e241f',
       ]
 
+      function setCursor(nextVal) {
+        if (hasEventLog) {
+          updateUi({ replayOffset: nextVal >= totalOffsets ? null : Math.max(1, nextVal) })
+        } else {
+          updateUi({ replaySeq: nextVal >= headSeq ? null : Math.max(1, nextVal) })
+        }
+      }
+
       return React.createElement(
         'div',
-        { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
-        // Interactive Timeline Scrubber
+        { style: { display: 'flex', flexDirection: 'column', gap: '8px' } },
+        // Kafka-style Event Offset + Timestamp Timeline Scrubber
         React.createElement(
           'div',
           {
             style: {
               display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
+              flexDirection: 'column',
+              gap: '5px',
               fontSize: '11px',
               padding: '7px 9px',
               borderRadius: '8px',
@@ -1324,75 +1641,96 @@ window.__ModuleLoader__.load({
             },
           },
           React.createElement(
-            'button',
-            {
-              type: 'button',
-              onClick: function () { updateUi({ replaySeq: Math.max(1, maxSeq - 1) }) },
-              style: {
-                cursor: 'pointer',
-                padding: '2px 6px',
-                borderRadius: '4px',
-                border: '0.5px solid var(--dsw-alias-border-l2)',
-                background: 'var(--dsw-alias-bg-layer-3)',
-                color: 'var(--dsw-alias-label-primary)',
-                fontSize: '11px',
+            'div',
+            { style: { display: 'flex', alignItems: 'center', gap: '6px' } },
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                onClick: function () { setCursor(Math.max(1, currentCursor - 1)) },
+                style: {
+                  cursor: 'pointer',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  background: 'var(--dsw-alias-bg-layer-3)',
+                  color: 'var(--dsw-alias-label-primary)',
+                  fontSize: '11px',
+                },
+                title: 'Step backward one event',
               },
-              title: 'Step backward one floor',
-            },
-            '◀',
-          ),
-          React.createElement(
-            'span',
-            { style: { color: 'var(--dsw-alias-label-secondary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
-            '#' + maxSeq + '/' + headSeq,
-          ),
-          React.createElement('input', {
-            type: 'range',
-            min: 1,
-            max: Math.max(1, headSeq),
-            value: maxSeq,
-            onChange: function (e) { updateUi({ replaySeq: Number(e.target.value) }) },
-            style: { flex: 1, minWidth: '60px' },
-          }),
-          React.createElement(
-            'button',
-            {
-              type: 'button',
-              onClick: function () {
-                var next = maxSeq + 1
-                updateUi({ replaySeq: next >= headSeq ? null : next })
+              '◀',
+            ),
+            React.createElement(
+              'span',
+              { style: { color: 'var(--dsw-alias-label-secondary)', fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' } },
+              (hasEventLog ? 'Ev ' : '#') + currentCursor + '/' + totalOffsets,
+            ),
+            React.createElement('input', {
+              type: 'range',
+              min: 1,
+              max: Math.max(1, totalOffsets),
+              value: Math.max(1, currentCursor),
+              onChange: function (e) { setCursor(Number(e.target.value)) },
+              style: { flex: 1, minWidth: '60px' },
+            }),
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                onClick: function () { setCursor(currentCursor + 1) },
+                style: {
+                  cursor: 'pointer',
+                  padding: '2px 6px',
+                  borderRadius: '4px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  background: 'var(--dsw-alias-bg-layer-3)',
+                  color: 'var(--dsw-alias-label-primary)',
+                  fontSize: '11px',
+                },
+                title: 'Step forward one event',
               },
-              style: {
-                cursor: 'pointer',
-                padding: '2px 6px',
-                borderRadius: '4px',
-                border: '0.5px solid var(--dsw-alias-border-l2)',
-                background: 'var(--dsw-alias-bg-layer-3)',
-                color: 'var(--dsw-alias-label-primary)',
-                fontSize: '11px',
+              '▶',
+            ),
+            React.createElement(
+              'button',
+              {
+                type: 'button',
+                onClick: function () { updateUi({ replayOffset: null, replaySeq: null }) },
+                style: {
+                  cursor: 'pointer',
+                  padding: '2px 7px',
+                  borderRadius: '4px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  background: isLive ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-3)',
+                  color: 'var(--dsw-alias-label-primary)',
+                  fontSize: '11px',
+                  whiteSpace: 'nowrap',
+                },
               },
-              title: 'Step forward one floor',
-            },
-            '▶',
+              isLive ? '● Live' : 'Latest',
+            ),
           ),
-          React.createElement(
-            'button',
-            {
-              type: 'button',
-              onClick: function () { updateUi({ replaySeq: null }) },
-              style: {
-                cursor: 'pointer',
-                padding: '2px 7px',
-                borderRadius: '4px',
-                border: '0.5px solid var(--dsw-alias-border-l2)',
-                background: ui.replaySeq === null ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-3)',
-                color: 'var(--dsw-alias-label-primary)',
-                fontSize: '11px',
-                whiteSpace: 'nowrap',
-              },
-            },
-            ui.replaySeq === null ? '● Live' : 'Latest',
-          ),
+          hasEventLog && layout.currentEvent
+            ? React.createElement(
+                'div',
+                {
+                  style: {
+                    fontSize: '11px',
+                    color: layout.currentEvent.type === 'member.spawn'
+                      ? '#10b981'
+                      : layout.currentEvent.type === 'member.kill'
+                        ? '#f97316'
+                        : 'var(--dsw-alias-label-secondary)',
+                    whiteSpace: 'nowrap',
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                  },
+                  title: formatEventBadge(layout.currentEvent),
+                },
+                formatEventBadge(layout.currentEvent),
+              )
+            : null,
         ),
         // Round-Table SVG Canvas
         React.createElement(
@@ -1478,7 +1816,7 @@ window.__ModuleLoader__.load({
                 fill: 'var(--dsw-alias-label-tertiary)',
                 fontSize: '9.5',
               },
-              latestIsBroadcast ? '@all broadcast' : (layout.totalRounds + ' round(s)'),
+              latestIsBroadcast ? '@all broadcast' : (layout.seats.length + ' active' + (shortClock ? ' · ' + shortClock : '')),
             ),
             // Directed arrows (oldest dark faint first -> latest bright yellow on top!)
             layout.edges.map(function (ed, idx) {
@@ -1583,15 +1921,15 @@ window.__ModuleLoader__.load({
                   style: { cursor: 'pointer', opacity: seat.killed ? 0.45 : 1 },
                   onClick: function () { updateUi({ activeTab: 'board', filterMember: seat.name }) },
                 },
-                isWorking
+                isWorking || seat.justSpawned
                   ? React.createElement('circle', {
                       cx: seat.x,
                       cy: seat.y,
                       r: nodeR + 4,
                       fill: 'none',
-                      stroke: '#facc15',
-                      strokeWidth: 1.2,
-                      strokeOpacity: 0.7,
+                      stroke: seat.justSpawned ? '#10b981' : '#facc15',
+                      strokeWidth: 1.4,
+                      strokeOpacity: 0.8,
                     })
                   : null,
                 React.createElement('circle', {
@@ -1684,7 +2022,7 @@ window.__ModuleLoader__.load({
           : React.createElement(
               'div',
               { style: { color: 'var(--dsw-alias-label-tertiary)', fontSize: '12px', padding: '8px', textAlign: 'center' } },
-              'No directed @mention arrows up to floor #' + maxSeq + '.',
+              'No directed @mention arrows up to this point in the timeline.',
             ),
       )
     }
@@ -2087,6 +2425,7 @@ window.__ModuleLoader__.load({
           computeGraphEdges: computeGraphEdges,
           computeEdgeVisualStyle: computeEdgeVisualStyle,
           computeRoundTableLayout: computeRoundTableLayout,
+          computeRoundTableFromEvents: computeRoundTableFromEvents,
           getState: function () { return uiStore.getSnapshot() },
           refresh: function (sessionId) { return fetchSwarmState(sessionId) },
           pushSnapshot: function (sessionId, snapshot) {
@@ -2134,6 +2473,7 @@ window.__ModuleLoader__.load({
     exports.computeGraphEdges = computeGraphEdges
     exports.computeEdgeVisualStyle = computeEdgeVisualStyle
     exports.computeRoundTableLayout = computeRoundTableLayout
+    exports.computeRoundTableFromEvents = computeRoundTableFromEvents
     return module.exports
   },
 })

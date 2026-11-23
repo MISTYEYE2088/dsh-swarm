@@ -19,6 +19,7 @@ import {
   writeJsonAtomicSync,
   readJsonSync,
   replayChannelsAt,
+  replaySwarmEvents,
 } from '../src/host/store.js'
 import {
   validateSwarmInit,
@@ -1046,7 +1047,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.2/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.3/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1103,7 +1104,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.2/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.3/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -1666,6 +1667,184 @@ async function test_round_table_preserves_peer_and_killed_edges_and_broadcast_to
   assert.equal(bcEdges[0].broadcast, true)
 }
 
+async function test_round_table_restores_historical_active_seats_across_waves() {
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-rt-waves') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-waves', session: { header: { id: 'sess-waves', cwd: tempRoot } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'Multi-Wave Replay', concurrency_limit: 4 }, { agent: coordAgent })
+  // Wave 1: seq #1 (impl-w1 brief), #2 (qa-w1 brief)
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-w1', role: 'worker', brief: '[OWNERSHIP] src\n[FORBIDDEN] tests\n[DONE_CRITERIA] done' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-w1', role: 'verifier', brief: '[OWNERSHIP] tests\n[FORBIDDEN] src\n[DONE_CRITERIA] verify' },
+    { agent: coordAgent },
+  )
+  // seq #3: impl-w1 -> qa-w1, seq #4: qa-w1 -> coordinator
+  await registeredTools.get('post_board').execute(
+    { title: 'Wave 1 implementation complete', text: '@qa-w1 ready for check', mentions: ['qa-w1'], kind: 'report' },
+    { agent: { id: 'sess-waves__impl-w1' } },
+  )
+  await registeredTools.get('post_board').execute(
+    { title: 'Wave 1 QA approved', text: '@coordinator [VERDICT: ALL PASS]', mentions: ['coordinator'], kind: 'review', verdict: 'approve' },
+    { agent: { id: 'sess-waves__qa-w1' } },
+  )
+  // Retire Wave 1 members at headSeq #4
+  await registeredTools.get('swarm_kill').execute({ name: 'impl-w1' }, { agent: coordAgent })
+  await registeredTools.get('swarm_kill').execute({ name: 'qa-w1' }, { agent: coordAgent })
+
+  // Also test legacy swarm fallback: erase killed_at_seq on qa-w1 to verify inference from board.jsonl!
+  runtime.store.updateMember('sess-waves', 'qa-w1', m => ({ ...m, killed_at_seq: null }))
+
+  // Wave 2: seq #5 (arch-w2 brief), #6 (impl-w2 brief), #7 (impl-w2 -> arch-w2)
+  await registeredTools.get('swarm_add').execute(
+    { name: 'arch-w2', role: 'architect', brief: '[OWNERSHIP] docs\n[FORBIDDEN] src\n[DONE_CRITERIA] adr' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-w2', role: 'worker', brief: '[OWNERSHIP] src\n[FORBIDDEN] docs\n[DONE_CRITERIA] code' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('post_board').execute(
+    { title: 'Wave 2 interface objection', text: '@arch-w2 please review boundary', mentions: ['arch-w2'], kind: 'question' },
+    { agent: { id: 'sess-waves__impl-w2' } },
+  )
+
+  const snap = (await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })).snapshot
+
+  const code = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedMod = null
+  const sandbox = {
+    window: { __ModuleLoader__: { load(spec) { loadedMod = spec.factory(() => null) } } },
+    console: { info() {}, warn() {}, error() {} },
+    Set, Map, Object, Array, Number, String, Symbol, Math,
+  }
+  vm.runInNewContext(code, sandbox, { filename: 'client.js' })
+
+  // Replay Wave 1 at floor #3 -> ONLY coordinator + impl-w1 + qa-w1 (3 seats, NO Wave 2 members!)
+  const wave1Layout = loadedMod.computeRoundTableLayout(snap.members, snap.edgeEvents, 3)
+  assert.deepEqual(
+    Array.from(wave1Layout.seats.map(s => s.name)).sort(),
+    ['coordinator', 'impl-w1', 'qa-w1'],
+    'Wave 1 replay at #3 must show exact historical Wave 1 active seats',
+  )
+  assert.equal(wave1Layout.seats.every(s => !s.killed), true, 'Wave 1 seats were alive at #3')
+  assert.equal(wave1Layout.latestEdges[0].from, 'impl-w1')
+  assert.equal(wave1Layout.latestEdges[0].to, 'qa-w1')
+
+  // Replay Wave 2 at floor #7 -> ONLY coordinator + arch-w2 + impl-w2 (3 seats, NO retired Wave 1 members!)
+  const wave2Layout = loadedMod.computeRoundTableLayout(snap.members, snap.edgeEvents, 7)
+  assert.deepEqual(
+    Array.from(wave2Layout.seats.map(s => s.name)).sort(),
+    ['arch-w2', 'coordinator', 'impl-w2'],
+    'Wave 2 replay at #7 must exclude retired Wave 1 members (both explicit and legacy-inferred)',
+  )
+  assert.equal(wave2Layout.latestEdges[0].from, 'impl-w2')
+  assert.equal(wave2Layout.latestEdges[0].to, 'arch-w2')
+}
+
+async function test_kafka_event_log_replays_exact_state_by_offset_and_timestamp() {
+  const store = new SwarmStore(path.join(tempRoot, 'kafka-events'))
+  store.initSwarm('sw-kafka', { title: 'Kafka Replay', concurrency_limit: 4, concurrency_confirmed: true })
+
+  // Deterministic synthetic timestamps for time-travel verification
+  const eventsDir = store.pathsOf('sw-kafka').eventsJsonl
+  assert.equal(fs.existsSync(eventsDir), true, 'events.jsonl must be created on swarm init')
+
+  store.registerMemberWithBrief('sw-kafka', {
+    name: 'impl-w1',
+    session_id: 'sw-kafka__impl-w1',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+  store.registerMemberWithBrief('sw-kafka', {
+    name: 'qa-w1',
+    session_id: 'sw-kafka__qa-w1',
+    role: 'verifier',
+    brief: '[OWNERSHIP] tests\n[FORBIDDEN] a\n[DONE_CRITERIA] test',
+  })
+  store.appendBoardRecord('sw-kafka', {
+    type: 'post',
+    agent: 'impl-w1',
+    title: 'Wave 1 core complete',
+    mentions: ['qa-w1'],
+    kind: 'report',
+    text: '@qa-w1 please verify',
+  })
+  const w1Events = store.readEventLog('sw-kafka')
+  const w1PostOffset = w1Events[w1Events.length - 1].offset
+  const w1PostTs = w1Events[w1Events.length - 1].ts_ms
+
+  // Wait 15ms so Wave 2 events have a strictly greater timestamp
+  await new Promise(resolve => setTimeout(resolve, 15))
+  store.appendEvent('sw-kafka', { type: 'member.kill', actor: 'coordinator', seq: 3, payload: { name: 'impl-w1', released: false } })
+  store.appendEvent('sw-kafka', { type: 'member.kill', actor: 'coordinator', seq: 3, payload: { name: 'qa-w1', released: false } })
+  store.registerMemberWithBrief('sw-kafka', {
+    name: 'arch-w2',
+    session_id: 'sw-kafka__arch-w2',
+    role: 'architect',
+    brief: '[OWNERSHIP] docs\n[FORBIDDEN] src\n[DONE_CRITERIA] adr',
+  })
+  store.appendBoardRecord('sw-kafka', {
+    type: 'post',
+    agent: 'coordinator',
+    title: 'Global Wave 2 kickoff',
+    mentions: ['all'],
+    kind: 'decision',
+    text: '@all Wave 2 begins now',
+  })
+
+  const fullEvents = store.readEventLog('sw-kafka')
+
+  // 1. Host replay by offset AND by timestamp at Wave 1 post
+  const atW1ByOffset = replaySwarmEvents(fullEvents, { atOffset: w1PostOffset })
+  assert.deepEqual(atW1ByOffset.activeMembers.map(m => m.name).sort(), ['coordinator', 'impl-w1', 'qa-w1'])
+  const atW1ByTime = replaySwarmEvents(fullEvents, { atTsMs: w1PostTs })
+  assert.deepEqual(atW1ByTime.activeMembers.map(m => m.name).sort(), ['coordinator', 'impl-w1', 'qa-w1'])
+
+  // 2. Host replay at latest offset -> Wave 1 retired, only coordinator + arch-w2 active, latest edge is @all -> __table__
+  const atEnd = replaySwarmEvents(fullEvents)
+  assert.deepEqual(atEnd.activeMembers.map(m => m.name).sort(), ['arch-w2', 'coordinator'])
+  const lastEdge = atEnd.edgeEvents[atEnd.edgeEvents.length - 1]
+  assert.equal(lastEdge.to, '__table__')
+  assert.equal(lastEdge.broadcast, true)
+
+  // 3. Client `computeRoundTableFromEvents` replays identical seats at Wave 1 offset vs latest offset
+  const code = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedMod = null
+  const sandbox = {
+    window: { __ModuleLoader__: { load(spec) { loadedMod = spec.factory(() => null) } } },
+    console: { info() {}, warn() {}, error() {} },
+    Set, Map, Object, Array, Number, String, Symbol, Math,
+  }
+  vm.runInNewContext(code, sandbox, { filename: 'client.js' })
+
+  const clientW1 = loadedMod.computeRoundTableFromEvents(fullEvents, [], w1PostOffset)
+  assert.deepEqual(Array.from(clientW1.seats.map(s => s.name)).sort(), ['coordinator', 'impl-w1', 'qa-w1'])
+  assert.equal(clientW1.latestEdges[0].from, 'impl-w1')
+  assert.equal(clientW1.latestEdges[0].to, 'qa-w1')
+
+  const clientEnd = loadedMod.computeRoundTableFromEvents(fullEvents, [], null)
+  assert.deepEqual(Array.from(clientEnd.seats.map(s => s.name)).sort(), ['arch-w2', 'coordinator'])
+  assert.equal(clientEnd.latestEdges[0].to, '__table__')
+  assert.equal(clientEnd.latestEdges[0].broadcast, true)
+
+  // 4. Legacy backfill: delete events.jsonl and verify readEventLog synthesizes valid history automatically
+  fs.unlinkSync(eventsDir)
+  const backfilled = store.readEventLog('sw-kafka')
+  assert.ok(backfilled.length >= 5, 'Legacy backfill must synthesize init + spawn + post events')
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -1733,6 +1912,8 @@ try {
   await runTest('test_validator_enforces_meaningful_post_title', test_validator_enforces_meaningful_post_title)
   await runTest('test_client_round_table_edge_aging_and_layout', test_client_round_table_edge_aging_and_layout)
   await runTest('test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center', test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center)
+  await runTest('test_round_table_restores_historical_active_seats_across_waves', test_round_table_restores_historical_active_seats_across_waves)
+  await runTest('test_kafka_event_log_replays_exact_state_by_offset_and_timestamp', test_kafka_event_log_replays_exact_state_by_offset_and_timestamp)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

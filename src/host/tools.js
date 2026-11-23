@@ -9,6 +9,7 @@ import path from 'node:path'
 
 import {
   replayChannelsAt,
+  replaySwarmEvents,
   extractScreenshotsFromPosts,
   computeSupersededMap,
   deriveFallbackTitle,
@@ -137,6 +138,24 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     killed: 0,
   }
 
+  // Infer historical born_seq / retired_seq for every member so Round-Table replay
+  // restores the exact set of active seats at any historical floor (including legacy swarms).
+  const firstSeenSeq = new Map()
+  const lastSeenSeq = new Map()
+  for (const rec of records) {
+    if (!rec || rec.type === 'control') continue
+    if (rec.agent) {
+      if (!firstSeenSeq.has(rec.agent)) firstSeenSeq.set(rec.agent, rec.seq)
+      lastSeenSeq.set(rec.agent, rec.seq)
+    }
+    if (Array.isArray(rec.mentions)) {
+      for (const mName of rec.mentions) {
+        if (!firstSeenSeq.has(mName)) firstSeenSeq.set(mName, rec.seq)
+        lastSeenSeq.set(mName, rec.seq)
+      }
+    }
+  }
+
   const memberRows = []
   for (const [name, rawMember] of Object.entries(members)) {
     if (rawMember.system_builtin === true && rawMember.role === 'monitor') continue
@@ -146,6 +165,17 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     const m = liveOverlay ? { ...rawMember, ...liveOverlay } : rawMember
     const liveness = runtime.getMemberLiveness(swarmId, name, m)
     const queuePos = runtime.concurrencyGate?.queuePositionOf?.(m.session_id) ?? 0
+
+    const bornSeq = m.role === 'coordinator'
+      ? 0
+      : (typeof m.brief_seq === 'number' && m.brief_seq > 0
+          ? m.brief_seq
+          : (firstSeenSeq.get(name) ?? 0))
+    const retiredSeq = m.killed === true
+      ? (typeof m.killed_at_seq === 'number' && m.killed_at_seq > 0
+          ? m.killed_at_seq
+          : (lastSeenSeq.get(name) ?? bornSeq))
+      : null
 
     if (m.killed) {
       memberSummary.killed += 1
@@ -168,6 +198,10 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       parent: m.parent ?? null,
       phase: m.last_error ? 'ERROR' : m.phase,
       killed: m.killed === true,
+      born_seq: bornSeq,
+      retired_seq: retiredSeq,
+      brief_seq: m.brief_seq ?? bornSeq,
+      killed_at_seq: retiredSeq,
       handover_to: m.handover_to ?? null,
       status: liveness.status,
       stepSummary: liveness.stepSummary ?? null,
@@ -276,11 +310,15 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       : withTitle
   })
 
+  const events = store.readEventLog(swarmId)
+  const replayed = replaySwarmEvents(events)
+
   return {
     runtime: typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null,
     swarm,
     plan,
     headSeq,
+    headOffset: replayed.offset,
     channels: channelState.channels,
     archivedChannels: channelState.archived,
     concurrency: runtime.concurrencyGate.snapshot(),
@@ -290,6 +328,7 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     supersededBy,
     members: memberRows,
     posts: annotatedPosts,
+    events: events.slice(-600),
     edgeEvents,
     screenshots: extractScreenshotsFromPosts(records),
   }
@@ -356,7 +395,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.2', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.3', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -814,6 +853,12 @@ export function createSwarmTools(runtime) {
         let archivePath = null
         if (isDonePost) {
           store.updateSwarm(swarmId, { status: 'DONE' })
+          store.appendEvent(swarmId, {
+            type: 'swarm.done',
+            actor: callerName,
+            seq: postRecord.seq,
+            payload: { seq: postRecord.seq, title: postRecord.title },
+          })
           archivePath = store.archiveSwarm(swarmId, 'done')
         }
 
@@ -1074,7 +1119,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.2', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.3', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1316,7 +1361,19 @@ export function createSwarmTools(runtime) {
           : null
 
         if (neverWorked) {
+          const killedAtSeq = store.headSeq(swarmId)
           store.removeMemberRecord(swarmId, targetName)
+          store.appendEvent(swarmId, {
+            type: 'member.kill',
+            actor: callerName,
+            seq: killedAtSeq,
+            payload: {
+              name: targetName,
+              released: true,
+              handover_to: handoverTo,
+              reason: killReason,
+            },
+          })
           runtime.notifyProjectionChanged(swarmId)
           return {
             ok: true,
@@ -1325,14 +1382,27 @@ export function createSwarmTools(runtime) {
           }
         }
 
+        const killedAtSeq = store.headSeq(swarmId)
         store.updateMember(swarmId, targetName, m => ({
           ...m,
           desired_state: 'KILLED',
           phase: 'KILLED',
           killed: true,
+          killed_at_seq: killedAtSeq,
           ...(handoverTo ? { handover_to: handoverTo } : {}),
           ...(killReason ? { kill_reason: killReason } : {}),
         }))
+        store.appendEvent(swarmId, {
+          type: 'member.kill',
+          actor: callerName,
+          seq: killedAtSeq,
+          payload: {
+            name: targetName,
+            released: false,
+            handover_to: handoverTo,
+            reason: killReason,
+          },
+        })
         runtime.notifyProjectionChanged(swarmId)
 
         const handoverNote = handoverTo ? ` (handed over to @${handoverTo}${killReason ? ': ' + killReason : ''})` : ''

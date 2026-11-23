@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.3 (2026-11-23)
+
+- **Kafka-Style Event-Sourced Architecture (`events.jsonl`) for Exact Historical Replay**:
+  - Added append-only `<swarmId>/events.jsonl` recording every immutable swarm action with monotonic `offset` and millisecond timestamp `ts_ms` (`swarm.init`, `member.spawn`, `member.kill`, `member.model_switch`, `board.post`, `board.control`, `plan.update`, `swarm.done`), archived alongside the other blackboard files on close.
+  - Added deterministic `replaySwarmEvents(events, { atOffset, atTsMs, atSeq })` in `src/host/store.js` plus automatic legacy synthesis for older swarms without `events.jsonl`.
+  - Upgraded the Round-Table UI (`client.js`, `computeRoundTableFromEvents`) to scrub across Kafka event offsets & timestamps, restoring the **exact active seats, spawn/retire transitions, and aging yellow arrows** at every historical moment.
+
 ## 0.3.2 (2026-11-23)
 
 - **Rightbar Board Tab UX**:

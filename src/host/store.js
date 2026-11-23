@@ -1,11 +1,12 @@
-// Four-file plain-text Swarm store:
+// Five-file plain-text Swarm store:
 //   <rootDir>/<swarmId>/swarm.json
 //   <rootDir>/<swarmId>/board.jsonl
 //   <rootDir>/<swarmId>/members.json
 //   <rootDir>/<swarmId>/plan.json
+//   <rootDir>/<swarmId>/events.jsonl   (Kafka-style append-only lifecycle & board event log)
 //
-// Also owns event-sourced channel replay (`channelsAt` / `activeAt`) from
-// `type: "control"` frames embedded inside `board.jsonl`, post superseding maps,
+// Also owns deterministic time/offset event replay (`replaySwarmEvents`),
+// event-sourced channel replay (`replayChannelsAt`), post superseding maps,
 // merge-gate rejection tracking, and Windows-NTFS-resilient atomic JSON writes.
 
 import fs from 'node:fs'
@@ -102,6 +103,22 @@ export function readJsonSync(filePath, fallback = undefined) {
   if (!fs.existsSync(filePath)) return fallback
   const text = fs.readFileSync(filePath, 'utf8')
   return JSON.parse(text)
+}
+
+/** Read and parse a newline-delimited JSONL file, ignoring truncated trailing lines. */
+export function readJsonlSync(filePath) {
+  if (!fs.existsSync(filePath)) return []
+  const raw = fs.readFileSync(filePath, 'utf8')
+  const lines = raw.split('\n').filter(line => line.trim().length > 0)
+  const records = []
+  for (const line of lines) {
+    try {
+      records.push(JSON.parse(line))
+    } catch {
+      // Ignore truncated trailing line on crash recovery
+    }
+  }
+  return records
 }
 
 // #FUNC Replay control frames up to `atSeq` to compute existing channels and member subscriptions.
@@ -218,6 +235,182 @@ export function computeSupersededMap(records) {
   return supersededBy
 }
 
+// #FUNC Fold an append-only Kafka-style event stream (`events.jsonl`) up to `atOffset`, `atTsMs`, or `atSeq` to reconstruct exact historical seats, channels, and directed/broadcast arrows.
+// #NOT  Never leaks future spawned members or already-killed members into an earlier point in time.
+// #EDGE-IN Replaying by offset or timestamp across Wave 1 spawn, peer posts, Wave 1 kill, and Wave 2 spawn restores exact historical seats at every point → test_kafka_event_log_replays_exact_state_by_offset_and_timestamp
+// #WHY  Event-sourced replay over `events.jsonl` (`offset` + `ts_ms`) gives lossless Kafka-style time-travel for the Round Table instead of guessing history from a mutable `members.json` snapshot.
+export function replaySwarmEvents(events, { atOffset = Infinity, atTsMs = Infinity, atSeq = Infinity } = {}) {
+  const list = Array.isArray(events) ? events : []
+  const activeMembers = new Map()
+  const allMembers = new Map()
+  const activeChannels = new Set(['main'])
+  const subscriptions = new Map()
+  const edgeEvents = []
+  let lastEvent = null
+  let headSeq = 0
+  let swarmStatus = 'ACTIVE'
+
+  function ensureSub(name) {
+    if (!subscriptions.has(name)) subscriptions.set(name, new Set(['main']))
+    return subscriptions.get(name)
+  }
+
+  for (const ev of list) {
+    if (!ev || typeof ev !== 'object') continue
+    if (typeof ev.offset === 'number' && ev.offset > atOffset) break
+    if (typeof ev.ts_ms === 'number' && ev.ts_ms > atTsMs) break
+    if (typeof ev.seq === 'number' && ev.seq > 0 && ev.seq > atSeq) break
+
+    lastEvent = ev
+    if (typeof ev.seq === 'number' && ev.seq > headSeq) headSeq = ev.seq
+    const p = ev.payload || {}
+
+    if (ev.type === 'swarm.init') {
+      swarmStatus = 'ACTIVE'
+      if (!activeMembers.has('coordinator')) {
+        const coord = {
+          name: 'coordinator',
+          role: 'coordinator',
+          group: null,
+          provider: p.default_provider || 'inherit',
+          model: p.coordinator_model || p.default_model || 'inherit',
+          born_offset: ev.offset,
+          born_ts_ms: ev.ts_ms,
+          born_seq: 0,
+        }
+        activeMembers.set('coordinator', coord)
+        allMembers.set('coordinator', coord)
+        ensureSub('coordinator')
+      }
+    } else if (ev.type === 'member.spawn' && p.name) {
+      const seat = {
+        name: p.name,
+        role: p.role || 'worker',
+        group: p.group ?? null,
+        provider: p.provider || 'inherit',
+        model: p.model || 'inherit',
+        born_offset: ev.offset,
+        born_ts_ms: ev.ts_ms,
+        born_seq: p.brief_seq ?? ev.seq ?? headSeq,
+      }
+      activeMembers.set(p.name, seat)
+      allMembers.set(p.name, seat)
+      ensureSub(p.name)
+    } else if (ev.type === 'member.kill' && p.name) {
+      activeMembers.delete(p.name)
+      const prev = allMembers.get(p.name)
+      if (prev) {
+        prev.retired_offset = ev.offset
+        prev.retired_ts_ms = ev.ts_ms
+        prev.retired_seq = ev.seq ?? headSeq
+      }
+    } else if (ev.type === 'member.model_switch' && p.name) {
+      const m = activeMembers.get(p.name) || allMembers.get(p.name)
+      if (m) {
+        if (p.provider) m.provider = p.provider
+        if (p.model) m.model = p.model
+      }
+    } else if (ev.type === 'board.control') {
+      const ch = typeof p.channel === 'string' ? p.channel.replace(/^#/, '') : ''
+      if (ch && ch !== 'main') {
+        if (p.action === 'channel.create') {
+          activeChannels.add(ch)
+          if (p.agent) ensureSub(p.agent).add(ch)
+        } else if (p.action === 'channel.subscribe') {
+          const target = p.target || p.agent
+          if (activeChannels.has(ch) && target) ensureSub(target).add(ch)
+        } else if (p.action === 'channel.unsubscribe') {
+          const target = p.target || p.agent
+          if (target) ensureSub(target).delete(ch)
+        } else if (p.action === 'channel.archive') {
+          activeChannels.delete(ch)
+          for (const set of subscriptions.values()) set.delete(ch)
+        }
+      }
+    } else if (ev.type === 'board.post') {
+      const from = p.agent || ev.actor || 'coordinator'
+      const seq = p.seq ?? ev.seq ?? 0
+      const title = p.title || deriveFallbackTitle(p.text, p.kind || 'post')
+      const rawMentions = Array.isArray(p.mentions) ? p.mentions : []
+      const rawChannels = Array.isArray(p.channel_mentions) ? p.channel_mentions : []
+
+      if (p.silent === true || rawMentions.includes('all')) {
+        edgeEvents.push({
+          offset: ev.offset,
+          ts_ms: ev.ts_ms,
+          time: ev.time || p.time || '',
+          seq,
+          from,
+          to: '__table__',
+          broadcast: true,
+          kind: p.kind || 'report',
+          title,
+        })
+      } else {
+        const targets = new Set()
+        for (const token of rawMentions) {
+          if (!token || token === from || token === 'monitor') continue
+          if (activeMembers.has(token) || allMembers.has(token)) {
+            targets.add(token)
+            continue
+          }
+          for (const [mName, mObj] of activeMembers.entries()) {
+            if (mName !== from && mObj.group === token) targets.add(mName)
+          }
+        }
+        if (rawChannels.length > 0) {
+          for (const mName of activeMembers.keys()) {
+            if (mName === from) continue
+            const subs = ensureSub(mName)
+            if (rawChannels.some(ch => ch !== 'main' && subs.has(ch))) targets.add(mName)
+          }
+        }
+        if (targets.size === 0) {
+          edgeEvents.push({
+            offset: ev.offset,
+            ts_ms: ev.ts_ms,
+            time: ev.time || p.time || '',
+            seq,
+            from,
+            to: '__table__',
+            broadcast: true,
+            kind: p.kind || 'report',
+            title,
+          })
+        } else {
+          for (const t of targets) {
+            edgeEvents.push({
+              offset: ev.offset,
+              ts_ms: ev.ts_ms,
+              time: ev.time || p.time || '',
+              seq,
+              from,
+              to: t,
+              broadcast: false,
+              kind: p.kind || 'report',
+              title,
+            })
+          }
+        }
+      }
+    } else if (ev.type === 'swarm.done') {
+      swarmStatus = 'DONE'
+    }
+  }
+
+  return {
+    offset: lastEvent?.offset ?? 0,
+    ts_ms: lastEvent?.ts_ms ?? 0,
+    time: lastEvent?.time ?? '',
+    headSeq,
+    status: swarmStatus,
+    lastEvent,
+    activeMembers: [...activeMembers.values()],
+    channels: [...activeChannels],
+    edgeEvents,
+  }
+}
+
 /**
  * Per-Swarm store managing `swarm.json`, `board.jsonl`, `members.json`, and `plan.json`
  * inside `<baseDir>/<swarmId>/`.
@@ -241,7 +434,185 @@ export class SwarmStore {
       boardJsonl: path.join(dir, 'board.jsonl'),
       membersJson: path.join(dir, 'members.json'),
       planJson: path.join(dir, 'plan.json'),
+      eventsJsonl: path.join(dir, 'events.jsonl'),
     }
+  }
+
+  /** Append one immutable Kafka-style lifecycle/board event to `events.jsonl` with monotonic `offset` and `ts_ms`. */
+  appendEvent(swarmId, { type, actor = 'coordinator', seq = null, ts_ms = Date.now(), time = null, payload = {} }) {
+    const paths = this.pathsOf(swarmId)
+    fs.mkdirSync(paths.dir, { recursive: true })
+    const existing = this.readRawEvents(swarmId)
+    const nextOffset = existing.length === 0 ? 1 : existing[existing.length - 1].offset + 1
+    const eventTime = time || formatTime(new Date(ts_ms))
+    const frame = {
+      offset: nextOffset,
+      ts_ms,
+      time: eventTime,
+      type,
+      ...(typeof seq === 'number' && seq > 0 ? { seq } : {}),
+      actor,
+      payload,
+    }
+    fs.appendFileSync(paths.eventsJsonl, JSON.stringify(frame) + '\n', 'utf8')
+    return frame
+  }
+
+  /** Read raw events from `events.jsonl` without legacy synthesis. */
+  readRawEvents(swarmId) {
+    return readJsonlSync(this.pathsOf(swarmId).eventsJsonl)
+  }
+
+  /**
+   * Read the ordered Kafka-style event log for `swarmId`.
+   * If `events.jsonl` does not exist yet (legacy pre-v0.3.3 swarm on disk), synthesizes
+   * an accurate timestamped event stream from `swarm.json`, `members.json`, and `board.jsonl`.
+   */
+  readEventLog(swarmId) {
+    const raw = this.readRawEvents(swarmId)
+    if (raw.length > 0) return raw
+    if (!this.exists(swarmId)) return []
+
+    const swarm = this.readSwarm(swarmId)
+    const members = this.readMembers(swarmId)
+    const board = this.readBoard(swarmId)
+    const synthesized = []
+    let offset = 1
+
+    const initTs = swarm?.created_at ? Date.parse(swarm.created_at) : Date.now()
+    synthesized.push({
+      offset: offset++,
+      ts_ms: Number.isFinite(initTs) ? initTs : 0,
+      time: formatTime(new Date(Number.isFinite(initTs) ? initTs : Date.now())),
+      type: 'swarm.init',
+      actor: 'coordinator',
+      payload: {
+        title: swarm?.title || 'Swarm',
+        generation: swarm?.generation ?? 1,
+        concurrency_limit: swarm?.concurrency_limit ?? 4,
+        default_provider: swarm?.default_provider || 'inherit',
+        default_model: swarm?.default_model || 'inherit',
+      },
+    })
+
+    // Compute inferred last activity seq for killed legacy members
+    const lastActiveSeq = new Map()
+    for (const rec of board) {
+      if (!rec || rec.type === 'control') continue
+      if (rec.agent) lastActiveSeq.set(rec.agent, rec.seq)
+      if (Array.isArray(rec.mentions)) {
+        for (const mName of rec.mentions) lastActiveSeq.set(mName, rec.seq)
+      }
+    }
+
+    const spawnedSet = new Set(['coordinator'])
+    const retiredAtSeq = new Map()
+    for (const [mName, m] of Object.entries(members)) {
+      if (!m || mName === 'coordinator' || (m.system_builtin && m.role === 'monitor')) continue
+      if (m.killed === true) {
+        const retSeq = (typeof m.killed_at_seq === 'number' && m.killed_at_seq > 0)
+          ? m.killed_at_seq
+          : (lastActiveSeq.get(mName) ?? m.brief_seq ?? 0)
+        if (!retiredAtSeq.has(retSeq)) retiredAtSeq.set(retSeq, [])
+        retiredAtSeq.get(retSeq).push({ name: mName, member: m })
+      }
+    }
+
+    for (const rec of board) {
+      if (!rec) continue
+      const recTs = typeof rec.created_ms === 'number'
+        ? rec.created_ms
+        : (rec.time ? Date.parse(String(rec.time).replace(' ', 'T') + 'Z') : Date.now())
+      const tsMs = Number.isFinite(recTs) ? recTs : Date.now()
+
+      if (rec.type === 'control') {
+        synthesized.push({
+          offset: offset++,
+          ts_ms: tsMs,
+          time: rec.time || formatTime(new Date(tsMs)),
+          type: 'board.control',
+          seq: rec.seq,
+          actor: rec.agent || 'coordinator',
+          payload: {
+            seq: rec.seq,
+            action: rec.action,
+            agent: rec.agent,
+            channel: rec.channel,
+            ...(rec.target ? { target: rec.target } : {}),
+          },
+        })
+      } else {
+        // Emit member.spawn right before a member's opening brief
+        if (rec.kind === 'brief' && Array.isArray(rec.mentions)) {
+          for (const mName of rec.mentions) {
+            const m = members[mName]
+            if (m && !spawnedSet.has(mName)) {
+              spawnedSet.add(mName)
+              synthesized.push({
+                offset: offset++,
+                ts_ms: Math.max(0, tsMs - 1),
+                time: rec.time || formatTime(new Date(tsMs)),
+                type: 'member.spawn',
+                seq: rec.seq,
+                actor: m.parent || 'coordinator',
+                payload: {
+                  name: mName,
+                  role: m.role || 'worker',
+                  group: m.group ?? null,
+                  provider: m.applied_provider || 'inherit',
+                  model: m.applied_model || 'inherit',
+                  brief_seq: rec.seq,
+                },
+              })
+            }
+          }
+        }
+        synthesized.push({
+          offset: offset++,
+          ts_ms: tsMs,
+          time: rec.time || formatTime(new Date(tsMs)),
+          type: 'board.post',
+          seq: rec.seq,
+          actor: rec.agent || 'coordinator',
+          payload: {
+            seq: rec.seq,
+            agent: rec.agent,
+            title: rec.title || deriveFallbackTitle(rec.text, rec.kind || 'post'),
+            kind: rec.kind || 'report',
+            channel: rec.channel || 'main',
+            mentions: rec.mentions || [],
+            ...(rec.channel_mentions ? { channel_mentions: rec.channel_mentions } : {}),
+            ...(rec.verdict ? { verdict: rec.verdict } : {}),
+            ...(rec.supersedes ? { supersedes: rec.supersedes } : {}),
+            ...(rec.silent ? { silent: true } : {}),
+            ...(rec.escalate ? { escalate: true } : {}),
+            time: rec.time || '',
+          },
+        })
+      }
+
+      const retiringHere = retiredAtSeq.get(rec.seq)
+      if (retiringHere) {
+        for (const item of retiringHere) {
+          synthesized.push({
+            offset: offset++,
+            ts_ms: tsMs + 1,
+            time: rec.time || formatTime(new Date(tsMs)),
+            type: 'member.kill',
+            seq: rec.seq,
+            actor: 'coordinator',
+            payload: {
+              name: item.name,
+              released: false,
+              handover_to: item.member.handover_to ?? null,
+              reason: item.member.kill_reason ?? null,
+            },
+          })
+        }
+      }
+    }
+
+    return synthesized
   }
 
   /** Serialize async mutations per swarmId so board seqs and cursor updates never race. */
@@ -392,6 +763,20 @@ export class SwarmStore {
       writeJsonAtomicSync(paths.membersJson, members)
     }
 
+    this.appendEvent(swarmId, {
+      type: 'swarm.init',
+      actor: 'coordinator',
+      payload: {
+        title: swarmMeta.title,
+        generation: swarmMeta.generation,
+        concurrency_limit: swarmMeta.concurrency_limit,
+        project_root: swarmMeta.project_root,
+        default_provider: swarmMeta.default_provider,
+        default_model: swarmMeta.default_model,
+        coordinator_model: swarmMeta.coordinator_model,
+      },
+    })
+
     return { swarm: swarmMeta, members }
   }
 
@@ -441,19 +826,7 @@ export class SwarmStore {
   }
 
   readBoard(swarmId) {
-    const { boardJsonl } = this.pathsOf(swarmId)
-    if (!fs.existsSync(boardJsonl)) return []
-    const raw = fs.readFileSync(boardJsonl, 'utf8')
-    const lines = raw.split('\n').filter(line => line.trim().length > 0)
-    const records = []
-    for (const line of lines) {
-      try {
-        records.push(JSON.parse(line))
-      } catch {
-        // Ignore truncated trailing line on crash recovery
-      }
-    }
-    return records
+    return readJsonlSync(this.pathsOf(swarmId).boardJsonl)
   }
 
   headSeq(swarmId) {
@@ -587,6 +960,45 @@ export class SwarmStore {
     }
     this.writeMembers(swarmId, members)
 
+    if (record.type === 'control') {
+      this.appendEvent(swarmId, {
+        type: 'board.control',
+        actor: record.agent,
+        seq: record.seq,
+        ts_ms: record.created_ms,
+        time: record.time,
+        payload: {
+          seq: record.seq,
+          action: record.action,
+          agent: record.agent,
+          channel: record.channel,
+          ...(record.target ? { target: record.target } : {}),
+        },
+      })
+    } else {
+      this.appendEvent(swarmId, {
+        type: 'board.post',
+        actor: record.agent,
+        seq: record.seq,
+        ts_ms: record.created_ms,
+        time: record.time,
+        payload: {
+          seq: record.seq,
+          agent: record.agent,
+          title: record.title,
+          kind: record.kind,
+          channel: record.channel,
+          mentions: record.mentions,
+          ...(record.channel_mentions ? { channel_mentions: record.channel_mentions } : {}),
+          ...(record.verdict ? { verdict: record.verdict } : {}),
+          ...(record.supersedes ? { supersedes: record.supersedes } : {}),
+          ...(record.silent ? { silent: true } : {}),
+          ...(record.escalate ? { escalate: true } : {}),
+          time: record.time,
+        },
+      })
+    }
+
     return record
   }
 
@@ -609,6 +1021,25 @@ export class SwarmStore {
     const briefTitle = typeof spec.title === 'string' && spec.title.trim()
       ? spec.title.trim().slice(0, 100)
       : `Brief: @${spec.name} (${role})`
+
+    // Append `member.spawn` event BEFORE the brief post so Kafka replay seats the member right before its brief arrives!
+    const plannedBriefSeq = this.headSeq(swarmId) + 1
+    this.appendEvent(swarmId, {
+      type: 'member.spawn',
+      actor: spec.parent ?? 'coordinator',
+      seq: plannedBriefSeq,
+      payload: {
+        name: spec.name,
+        role,
+        can_block_merge: canBlockMerge,
+        group: spec.group ?? null,
+        parent: spec.parent ?? 'coordinator',
+        provider: spec.provider ?? swarm?.default_provider ?? 'inherit',
+        model: spec.model ?? swarm?.default_model ?? 'inherit',
+        workspace_mode: spec.workspace_mode ?? 'inherit',
+        brief_seq: plannedBriefSeq,
+      },
+    })
 
     const briefPost = this.appendBoardRecord(swarmId, {
       type: 'post',
@@ -733,14 +1164,24 @@ export class SwarmStore {
       updated_at: new Date().toISOString(),
       ...planData,
     })
-    return readJsonSync(paths.planJson, null)
+    const saved = readJsonSync(paths.planJson, null)
+    this.appendEvent(swarmId, {
+      type: 'plan.update',
+      actor: 'coordinator',
+      payload: {
+        goal: saved?.goal ?? '',
+        current_wave: saved?.current_wave ?? 1,
+        track_count: Array.isArray(saved?.tracks) ? saved.tracks.length : 0,
+      },
+    })
+    return saved
   }
 
   readPlan(swarmId) {
     return readJsonSync(this.pathsOf(swarmId).planJson, null)
   }
 
-  /** Copy blackboard files into `<baseDir>/archive/<swarmId>_gen<gen>_<timestamp>_<reason>/`. */
+  /** Copy blackboard & event log files into `<baseDir>/archive/<swarmId>_gen<gen>_<timestamp>_<reason>/`. */
   archiveSwarm(swarmId, reason = 'done') {
     if (!this.exists(swarmId)) return null
     const srcPaths = this.pathsOf(swarmId)
@@ -750,7 +1191,7 @@ export class SwarmStore {
     const safeId = String(swarmId).replace(/[^a-zA-Z0-9_.-]/g, '_')
     const archiveDir = path.join(this.baseDir, 'archive', `${safeId}_gen${gen}_${stamp}_${reason}`)
     fs.mkdirSync(archiveDir, { recursive: true })
-    for (const fileName of ['swarm.json', 'board.jsonl', 'members.json', 'plan.json']) {
+    for (const fileName of ['swarm.json', 'board.jsonl', 'members.json', 'plan.json', 'events.jsonl']) {
       const srcFile = path.join(srcPaths.dir, fileName)
       if (fs.existsSync(srcFile)) {
         fs.copyFileSync(srcFile, path.join(archiveDir, fileName))
