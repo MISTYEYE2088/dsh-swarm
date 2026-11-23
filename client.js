@@ -672,7 +672,17 @@ window.__ModuleLoader__.load({
                           {
                             type: 'button',
                             onClick: function () {
-                              try { uiWorkspaceRef.openSession(m.session_id) } catch (_e) {}
+                              try {
+                                if (m.role === 'coordinator' || m.session_id === targetSwarmId) {
+                                  uiWorkspaceRef.openSession(targetSwarmId)
+                                } else {
+                                  uiWorkspaceRef.openSession({
+                                    parentSessionId: targetSwarmId,
+                                    childSessionId: m.session_id,
+                                    mode: 'continuable',
+                                  })
+                                }
+                              } catch (_e) {}
                             },
                             style: {
                               padding: '2px 8px',

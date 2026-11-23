@@ -47,9 +47,9 @@ const DEFAULTS = Object.freeze({
   minSpacingMs: 200,
   agingThresholdMs: 15_000,
   monitorIntervalMs: 180_000,
-  defaultProvider: 'internal',
-  defaultModel: 'deepseek4.1f',
-  coordinatorModel: 'glm5.3',
+  defaultProvider: 'inherit',
+  defaultModel: 'inherit',
+  coordinatorModel: 'inherit',
   swarmDir: '',
   worktreesDir: '',
 })
@@ -336,6 +336,153 @@ export function applyWith(ctx, config, deps = {}) {
       turnStates.set(agentId, state)
     },
 
+    getParentModelRoute(rootAgent) {
+      const reqCfg = rootAgent?.session?.requestHeader?.()?.config
+      const agentOpts = rootAgent?.options
+      const defSel = ctx.get?.('agentDefaultModel')?.currentSelection?.()
+      const provider = reqCfg?.provider ?? agentOpts?.provider ?? defSel?.provider ?? ''
+      const model = reqCfg?.model ?? agentOpts?.model ?? defSel?.model ?? ''
+      const maxTokens = reqCfg?.maxTokens ?? agentOpts?.maxTokens
+      const reasoningEffort = reqCfg?.reasoningEffort ?? agentOpts?.reasoningEffort ?? defSel?.reasoningEffort
+      return {
+        provider: String(provider || ''),
+        model: String(model || ''),
+        ...(maxTokens !== undefined ? { maxTokens } : {}),
+        ...(reasoningEffort !== undefined ? { reasoningEffort } : {}),
+      }
+    },
+
+    async discoverAvailableModels(rootAgent) {
+      const parentRoute = runtime.getParentModelRoute(rootAgent)
+      const routes = []
+      const seen = new Set()
+      function addRoute(provider, model, name = '') {
+        if (!provider || !model) return
+        const key = `${provider}/${model}`
+        if (seen.has(key)) return
+        seen.add(key)
+        routes.push({
+          provider,
+          model,
+          name: name || model,
+          label: `${provider}/${model}`,
+        })
+      }
+
+      if (parentRoute.provider && parentRoute.model) {
+        addRoute(parentRoute.provider, parentRoute.model, `${parentRoute.model} (当前会话模型)`)
+      }
+
+      // Check DSH subagentModelSelection settings if configured
+      try {
+        const subSel = ctx.get?.('subagentModelSelection')?.current?.()
+        if (subSel && Array.isArray(subSel.allowedModels)) {
+          for (const r of subSel.allowedModels) {
+            addRoute(r.provider, r.model)
+          }
+        }
+      } catch {
+        // Ignore if subagentModelSelection is not configured
+      }
+
+      // Query registered providers and advertised models from ctx.llm
+      try {
+        const llm = ctx.get?.('llm')
+        if (llm && typeof llm.listProviders === 'function') {
+          const providers = llm.listProviders() ?? []
+          for (const p of providers) {
+            if (!p?.id) continue
+            try {
+              const models = (await llm.listModels?.(p.id)) ?? []
+              for (const m of models) {
+                if (m?.id) addRoute(p.id, m.id, m.name || m.id)
+              }
+            } catch {
+              // Ignore provider listing failure
+            }
+          }
+        }
+      } catch {
+        // Ignore if llm service is absent in unit test mocks
+      }
+
+      return { parentRoute, routes }
+    },
+
+    async resolveModelRoute({ requestedProvider, requestedModel, rootAgent, swarmMeta } = {}) {
+      const { parentRoute, routes } = await runtime.discoverAvailableModels(rootAgent)
+      let rawProvider = typeof requestedProvider === 'string' ? requestedProvider.trim() : ''
+      let rawModel = typeof requestedModel === 'string' ? requestedModel.trim() : ''
+
+      // Support combined "provider/model" string in requestedModel
+      if (rawModel.includes('/')) {
+        const slashIdx = rawModel.indexOf('/')
+        const prefix = rawModel.slice(0, slashIdx).trim()
+        const suffix = rawModel.slice(slashIdx + 1).trim()
+        if (prefix && suffix) {
+          rawProvider = prefix
+          rawModel = suffix
+        }
+      }
+
+      const isInherit = (val) => !val || val === 'inherit' || val === 'default' || val === 'current' || val === 'internal'
+      if (isInherit(rawModel)) {
+        const fallbackModel = !isInherit(swarmMeta?.default_model)
+          ? swarmMeta.default_model
+          : parentRoute.model
+        rawModel = fallbackModel || rawModel
+      }
+      if (isInherit(rawProvider)) {
+        const fallbackProv = !isInherit(swarmMeta?.default_provider)
+          ? swarmMeta.default_provider
+          : parentRoute.provider
+        rawProvider = fallbackProv || rawProvider
+      }
+
+      const llm = ctx.get?.('llm')
+      const registeredProviders = (llm && typeof llm.listProviders === 'function')
+        ? (llm.listProviders() ?? []).map(p => p.id)
+        : []
+
+      if (registeredProviders.length > 0) {
+        const providerValid = registeredProviders.includes(rawProvider)
+        // Find matching route in discovered catalog
+        const exactMatch = routes.find(r => (
+          (!providerValid || r.provider === rawProvider)
+          && (r.model === rawModel || r.label === `${rawProvider}/${rawModel}`)
+        )) ?? routes.find(r => r.model.toLowerCase() === rawModel.toLowerCase())
+          ?? routes.find(r => (
+            rawModel
+            && !isInherit(rawModel)
+            && (r.model.toLowerCase().includes(rawModel.toLowerCase())
+              || rawModel.toLowerCase().includes(r.model.toLowerCase()))
+          ))
+
+        if (exactMatch) {
+          rawProvider = exactMatch.provider
+          rawModel = exactMatch.model
+        } else if (!providerValid) {
+          // Never allow an unregistered provider (like "internal") to reach DSH agent-loop!
+          rawProvider = parentRoute.provider || registeredProviders[0] || rawProvider
+          if (isInherit(rawModel) && parentRoute.model) {
+            rawModel = parentRoute.model
+          }
+        }
+      }
+
+      const finalProvider = rawProvider || parentRoute.provider || ''
+      const finalModel = rawModel || parentRoute.model || ''
+      const routeChanged = finalProvider !== parentRoute.provider || finalModel !== parentRoute.model
+      return {
+        provider: finalProvider,
+        model: finalModel,
+        ...(parentRoute.maxTokens !== undefined ? { maxTokens: parentRoute.maxTokens } : {}),
+        ...(!routeChanged && parentRoute.reasoningEffort !== undefined
+          ? { reasoningEffort: parentRoute.reasoningEffort }
+          : {}),
+      }
+    },
+
     activateCoordinatorMode(agent) {
       if (!agent) return
       agentMembership.set(agent.id, {
@@ -358,12 +505,102 @@ export function applyWith(ctx, config, deps = {}) {
       }
     },
 
+    buildChildSetup({ swarmId, memberName, member, rolePrompt, resolvedRoute, rootAgent, isCreate }) {
+      const permPreset = rootAgent?.ctx?.get?.('permissionPresets')?.current?.(rootAgent?.session)
+      const sandboxMode = rootAgent?.ctx?.get?.('sandboxPolicy')?.overrideOf?.(rootAgent?.session)
+      const hasApprovalSvc = rootAgent?.ctx?.get?.('approval') !== undefined
+
+      return function setup(agentCtx, childAgent) {
+        // 1. Join parent's Agent Preset so preset tools (bash, read, write, edit, glob, grep) are mounted!
+        try {
+          if (rootAgent?.ctx) {
+            agentCtx?.get?.('agentPresets')?.composeFrom?.(agentCtx, rootAgent.ctx)
+          }
+        } catch (err) {
+          warn(`composeFrom parent preset failed for @${memberName}: ${String(err)}`)
+        }
+
+        // 2. On fresh creation, append the durable v3 subagent/descriptor and delegated policy events
+        if (isCreate && childAgent?.session && typeof childAgent.session.append === 'function') {
+          try {
+            childAgent.session.append('subagent/descriptor', {
+              version: 3,
+              mode: 'continuable',
+              provider: 'spawn',
+              label: `@${memberName} (${member.role})`,
+              ...(resolvedRoute.provider ? { agentProvider: resolvedRoute.provider } : {}),
+              ...(resolvedRoute.model ? { agentModel: resolvedRoute.model } : {}),
+              ...(resolvedRoute.reasoningEffort ? { agentReasoningEffort: resolvedRoute.reasoningEffort } : {}),
+            })
+          } catch (err) {
+            warn(`append subagent/descriptor failed for @${memberName}: ${String(err)}`)
+          }
+
+          try {
+            if (sandboxMode !== undefined) {
+              childAgent.session.append('sandbox/mode', { mode: sandboxMode, source: 'delegation' })
+            }
+            if (hasApprovalSvc) {
+              childAgent.session.append('approval/policy', { policy: 'never', source: 'delegation' })
+            }
+            if (permPreset === 'auto' || permPreset === 'danger-full-access') {
+              childAgent.session.append('permission/preset', { preset: permPreset })
+            }
+          } catch {
+            // Ignore if session event schemas are not mounted in minimal test harness
+          }
+        }
+
+        // 3. Restrict recursive subagent tools on workers so they communicate via board.jsonl
+        try {
+          const toolsOnChild = agentCtx?.tools ?? agentCtx?.get?.('tools')
+          if (toolsOnChild && typeof toolsOnChild.restrict === 'function') {
+            toolsOnChild.restrict({
+              deny: ['subagent', 'subagent_fork', 'workflow', 'swarm_init', 'swarm_add', 'swarm_kill'],
+            })
+          }
+        } catch {
+          // Ignore if tool restriction is unavailable
+        }
+
+        // 4. Mount the role-specific SOP prompt section
+        const sp = agentCtx?.systemPrompt ?? agentCtx?.get?.('systemPrompt')
+        if (sp && typeof sp.section === 'function') {
+          sp.section({
+            name: 'dsh-swarm:role-sop',
+            order: 85,
+            text: rolePrompt,
+            interpolate: false,
+          })
+        }
+      }
+    },
+
     async spawnMemberAgent({ swarmId, memberName, member, briefPost, fullBrief, rootAgent }) {
       agentMembership.set(member.session_id, {
         swarmId,
         memberName,
         role: member.role,
       })
+
+      const swarmMeta = store.readSwarm(swarmId)
+      const resolvedRoute = await runtime.resolveModelRoute({
+        requestedProvider: member.applied_provider,
+        requestedModel: member.applied_model,
+        rootAgent,
+        swarmMeta,
+      })
+
+      // Persist the resolved real provider/model back to members.json
+      if (resolvedRoute.provider || resolvedRoute.model) {
+        member = store.updateMember(swarmId, memberName, curr => ({
+          ...curr,
+          desired_provider: resolvedRoute.provider || curr.desired_provider,
+          desired_model: resolvedRoute.model || curr.desired_model,
+          applied_provider: resolvedRoute.provider || curr.applied_provider,
+          applied_model: resolvedRoute.model || curr.applied_model,
+        }))
+      }
 
       const members = store.readMembers(swarmId)
       const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
@@ -394,33 +631,58 @@ export function applyWith(ctx, config, deps = {}) {
           }
         }
 
+        const agentPreset = rootAgent?.ctx?.get?.('agentPresets')?.composedPreset?.(rootAgent.ctx)
+          ?? rootAgent?.session?.header?.agentPreset
+        const childDepth = (rootAgent?.session?.header?.delegationDepth ?? 0) + 1
+        const agentOptions = {
+          ...(resolvedRoute.provider ? { provider: resolvedRoute.provider } : {}),
+          ...(resolvedRoute.model ? { model: resolvedRoute.model } : {}),
+          ...(resolvedRoute.maxTokens !== undefined ? { maxTokens: resolvedRoute.maxTokens } : {}),
+          ...(resolvedRoute.reasoningEffort !== undefined ? { reasoningEffort: resolvedRoute.reasoningEffort } : {}),
+          subagentDepth: childDepth,
+        }
+
         const handle = await agentsSvc.create({
           sessionId: member.session_id,
           ...(rootAgent ? { parentAgent: rootAgent } : {}),
           meta: {
             cwd: member.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+            ...(agentPreset ? { agentPreset } : {}),
             parentSession: swarmId,
+            isSeeded: Boolean(seedEvents),
             origin: 'subagent',
-            delegationDepth: (rootAgent?.session?.header?.delegationDepth ?? 0) + 1,
-            ...(seedEvents ? { isSeeded: true } : {}),
+            delegationDepth: childDepth,
           },
           ...(seedEvents ? { seed: seedEvents, inheritedEventCount } : {}),
-          agentOptions: {
-            provider: member.applied_provider,
-            model: member.applied_model,
-          },
-          setup(agentCtx) {
-            const sp = agentCtx?.get?.('systemPrompt')
-            if (sp && typeof sp.section === 'function') {
-              sp.section({
-                name: 'dsh-swarm:role-sop',
-                order: 85,
-                text: rolePrompt,
-                interpolate: false,
-              })
-            }
-          },
+          agentOptions,
+          setup: runtime.buildChildSetup({
+            swarmId,
+            memberName,
+            member,
+            rolePrompt,
+            resolvedRoute,
+            rootAgent,
+            isCreate: true,
+          }),
         })
+
+        // Register the child in the parent session's durable subagent/catalog projection
+        // so DSH's SessionHistoryController & ClientSessions resolve its durable parent address!
+        if (rootAgent?.session && typeof rootAgent.session.append === 'function') {
+          try {
+            const childHeader = handle?.agent?.session?.header
+            rootAgent.session.append('subagent/catalog', {
+              version: 0,
+              childId: childHeader?.id ?? member.session_id,
+              childCreatedAt: childHeader?.createdAt ?? Date.now(),
+              mode: 'continuable',
+              label: `@${memberName} (${member.role})`,
+            })
+          } catch (err) {
+            warn(`append subagent/catalog failed for @${memberName}: ${String(err)}`)
+          }
+        }
+
         memberHandles.set(`${swarmId}:${memberName}`, handle)
         if (member.role !== 'monitor') {
           handle.agent.steer(
@@ -473,11 +735,23 @@ export function applyWith(ctx, config, deps = {}) {
       const m = members[memberName]
       if (!m || m.killed) return { ok: false, error: `Member @${memberName} not found or killed.` }
 
+      const agentsSvc = ctx.get?.('agents')
+      const rootAgent = agentsSvc?.get?.(swarmId)
+      const swarmMeta = store.readSwarm(swarmId)
+      const resolvedRoute = await runtime.resolveModelRoute({
+        requestedProvider: provider,
+        requestedModel: model,
+        rootAgent,
+        swarmMeta,
+      })
+      const nextProvider = resolvedRoute.provider || provider
+      const nextModel = resolvedRoute.model || model
+
       // Record desired_model first, then apply
       store.updateMember(swarmId, memberName, curr => ({
         ...curr,
-        desired_provider: provider,
-        desired_model: model,
+        desired_provider: nextProvider,
+        desired_model: nextModel,
       }))
 
       const key = `${swarmId}:${memberName}`
@@ -487,30 +761,52 @@ export function applyWith(ctx, config, deps = {}) {
         memberHandles.delete(key)
       }
 
-      const agentsSvc = ctx.get?.('agents')
       if (agentsSvc && typeof agentsSvc.resume === 'function') {
-        const rootAgent = agentsSvc.get?.(swarmId)
+        const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
+        const rolePrompt = renderRolePrompt(m.role, {
+          memberName,
+          groupName: m.group ?? 'none',
+          workspaceMode: m.workspace_mode,
+          cwd: m.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+          briefSeq: m.brief_seq ?? 1,
+          brief: '',
+          lastReadSeq: m.last_read_seq ?? 0,
+          verifierName,
+        })
         const resumed = await agentsSvc.resume({
           resumeSessionId: m.session_id,
           ...(rootAgent ? { parentAgent: rootAgent } : {}),
-          agentOptions: { provider, model },
+          agentOptions: {
+            ...(nextProvider ? { provider: nextProvider } : {}),
+            ...(nextModel ? { model: nextModel } : {}),
+            ...(resolvedRoute.maxTokens !== undefined ? { maxTokens: resolvedRoute.maxTokens } : {}),
+          },
+          setup: runtime.buildChildSetup({
+            swarmId,
+            memberName,
+            member: m,
+            rolePrompt,
+            resolvedRoute,
+            rootAgent,
+            isCreate: false,
+          }),
         })
         memberHandles.set(key, resumed)
         resumed.agent.steer(
           buildSwarmSystemMessage(
-            `[Swarm Model Switch] 你的运行模型已热切换为 ${provider}/${model}（原因：${reason}）。请调用 read_board({"since": ${m.last_read_seq ?? 0}}) 继续未完成的工作。`,
-            `Swarm model switched to ${model}`,
+            `[Swarm Model Switch] 你的运行模型已热切换为 ${nextProvider}/${nextModel}（原因：${reason}）。请调用 read_board({"since": ${m.last_read_seq ?? 0}}) 继续未完成的工作。`,
+            `Swarm model switched to ${nextModel}`,
           ),
         )
       }
 
       store.updateMember(swarmId, memberName, curr => ({
         ...curr,
-        applied_provider: provider,
-        applied_model: model,
+        applied_provider: nextProvider,
+        applied_model: nextModel,
       }))
 
-      return { ok: true }
+      return { ok: true, provider: nextProvider, model: nextModel }
     },
 
     async disposeMemberAgent(swarmId, memberName) {

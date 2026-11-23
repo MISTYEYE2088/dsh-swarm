@@ -50,7 +50,7 @@ export function validateSwarmInit(args) {
     return formatError('swarm_init', '参数必须是 JSON 对象。', {
       title: '模块排查与修复',
       concurrency_limit: 4,
-      default_model: 'deepseek4.1f',
+      default_model: 'inherit',
     })
   }
   const title = typeof args.title === 'string' ? args.title.trim() : ''
@@ -58,7 +58,7 @@ export function validateSwarmInit(args) {
     return formatError('swarm_init', 'title 必须是非空字符串（2~120 字符）。', {
       title: 'PDF 导出乱码排查与修复',
       concurrency_limit: 4,
-      default_model: 'deepseek4.1f',
+      default_model: 'inherit',
     })
   }
   const limit = Number(args.concurrency_limit)
@@ -69,7 +69,7 @@ export function validateSwarmInit(args) {
       {
         title,
         concurrency_limit: 4,
-        default_model: args.default_model || 'deepseek4.1f',
+        default_model: args.default_model || 'inherit',
       },
     )
   }
@@ -80,13 +80,13 @@ export function validateSwarmInit(args) {
       concurrency_limit: limit,
       default_provider: typeof args.default_provider === 'string' && args.default_provider.trim()
         ? args.default_provider.trim()
-        : 'internal',
+        : 'inherit',
       default_model: typeof args.default_model === 'string' && args.default_model.trim()
         ? args.default_model.trim()
-        : 'deepseek4.1f',
+        : 'inherit',
       coordinator_model: typeof args.coordinator_model === 'string' && args.coordinator_model.trim()
         ? args.coordinator_model.trim()
-        : 'glm5.3',
+        : 'inherit',
     },
   }
 }
@@ -233,8 +233,8 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       role,
       workspace,
       brief: brief || '[OWNERSHIP] 全局黑板死锁巡检\n[FORBIDDEN] 严禁修改任何业务文件\n[DONE_CRITERIA] 发现静默死锁时发 [stall] 提醒',
-      provider: args.provider ?? swarmMeta.default_provider ?? 'internal',
-      model: args.model ?? swarmMeta.default_model ?? 'deepseek4.1f',
+      provider: args.provider ?? swarmMeta.default_provider ?? 'inherit',
+      model: args.model ?? swarmMeta.default_model ?? 'inherit',
       fork: args.fork ? String(args.fork).trim() : null,
       tasks: Array.isArray(args.tasks) ? args.tasks.map(String) : null,
       parent: callerName,

@@ -890,6 +890,121 @@ async function test_slash_command_and_rightbar_registration() {
   assert.equal(registeredSlotKeys.includes('sidebar.right.pane.tab.title:dsh-swarm'), true)
 }
 
+async function test_subagent_creation_inherits_real_model_preset_and_durable_address() {
+  const parentEvents = []
+  const childEvents = []
+  let presetComposed = false
+  let createdOptions = null
+
+  const rootAgent = {
+    id: 'session-parent-1',
+    options: { provider: 'opencode-go', model: 'deepseek-v4.1-flash', maxTokens: 384000 },
+    ctx: {
+      get(name) {
+        if (name === 'agentPresets') {
+          return {
+            composedPreset() { return 'coding' },
+          }
+        }
+        if (name === 'permissionPresets') {
+          return { current() { return 'auto' } }
+        }
+        return undefined
+      },
+    },
+    session: {
+      header: { id: 'session-parent-1', cwd: tempRoot, delegationDepth: 0, agentPreset: 'coding' },
+      requestHeader() {
+        return { config: { provider: 'opencode-go', model: 'deepseek-v4.1-flash', maxTokens: 384000 } }
+      },
+      append(type, data) {
+        parentEvents.push({ type, data })
+      },
+    },
+  }
+
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'llm') {
+        return {
+          listProviders() { return [{ id: 'opencode-go', name: 'OpenCode Go' }] },
+          async listModels() {
+            return [
+              { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash' },
+              { id: 'glm-5', name: 'GLM 5' },
+            ]
+          },
+        }
+      }
+      if (name === 'agents') {
+        return {
+          get(id) { return id === rootAgent.id ? rootAgent : undefined },
+          async create(opts) {
+            createdOptions = opts
+            const childAgent = {
+              id: opts.sessionId,
+              session: {
+                header: { id: opts.sessionId, createdAt: 1700000000000, parentSession: rootAgent.id, origin: 'subagent' },
+                append(type, data) { childEvents.push({ type, data }) },
+              },
+              steer() {},
+            }
+            const childCtx = {
+              get(svc) {
+                if (svc === 'agentPresets') {
+                  return {
+                    composeFrom(_cCtx, pCtx) {
+                      if (pCtx === rootAgent.ctx) presetComposed = true
+                    },
+                  }
+                }
+                if (svc === 'systemPrompt') return { section() {} }
+                if (svc === 'tools') return { restrict() {} }
+                return undefined
+              },
+            }
+            if (typeof opts.setup === 'function') opts.setup(childCtx, childAgent)
+            return { agent: childAgent, async dispose() {} }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-subagent-fix') }, { log: () => {}, warn: () => {} })
+  runtime.store.initSwarm(rootAgent.id, {
+    title: 'Real Model & Durable Address Test',
+    concurrency_limit: 4,
+    concurrency_confirmed: true,
+  })
+  const { member, briefPost } = runtime.store.registerMemberWithBrief(rootAgent.id, {
+    name: 'engine-core',
+    session_id: `${rootAgent.id}__engine-core`,
+    role: 'worker',
+    provider: 'internal', // Even if LLM hallucinated "internal", resolveModelRoute must fix it to "opencode-go"
+    model: 'inherit',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+
+  await runtime.spawnMemberAgent({
+    swarmId: rootAgent.id,
+    memberName: 'engine-core',
+    member,
+    briefPost,
+    fullBrief: member.brief ?? '',
+    rootAgent,
+  })
+
+  assert.equal(createdOptions.agentOptions.provider, 'opencode-go')
+  assert.equal(createdOptions.agentOptions.model, 'deepseek-v4.1-flash')
+  assert.equal(presetComposed, true, 'Child agent must compose parent agentPreset so write/bash tools exist')
+  assert.equal(childEvents.some(e => e.type === 'subagent/descriptor' && e.data.version === 3 && e.data.mode === 'continuable'), true)
+  assert.equal(parentEvents.some(e => e.type === 'subagent/catalog' && e.data.childId === `${rootAgent.id}__engine-core` && e.data.mode === 'continuable'), true)
+}
+
 // Run all tests
 try {
   await runTest('test_atomic_store_roundtrip', test_atomic_store_roundtrip)
@@ -923,6 +1038,7 @@ try {
   await runTest('test_client_tokenize_board_text', test_client_tokenize_board_text)
   await runTest('test_client_graph_replay_aggregation', test_client_graph_replay_aggregation)
   await runTest('test_slash_command_and_rightbar_registration', test_slash_command_and_rightbar_registration)
+  await runTest('test_subagent_creation_inherits_real_model_preset_and_durable_address', test_subagent_creation_inherits_real_model_preset_and_durable_address)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }

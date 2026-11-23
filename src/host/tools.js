@@ -126,33 +126,62 @@ export function createSwarmTools(runtime) {
 
   const swarmInitTool = makeTool({
     name: 'swarm_init',
-    description: 'Initialize or update the Swarm blackboard (swarm.json, board.jsonl, members.json) AFTER asking the user for concurrency_limit via ask_user_question.',
+    description: 'Initialize or update the Swarm blackboard (swarm.json, board.jsonl, members.json) AFTER asking the user for concurrency_limit and model preference via ask_user_question.',
     parameters: {
       properties: {
         title: { type: 'string', description: 'Short descriptive title for this Swarm.' },
         concurrency_limit: { type: 'integer', description: 'User-confirmed positive integer concurrency limit (e.g. 2, 4, 6, 8, ...).' },
-        default_provider: { type: 'string', description: 'LLM provider route name (default: internal).' },
-        default_model: { type: 'string', description: 'Default worker/verifier model (e.g. deepseek4.1f or glm5.3).' },
-        coordinator_model: { type: 'string', description: 'Coordinator/monitor model (e.g. glm5.3).' },
+        default_provider: { type: 'string', description: 'Optional registered LLM provider id (default: "inherit" from current session).' },
+        default_model: { type: 'string', description: 'Optional model id or "provider/model" (default: "inherit" from current session).' },
+        coordinator_model: { type: 'string', description: 'Optional coordinator/monitor model id (default: "inherit" from current session).' },
       },
       required: ['title', 'concurrency_limit'],
     },
     async execute(args, exec) {
       const check = validateSwarmInit(args)
       if (!check.ok) return { ok: false, text: check.error }
-      const { swarmId } = runtime.resolveCaller(exec.agent)
+      const { swarmId, rootAgent } = runtime.resolveCaller(exec.agent)
+      const resolvedDefault = typeof runtime.resolveModelRoute === 'function'
+        ? await runtime.resolveModelRoute({
+            requestedProvider: check.value.default_provider,
+            requestedModel: check.value.default_model,
+            rootAgent,
+          })
+        : { provider: check.value.default_provider, model: check.value.default_model }
+      const resolvedCoord = typeof runtime.resolveModelRoute === 'function'
+        ? await runtime.resolveModelRoute({
+            requestedProvider: check.value.default_provider,
+            requestedModel: check.value.coordinator_model,
+            rootAgent,
+          })
+        : { provider: check.value.default_provider, model: check.value.coordinator_model }
+
       return await store.withLock(swarmId, async () => {
         const { swarm } = store.initSwarm(swarmId, {
           ...check.value,
+          default_provider: resolvedDefault.provider || check.value.default_provider,
+          default_model: resolvedDefault.model || check.value.default_model,
+          coordinator_model: resolvedCoord.model || resolvedDefault.model || check.value.coordinator_model,
           concurrency_confirmed: true,
         })
+        if (resolvedCoord.provider || resolvedCoord.model) {
+          try {
+            store.updateMember(swarmId, 'coordinator', curr => ({
+              ...curr,
+              desired_provider: resolvedCoord.provider || curr.desired_provider,
+              desired_model: resolvedCoord.model || curr.desired_model,
+              applied_provider: resolvedCoord.provider || curr.applied_provider,
+              applied_model: resolvedCoord.model || curr.applied_model,
+            }))
+          } catch {}
+        }
         concurrencyGate.setLimit(swarm.concurrency_limit)
         runtime.ensureMonitorDaemon(swarmId)
         runtime.notifyProjectionChanged(swarmId)
         return {
           ok: true,
           swarm,
-          text: `[swarm_init OK] Swarm "${swarm.title}" 已初始化（swarm_id=${swarmId}，并发上限=${swarm.concurrency_limit}，默认模型=${swarm.default_model}）。接下来请调用 swarm_plan 写入波次计划，再调用 swarm_add 添加成员。`,
+          text: `[swarm_init OK] Swarm "${swarm.title}" 已初始化（swarm_id=${swarmId}，并发上限=${swarm.concurrency_limit}，默认路由=${swarm.default_provider}/${swarm.default_model}）。接下来请调用 swarm_plan 写入波次计划，再调用 swarm_add 添加成员。`,
         }
       })
     },
@@ -774,24 +803,50 @@ export function createSwarmCommand(runtime) {
       }
 
       // Default: `/swarm <task>` — initialize unconfirmed swarm entry and steer the Coordinator
-      // to ask the user for concurrency_limit first!
+      // to ask the user for concurrency_limit and model preference first!
+      const discovered = typeof runtime.discoverAvailableModels === 'function'
+        ? await runtime.discoverAvailableModels(agent)
+        : { parentRoute: { provider: 'inherit', model: 'inherit' }, routes: [] }
+      const currentRouteText = discovered.parentRoute?.provider && discovered.parentRoute?.model
+        ? `${discovered.parentRoute.provider}/${discovered.parentRoute.model}`
+        : 'inherit'
+      const availableRoutesList = Array.isArray(discovered.routes) && discovered.routes.length > 0
+        ? discovered.routes.slice(0, 12).map(r => `${r.provider}/${r.model}`).join(', ')
+        : currentRouteText
+
       await store.withLock(swarmId, async () => {
         if (!store.exists(swarmId)) {
           store.initSwarm(swarmId, {
             title: raw.slice(0, 60) || 'Swarm Task',
             concurrency_confirmed: false,
             concurrency_limit: runtime.settings.defaultConcurrency,
+            default_provider: discovered.parentRoute?.provider || 'inherit',
+            default_model: discovered.parentRoute?.model || 'inherit',
+            coordinator_model: discovered.parentRoute?.model || 'inherit',
           })
         }
       })
       runtime.activateCoordinatorMode(agent)
       runtime.notifyProjectionChanged(swarmId)
 
-      const kickoffPrompt = `[USER INVOKED /swarm]\n任务目标：${raw || '请协助完成任务'}\n\n【强制第一步】在调用 swarm_add 创建任何成员之前，你必须立即先调用 ask_user_question 询问用户本次希望使用的并发槽位数（如 4 / 6 / 2 / 8 或自定义）及模型选择（glm5.3 / deepseek4.1f），拿到用户回答后再调用 swarm_init -> swarm_plan -> swarm_add！`
+      const kickoffPrompt = [
+        `[USER INVOKED /swarm]`,
+        `任务目标：${raw || '请协助完成任务'}`,
+        ``,
+        `【当前 DSH 环境真实模型路由信息（严禁硬编码或捏造 provider="internal"！）】`,
+        `- 当前主会话正在使用的模型：\`${currentRouteText}\``,
+        `- 当前 DSH 已注册可用模型路由：\`${availableRoutesList}\``,
+        ``,
+        `【强制第一步】在调用 swarm_add 创建任何成员之前，你必须立即先调用 ask_user_question 询问用户：`,
+        `1. 本次希望使用的并发槽位数（如 4 / 6 / 2 / 8 或自定义）；`,
+        `2. 本次子成员希望使用的模型偏好（第一项推荐 "沿用当前会话模型 (${currentRouteText}) (Recommended)"，并将上述已注册可用模型列为选项，允许用户在 Other 中输入任意可用模型）。`,
+        ``,
+        `【拆解任务铁律】严禁为了凑并行人数把一个完整需求拆成多个毫无关联的小玩具（例如不要把“做一个游戏 Demo”拆成贪吃蛇+打砖块+翻牌三个无关游戏）！所有 Worker 必须围绕**同一个核心目标/系统**的正交子模块或不同排查线协同，并配备独立 @verifier 交叉实测打回返工！`,
+      ].join('\n')
       agent.steer(buildSwarmSystemMessage(kickoffPrompt, 'Swarm kickoff'))
       return {
         kind: 'success',
-        text: `🐝 已进入 Swarm 协调模式，正在向您确认本次任务的并发数与模型分配...`,
+        text: `🐝 已进入 Swarm 协调模式（当前会话模型: ${currentRouteText}），正在向您确认本次任务的并发数与模型偏好...`,
       }
     },
   }
