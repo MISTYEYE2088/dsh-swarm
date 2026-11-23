@@ -111,15 +111,15 @@ function discoverChildGitRepos(baseDir) {
   return found
 }
 
-/** Build the deterministic Overview / Board / Roster / Graph snapshot for the Browser UI and `swarm_status`. */
+/** Build the deterministic Overview / Board / Roster / Round-Table snapshot from the single `events.jsonl` projection. */
 export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
   if (!store.exists(swarmId)) return null
-  const swarm = store.readSwarm(swarmId)
+  const { events, projection } = store.projectState(swarmId)
+  const swarm = projection.swarm
+  const plan = projection.plan
+  const records = projection.board
+  const headSeq = projection.headSeq
   const members = store.readMembers(swarmId)
-  const records = store.readBoard(swarmId)
-  const plan = store.readPlan(swarmId)
-  const headSeq = records.length === 0 ? 0 : records[records.length - 1].seq
-  const channelState = replayChannelsAt(records, headSeq)
   const supersededMap = computeSupersededMap(records)
   const supersededBy = {}
   for (const [oldSeq, newSeq] of supersededMap.entries()) {
@@ -138,24 +138,6 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     killed: 0,
   }
 
-  // Infer historical born_seq / retired_seq for every member so Round-Table replay
-  // restores the exact set of active seats at any historical floor (including legacy swarms).
-  const firstSeenSeq = new Map()
-  const lastSeenSeq = new Map()
-  for (const rec of records) {
-    if (!rec || rec.type === 'control') continue
-    if (rec.agent) {
-      if (!firstSeenSeq.has(rec.agent)) firstSeenSeq.set(rec.agent, rec.seq)
-      lastSeenSeq.set(rec.agent, rec.seq)
-    }
-    if (Array.isArray(rec.mentions)) {
-      for (const mName of rec.mentions) {
-        if (!firstSeenSeq.has(mName)) firstSeenSeq.set(mName, rec.seq)
-        lastSeenSeq.set(mName, rec.seq)
-      }
-    }
-  }
-
   const memberRows = []
   for (const [name, rawMember] of Object.entries(members)) {
     if (rawMember.system_builtin === true && rawMember.role === 'monitor') continue
@@ -165,17 +147,6 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     const m = liveOverlay ? { ...rawMember, ...liveOverlay } : rawMember
     const liveness = runtime.getMemberLiveness(swarmId, name, m)
     const queuePos = runtime.concurrencyGate?.queuePositionOf?.(m.session_id) ?? 0
-
-    const bornSeq = m.role === 'coordinator'
-      ? 0
-      : (typeof m.brief_seq === 'number' && m.brief_seq > 0
-          ? m.brief_seq
-          : (firstSeenSeq.get(name) ?? 0))
-    const retiredSeq = m.killed === true
-      ? (typeof m.killed_at_seq === 'number' && m.killed_at_seq > 0
-          ? m.killed_at_seq
-          : (lastSeenSeq.get(name) ?? bornSeq))
-      : null
 
     if (m.killed) {
       memberSummary.killed += 1
@@ -198,10 +169,10 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       parent: m.parent ?? null,
       phase: m.last_error ? 'ERROR' : m.phase,
       killed: m.killed === true,
-      born_seq: bornSeq,
-      retired_seq: retiredSeq,
-      brief_seq: m.brief_seq ?? bornSeq,
-      killed_at_seq: retiredSeq,
+      born_seq: m.born_seq ?? m.brief_seq ?? 0,
+      retired_seq: m.retired_seq ?? m.killed_at_seq ?? null,
+      brief_seq: m.brief_seq ?? 0,
+      killed_at_seq: m.killed_at_seq ?? null,
       handover_to: m.handover_to ?? null,
       status: liveness.status,
       stepSummary: liveness.stepSummary ?? null,
@@ -229,79 +200,6 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     })
   }
 
-  // Compute historical directed @mention topology edges for every post so the Round-Table
-  // view shows true peer-to-peer exchanges (preserving later-killed members, omitting spurious
-  // `wake_mode === 'anything'` coordinator fanout, and routing `@all` / broadcasts to `__table__`).
-  const edgeEvents = []
-  for (const rec of records) {
-    if (!rec || rec.type === 'control') continue
-    const recTitle = rec.title || deriveFallbackTitle(rec.text, rec.kind || 'post')
-    const rawMentions = Array.isArray(rec.mentions) ? rec.mentions : []
-    const rawChannels = Array.isArray(rec.channel_mentions) ? rec.channel_mentions : []
-
-    if (rec.silent === true || rawMentions.includes('all')) {
-      edgeEvents.push({
-        seq: rec.seq,
-        from: rec.agent,
-        to: '__table__',
-        broadcast: true,
-        kind: rec.kind,
-        title: recTitle,
-        time: rec.time || '',
-      })
-      continue
-    }
-
-    const peerTargets = new Set()
-    for (const token of rawMentions) {
-      if (!token || token === rec.agent || token === 'monitor') continue
-      if (members[token]) {
-        peerTargets.add(token)
-        continue
-      }
-      // Expand @group to all members of that group (including later-killed historical members)
-      for (const [mName, mObj] of Object.entries(members)) {
-        if (mName !== rec.agent && mObj && mObj.group === token) {
-          peerTargets.add(mName)
-        }
-      }
-    }
-    if (rawChannels.length > 0) {
-      const chAtSeq = replayChannelsAt(records, rec.seq)
-      for (const mName of Object.keys(members)) {
-        if (mName === rec.agent) continue
-        const subs = new Set(chAtSeq.subscriptionsOf(mName))
-        if (rawChannels.some(ch => ch !== 'main' && subs.has(ch))) {
-          peerTargets.add(mName)
-        }
-      }
-    }
-
-    if (peerTargets.size === 0) {
-      edgeEvents.push({
-        seq: rec.seq,
-        from: rec.agent,
-        to: '__table__',
-        broadcast: true,
-        kind: rec.kind,
-        title: recTitle,
-        time: rec.time || '',
-      })
-    } else {
-      for (const target of peerTargets) {
-        edgeEvents.push({
-          seq: rec.seq,
-          from: rec.agent,
-          to: target,
-          broadcast: false,
-          kind: rec.kind,
-          title: recTitle,
-          time: rec.time || '',
-        })
-      }
-    }
-  }
-
   const annotatedPosts = records.slice(-250).map((rec) => {
     if (!rec || rec.type === 'control') return rec
     const withTitle = rec.title ? rec : { ...rec, title: deriveFallbackTitle(rec.text, rec.kind || 'post') }
@@ -310,17 +208,14 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       : withTitle
   })
 
-  const events = store.readEventLog(swarmId)
-  const replayed = replaySwarmEvents(events)
-
   return {
     runtime: typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null,
     swarm,
     plan,
     headSeq,
-    headOffset: replayed.offset,
-    channels: channelState.channels,
-    archivedChannels: channelState.archived,
+    headOffset: projection.offset,
+    channels: projection.channels,
+    archivedChannels: projection.archivedChannels,
     concurrency: runtime.concurrencyGate.snapshot(),
     memberSummary,
     watchdog: typeof runtime.getWatchdogStatus === 'function' ? runtime.getWatchdogStatus(swarmId) : null,
@@ -328,8 +223,8 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     supersededBy,
     members: memberRows,
     posts: annotatedPosts,
-    events: events.slice(-600),
-    edgeEvents,
+    events: events.filter(e => e && e.type !== 'state.checkpoint').slice(-600),
+    edgeEvents: projection.edgeEvents,
     screenshots: extractScreenshotsFromPosts(records),
   }
 }
@@ -395,7 +290,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.3', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.4', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -852,7 +747,6 @@ export function createSwarmTools(runtime) {
 
         let archivePath = null
         if (isDonePost) {
-          store.updateSwarm(swarmId, { status: 'DONE' })
           store.appendEvent(swarmId, {
             type: 'swarm.done',
             actor: callerName,
@@ -1119,7 +1013,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.3', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.4', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1361,18 +1255,10 @@ export function createSwarmTools(runtime) {
           : null
 
         if (neverWorked) {
-          const killedAtSeq = store.headSeq(swarmId)
-          store.removeMemberRecord(swarmId, targetName)
-          store.appendEvent(swarmId, {
-            type: 'member.kill',
+          store.removeMemberRecord(swarmId, targetName, {
             actor: callerName,
-            seq: killedAtSeq,
-            payload: {
-              name: targetName,
-              released: true,
-              handover_to: handoverTo,
-              reason: killReason,
-            },
+            seq: store.headSeq(swarmId),
+            reason: killReason,
           })
           runtime.notifyProjectionChanged(swarmId)
           return {
@@ -1383,15 +1269,6 @@ export function createSwarmTools(runtime) {
         }
 
         const killedAtSeq = store.headSeq(swarmId)
-        store.updateMember(swarmId, targetName, m => ({
-          ...m,
-          desired_state: 'KILLED',
-          phase: 'KILLED',
-          killed: true,
-          killed_at_seq: killedAtSeq,
-          ...(handoverTo ? { handover_to: handoverTo } : {}),
-          ...(killReason ? { kill_reason: killReason } : {}),
-        }))
         store.appendEvent(swarmId, {
           type: 'member.kill',
           actor: callerName,
@@ -1399,6 +1276,7 @@ export function createSwarmTools(runtime) {
           payload: {
             name: targetName,
             released: false,
+            killed_at_seq: killedAtSeq,
             handover_to: handoverTo,
             reason: killReason,
           },

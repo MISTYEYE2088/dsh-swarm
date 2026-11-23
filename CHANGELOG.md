@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.4 (2026-11-23)
+
+- **True Single-Source-of-Truth (SSOT) Two-File Storage + Stateless Projector & Auto-Checkpoints**:
+  - Eliminated all duplicate persistence across `swarm.json`, `board.jsonl`, `members.json`, and `plan.json`.
+  - Every immutable domain fact (`swarm.init`, `swarm.update`, `plan.update`, `member.spawn`, `member.kill`, `member.model_switch`, `board.post`, `board.control`, `swarm.done`, plus periodic `state.checkpoint` snapshots) is now stored in **exactly one place**: append-only `events.jsonl` (`offset` + `ts_ms`).
+  - Mutable consumer offsets & live runtime telemetry (`last_read_seq`, `wait_since`, `wake_mode`, `wake_kinds`, `turn_count`, `tool_call_count`, `last_error`) live in **exactly one place**: `offsets.json` (zero overlapping domain facts).
+  - Extracted pure stateless state computation into `src/host/projector.js` (`SwarmStateProjector`), removing hidden in-memory file caching. Every **50** domain events, `SwarmStore.appendEvent()` writes a compact `state.checkpoint` frame into `events.jsonl`; every state projection automatically anchors on the **second-newest** valid checkpoint and replays only the trailing ~50–100 events (O(1) bounded work even on multi-thousand-event swarms, plus crash resilience if the newest checkpoint were ever corrupted).
+  - Preserved automatic read compatibility for legacy pre-v0.3.4 swarm directories on disk.
+- **Flicker-Free Board Updates + Yellow Arrival Highlight Animation**:
+  - Deduplicated polling across Header & Rightbar into one shared ref-counted poller with in-flight guarding and state fingerprinting (`computeStateFingerprint`): unchanged polls perform **0 React re-renders** (eliminating periodic flicker completely).
+  - Newly arriving board posts smoothly glide in with a **3.2-second warm yellow highlight fade** (`dshSwarmNewPostFlash` CSS keyframe + `NEW` yellow pill) and smooth CSS color transitions.
+
 ## 0.3.3 (2026-11-23)
 
 - **Kafka-Style Event-Sourced Architecture (`events.jsonl`) for Exact Historical Replay**:

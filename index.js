@@ -21,14 +21,14 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.3'
+export const PLUGIN_VERSION = '0.3.4'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.3'
+    if (!fs.existsSync(headFile)) return 'release-0.3.4'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -36,7 +36,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.3.3'
+    return 'release-0.3.4'
   }
 }
 
@@ -306,23 +306,25 @@ export function applyWith(ctx, config, deps = {}) {
     }
     return store.withLock(swarmId, async () => {
       if (!store.exists(swarmId)) return
-      const members = store.readMembers(swarmId)
+      const existingOffsets = store.readOffsets(swarmId)
+      const updates = {}
       let changed = false
-      for (const [sid, t] of memberTelemetry.entries()) {
+      for (const [, t] of memberTelemetry.entries()) {
         if (t.swarmId !== swarmId) continue
-        const m = members[t.memberName]
-        if (!m || m.session_id !== sid) continue
-        m.turn_count = Math.max(m.turn_count ?? 0, t.turn_count ?? 0)
-        m.tool_call_count = Math.max(m.tool_call_count ?? 0, t.tool_call_count ?? 0)
-        if (t.last_turn_at) m.last_turn_at = t.last_turn_at
-        if (t.last_tool_call_at) m.last_tool_call_at = t.last_tool_call_at
-        if (t.last_tool_name) m.last_tool_name = t.last_tool_name
-        if (t.last_error !== undefined) m.last_error = t.last_error
-        if (t.phase && !m.killed) m.phase = t.phase
+        const cur = existingOffsets[t.memberName] || {}
+        updates[t.memberName] = {
+          turn_count: Math.max(cur.turn_count ?? 0, t.turn_count ?? 0),
+          tool_call_count: Math.max(cur.tool_call_count ?? 0, t.tool_call_count ?? 0),
+          ...(t.last_turn_at ? { last_turn_at: t.last_turn_at } : {}),
+          ...(t.last_tool_call_at ? { last_tool_call_at: t.last_tool_call_at } : {}),
+          ...(t.last_tool_name ? { last_tool_name: t.last_tool_name } : {}),
+          ...(t.last_error !== undefined ? { last_error: t.last_error } : {}),
+          ...(t.phase ? { phase: t.phase } : {}),
+        }
         changed = true
       }
       if (changed) {
-        store.writeMembers(swarmId, members)
+        store.flushOffsets(swarmId, updates)
       }
     }).catch((err) => {
       warn(`telemetry flush skipped for ${swarmId}: ${String(err?.message ?? err)}`)
@@ -955,24 +957,23 @@ export function applyWith(ctx, config, deps = {}) {
         t.phase = 'RUNNING'
       }
 
-      const updatedMember = store.updateMember(swarmId, memberName, curr => ({
-        ...curr,
-        applied_provider: nextProvider,
-        applied_model: nextModel,
-        last_error: null,
-        phase: 'RUNNING',
-      }))
       store.appendEvent(swarmId, {
         type: 'member.model_switch',
         actor: 'coordinator',
         seq: store.headSeq(swarmId),
         payload: {
           name: memberName,
-          provider: nextProvider,
-          model: nextModel,
+          desired_provider: nextProvider,
+          desired_model: nextModel,
+          applied_provider: nextProvider,
+          applied_model: nextModel,
           reason: reason ?? 'Model switched by coordinator',
         },
       })
+      store.flushOffsets(swarmId, {
+        [memberName]: { last_error: null, phase: 'RUNNING' },
+      })
+      const updatedMember = store.readMembers(swarmId)[memberName] ?? m
 
       return {
         ok: true,

@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.3'
+    var VERSION = '0.3.4'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -568,6 +568,7 @@ window.__ModuleLoader__.load({
       filterChannel: null,
       highlightedSeq: null,
       expandedSeqs: {}, // seq -> true (all posts collapsed by default)
+      freshPostSeqs: {}, // seq -> true while yellow arrival animation plays (3.5s)
       replaySeq: null, // fallback for legacy snapshots
       replayOffset: null, // null means LIVE (latest Kafka event offset)
       loading: false,
@@ -577,8 +578,99 @@ window.__ModuleLoader__.load({
       swarmsList: [],
       globalConcurrency: null,
       snapshotsBySession: {},
-      lastFetchedAt: 0,
     })
+
+    var lastStateFingerprint = ''
+    var inFlightFetchPromise = null
+    var knownMaxSeqBySwarm = {}
+    var freshClearTimers = {}
+    var pollRefCount = 0
+    var sharedPollTimer = null
+
+    function ensureAnimationStyles() {
+      if (typeof document === 'undefined' || !document.head) return
+      if (document.getElementById('dsh-swarm-anim-css')) return
+      try {
+        var style = document.createElement('style')
+        style.id = 'dsh-swarm-anim-css'
+        style.textContent = [
+          '@keyframes dshSwarmNewPostFlash {',
+          '  0% { background-color: rgba(250, 204, 21, 0.28); border-color: #facc15; box-shadow: 0 0 0 1px rgba(250, 204, 21, 0.45); transform: translateY(-4px); opacity: 0.72; }',
+          '  18% { background-color: rgba(250, 204, 21, 0.22); border-color: #eab308; box-shadow: 0 0 0 1px rgba(234, 179, 8, 0.35); transform: translateY(0); opacity: 1; }',
+          '  65% { background-color: rgba(250, 204, 21, 0.11); border-color: rgba(234, 179, 8, 0.55); }',
+          '  100% { background-color: var(--dsw-alias-bg-layer-2); border-color: var(--dsw-alias-border-l2); box-shadow: none; transform: translateY(0); opacity: 1; }',
+          '}',
+          '.dsh-swarm-post-fresh {',
+          '  animation: dshSwarmNewPostFlash 3.2s cubic-bezier(0.22, 1, 0.36, 1) forwards;',
+          '}',
+        ].join('\n')
+        document.head.appendChild(style)
+      } catch (_e) {}
+    }
+
+    function markPostsFresh(swarmKey, snapshot) {
+      if (!snapshot || !Array.isArray(snapshot.posts) || !swarmKey) return []
+      var maxSeq = 0
+      for (var i = 0; i < snapshot.posts.length; i += 1) {
+        var p = snapshot.posts[i]
+        if (p && p.type !== 'control' && typeof p.seq === 'number' && p.seq > maxSeq) {
+          maxSeq = p.seq
+        }
+      }
+      var prevMax = knownMaxSeqBySwarm[swarmKey]
+      knownMaxSeqBySwarm[swarmKey] = Math.max(prevMax || 0, maxSeq)
+      // Do not flash historical posts on the very first load of a swarm
+      if (prevMax === undefined || maxSeq <= prevMax) return []
+      var newlyArrived = []
+      for (var j = 0; j < snapshot.posts.length; j += 1) {
+        var post = snapshot.posts[j]
+        if (post && post.type !== 'control' && typeof post.seq === 'number' && post.seq > prevMax) {
+          newlyArrived.push(post.seq)
+        }
+      }
+      return newlyArrived
+    }
+
+    function scheduleClearFreshSeqs(seqs) {
+      if (!Array.isArray(seqs) || seqs.length === 0) return
+      for (var i = 0; i < seqs.length; i += 1) {
+        (function (seq) {
+          if (freshClearTimers[seq]) clearTimeout(freshClearTimers[seq])
+          freshClearTimers[seq] = setTimeout(function () {
+            delete freshClearTimers[seq]
+            var curr = uiStore.getSnapshot()
+            if (!curr.freshPostSeqs || !curr.freshPostSeqs[seq]) return
+            var nextFresh = Object.assign({}, curr.freshPostSeqs)
+            delete nextFresh[seq]
+            updateUi({ freshPostSeqs: nextFresh })
+          }, 3500)
+        })(seqs[i])
+      }
+    }
+
+    function computeStateFingerprint(data) {
+      try {
+        var snap = data && data.snapshot ? data.snapshot : null
+        return JSON.stringify({
+          resolvedSwarmId: data && data.resolvedSwarmId ? data.resolvedSwarmId : null,
+          swarms: data && data.swarms ? data.swarms : null,
+          concurrency: data && data.concurrency ? data.concurrency : null,
+          headSeq: snap ? snap.headSeq : 0,
+          headOffset: snap ? snap.headOffset : 0,
+          postCount: snap && Array.isArray(snap.posts) ? snap.posts.length : 0,
+          memberSummary: snap ? snap.memberSummary : null,
+          activeRejections: snap ? snap.activeRejections : null,
+          planUpdated: snap && snap.plan ? snap.plan.updated_at : null,
+          members: snap && Array.isArray(snap.members)
+            ? snap.members.map(function (m) {
+                return [m.name, m.status, m.killed, m.last_read_seq, m.wait_since, m.last_post_seq, m.turn_count, m.tool_call_count, m.stepSummary]
+              })
+            : null,
+        })
+      } catch (_e) {
+        return String(Date.now())
+      }
+    }
 
     function updateUi(patch) {
       var curr = uiStore.getSnapshot()
@@ -644,13 +736,14 @@ window.__ModuleLoader__.load({
       return keys.length > 0 ? map[keys[keys.length - 1]] : null
     }
 
-    function fetchSwarmState(sessionId, explicitSwarmId) {
+    function fetchSwarmState(sessionId, explicitSwarmId, forceUpdate) {
       if (typeof fetch !== 'function') return Promise.resolve(null)
+      if (inFlightFetchPromise && !forceUpdate) return inFlightFetchPromise
       var curr = uiStore.getSnapshot()
       var sid = sessionId || curr.activeSessionId || ''
       var swId = explicitSwarmId || curr.selectedSwarmId || ''
       var query = '?sessionId=' + encodeURIComponent(sid) + (swId ? '&swarmId=' + encodeURIComponent(swId) : '')
-      return fetch('/api/dsh-swarm/state' + query, {
+      inFlightFetchPromise = fetch('/api/dsh-swarm/state' + query, {
         method: 'GET',
         headers: { Accept: 'application/json' },
       })
@@ -660,11 +753,27 @@ window.__ModuleLoader__.load({
         })
         .then(function (data) {
           if (!data || !data.ok) return null
+          var fp = computeStateFingerprint(data)
+          var latestUi = uiStore.getSnapshot()
+          // Skip uiStore.set() when nothing changed -> zero redundant re-renders -> zero flicker!
+          if (!forceUpdate && fp === lastStateFingerprint && latestUi.loading === false) {
+            return data
+          }
+          lastStateFingerprint = fp
+          var swarmKey = data.resolvedSwarmId || swId || sid || 'default'
+          var newlyArrived = markPostsFresh(swarmKey, data.snapshot)
           updateUi(function (prev) {
             var nextMap = Object.assign({}, prev.snapshotsBySession)
             if (data.snapshot) {
               if (data.resolvedSwarmId) nextMap[data.resolvedSwarmId] = data.snapshot
               if (sid) nextMap[sid] = data.snapshot
+            }
+            var nextFresh = prev.freshPostSeqs || {}
+            if (newlyArrived.length > 0) {
+              nextFresh = Object.assign({}, nextFresh)
+              for (var i = 0; i < newlyArrived.length; i += 1) {
+                nextFresh[newlyArrived[i]] = true
+              }
             }
             return {
               loading: false,
@@ -673,14 +782,19 @@ window.__ModuleLoader__.load({
               swarmsList: Array.isArray(data.swarms) ? data.swarms : prev.swarmsList,
               globalConcurrency: data.concurrency || prev.globalConcurrency,
               snapshotsBySession: nextMap,
-              lastFetchedAt: Date.now(),
+              freshPostSeqs: nextFresh,
             }
           })
+          if (newlyArrived.length > 0) scheduleClearFreshSeqs(newlyArrived)
           return data
         })
         .catch(function () {
           return null
         })
+        .finally(function () {
+          inFlightFetchPromise = null
+        })
+      return inFlightFetchPromise
     }
 
     function postSwarmAction(payload) {
@@ -693,6 +807,7 @@ window.__ModuleLoader__.load({
         .then(function (res) { return res.json() })
         .then(function (data) {
           if (data && data.ok && data.snapshot) {
+            lastStateFingerprint = ''
             updateUi(function (prev) {
               var nextMap = Object.assign({}, prev.snapshotsBySession)
               var key = data.resolvedSwarmId || payload.swarmId || payload.sessionId || prev.resolvedSwarmId || 'default'
@@ -702,11 +817,10 @@ window.__ModuleLoader__.load({
                 resolvedSwarmId: data.resolvedSwarmId || prev.resolvedSwarmId,
                 globalConcurrency: data.concurrency || data.snapshot.concurrency || prev.globalConcurrency,
                 snapshotsBySession: nextMap,
-                lastFetchedAt: Date.now(),
               }
             })
           }
-          fetchSwarmState(payload.sessionId, payload.swarmId)
+          fetchSwarmState(payload.sessionId, payload.swarmId, true)
           return data
         })
         .catch(function (err) {
@@ -714,17 +828,28 @@ window.__ModuleLoader__.load({
         })
     }
 
-    function useSwarmPolling(sessionId, selectedSwarmId, intervalMs) {
+    function useSwarmPolling(sessionId, selectedSwarmId) {
       if (!React || typeof React.useEffect !== 'function') return
       React.useEffect(function () {
+        ensureAnimationStyles()
         if (sessionId && uiStore.getSnapshot().activeSessionId !== sessionId) {
           updateUi({ activeSessionId: sessionId })
         }
         fetchSwarmState(sessionId, selectedSwarmId)
-        var timer = setInterval(function () {
-          fetchSwarmState(sessionId, uiStore.getSnapshot().selectedSwarmId)
-        }, intervalMs || 2000)
-        return function () { clearInterval(timer) }
+        pollRefCount += 1
+        if (!sharedPollTimer) {
+          sharedPollTimer = setInterval(function () {
+            var cur = uiStore.getSnapshot()
+            fetchSwarmState(cur.activeSessionId, cur.selectedSwarmId)
+          }, 2000)
+        }
+        return function () {
+          pollRefCount = Math.max(0, pollRefCount - 1)
+          if (pollRefCount === 0 && sharedPollTimer) {
+            clearInterval(sharedPollTimer)
+            sharedPollTimer = null
+          }
+        }
       }, [sessionId, selectedSwarmId])
     }
 
@@ -1330,6 +1455,7 @@ window.__ModuleLoader__.load({
             )
           : filtered.map(function (p) {
               var isHighlighted = ui.highlightedSeq === p.seq
+              var isFresh = Boolean(ui.freshPostSeqs && ui.freshPostSeqs[p.seq])
               var isExpanded = Boolean(expandedMap[p.seq])
               var isSuperseded = Boolean(p.superseded_by)
               var postTitle = derivePostTitle(p)
@@ -1346,14 +1472,22 @@ window.__ModuleLoader__.load({
                 'div',
                 {
                   key: p.seq,
+                  className: isFresh ? 'dsh-swarm-post-fresh' : undefined,
                   style: {
                     padding: '7px 10px',
                     borderRadius: '8px',
                     border: isHighlighted
                       ? '1px solid var(--dsw-alias-state-business-primary)'
-                      : '0.5px solid var(--dsw-alias-border-l2)',
-                    background: isHighlighted ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-2)',
+                      : isFresh
+                        ? '1px solid #eab308'
+                        : '0.5px solid var(--dsw-alias-border-l2)',
+                    background: isHighlighted
+                      ? 'var(--dsw-alias-interactive-bg-hover)'
+                      : isFresh
+                        ? 'rgba(250, 204, 21, 0.14)'
+                        : 'var(--dsw-alias-bg-layer-2)',
                     opacity: isSuperseded ? 0.65 : 1,
+                    transition: 'background-color 0.45s ease, border-color 0.45s ease',
                     fontSize: '12px',
                   },
                 },
@@ -1388,6 +1522,25 @@ window.__ModuleLoader__.load({
                           wordBreak: 'break-word',
                         },
                       },
+                      isFresh
+                        ? React.createElement(
+                            'span',
+                            {
+                              style: {
+                                display: 'inline-block',
+                                marginRight: '5px',
+                                padding: '0 4px',
+                                borderRadius: '3px',
+                                background: '#facc15',
+                                color: '#1c1917',
+                                fontSize: '9.5px',
+                                fontWeight: 700,
+                                verticalAlign: '1px',
+                              },
+                            },
+                            'NEW',
+                          )
+                        : null,
                       '#' + p.seq + ' · ' + postTitle,
                     ),
                     React.createElement(
@@ -2474,6 +2627,9 @@ window.__ModuleLoader__.load({
     exports.computeEdgeVisualStyle = computeEdgeVisualStyle
     exports.computeRoundTableLayout = computeRoundTableLayout
     exports.computeRoundTableFromEvents = computeRoundTableFromEvents
+    exports.computeStateFingerprint = computeStateFingerprint
+    exports.fetchSwarmState = fetchSwarmState
+    exports.uiStore = uiStore
     return module.exports
   },
 })

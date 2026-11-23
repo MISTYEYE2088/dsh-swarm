@@ -16,6 +16,7 @@ import { fileURLToPath } from 'node:url'
 
 import {
   SwarmStore,
+  SwarmStateProjector,
   writeJsonAtomicSync,
   readJsonSync,
   replayChannelsAt,
@@ -1047,7 +1048,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.3/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.4/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1104,18 +1105,19 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.3/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.4/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
 
-  // R8: Posting [done] archives the 4-file blackboard into swarm/archive/<id>_.../
+  // R8: Posting [done] archives the SSOT 2-file store (events.jsonl + offsets.json) into swarm/archive/<id>_.../
   const doneRes = await registeredTools.get('post_board').execute(
     { title: 'Close swarm and archive artifacts', text: '[done] Test run complete and archived', kind: 'done', mentions: ['coordinator'] },
     { agent: callerAgent },
   )
   assert.equal(doneRes.ok, true)
-  assert.ok(doneRes.archive_path && fs.existsSync(path.join(doneRes.archive_path, 'board.jsonl')), 'Archive directory must contain board.jsonl')
+  assert.ok(doneRes.archive_path && fs.existsSync(path.join(doneRes.archive_path, 'events.jsonl')), 'Archive directory must contain events.jsonl')
+  assert.ok(fs.existsSync(path.join(doneRes.archive_path, 'offsets.json')), 'Archive directory must contain offsets.json')
 }
 
 // ---------------------------------------------------------------------------
@@ -1839,10 +1841,231 @@ async function test_kafka_event_log_replays_exact_state_by_offset_and_timestamp(
   assert.equal(clientEnd.latestEdges[0].to, '__table__')
   assert.equal(clientEnd.latestEdges[0].broadcast, true)
 
-  // 4. Legacy backfill: delete events.jsonl and verify readEventLog synthesizes valid history automatically
-  fs.unlinkSync(eventsDir)
-  const backfilled = store.readEventLog('sw-kafka')
-  assert.ok(backfilled.length >= 5, 'Legacy backfill must synthesize init + spawn + post events')
+  // 4. Legacy backfill: verify a pre-v0.3.4 directory (swarm.json + board.jsonl + members.json without events.jsonl) replays cleanly
+  const legacyDir = store.dirOf('sw-legacy')
+  fs.mkdirSync(legacyDir, { recursive: true })
+  fs.writeFileSync(path.join(legacyDir, 'swarm.json'), JSON.stringify({
+    swarm_id: 'sw-legacy',
+    title: 'Legacy Swarm',
+    created_at: '2026-01-01T00:00:00.000Z',
+    concurrency_limit: 2,
+    concurrency_confirmed: true,
+    next_seq: 3,
+  }))
+  fs.writeFileSync(path.join(legacyDir, 'members.json'), JSON.stringify({
+    'legacy-w1': { name: 'legacy-w1', role: 'worker', spawned_at: '2026-01-01T00:00:01.000Z', brief_seq: 1, killed: false },
+  }))
+  fs.writeFileSync(path.join(legacyDir, 'board.jsonl'), [
+    JSON.stringify({ seq: 1, time: '2026-01-01T00:00:01.000Z', type: 'post', agent: 'coordinator', title: 'Brief @legacy-w1', kind: 'brief', mentions: ['legacy-w1'], text: '@legacy-w1 do work' }),
+    JSON.stringify({ seq: 2, time: '2026-01-01T00:00:05.000Z', type: 'post', agent: 'legacy-w1', title: 'Legacy result', kind: 'report', mentions: ['coordinator'], text: '@coordinator done' }),
+  ].join('\n') + '\n')
+  const backfilled = store.readEventLog('sw-legacy')
+  assert.ok(backfilled.length >= 4, 'Legacy backfill must synthesize init + spawn + post events')
+  assert.equal(store.readBoard('sw-legacy').length, 2)
+  assert.equal(store.readMembers('sw-legacy')['legacy-w1'].role, 'worker')
+}
+
+async function test_ssot_two_file_storage_no_duplicate_facts() {
+  const baseDir = path.join(tempRoot, 'ssot-check')
+  const store = new SwarmStore(baseDir)
+  store.initSwarm('sw-ssot', { title: 'SSOT Invariant', concurrency_limit: 3, concurrency_confirmed: true })
+  store.registerMemberWithBrief('sw-ssot', {
+    name: 'impl-a',
+    session_id: 'sw-ssot__impl-a',
+    role: 'worker',
+    applied_model: 'deepseek-chat',
+    brief: '[OWNERSHIP] src\n[FORBIDDEN] docs\n[DONE_CRITERIA] ok',
+  })
+  store.writePlan('sw-ssot', { goal: 'Verify zero duplication', waves: [{ id: 1 }] })
+  store.appendBoardRecord('sw-ssot', {
+    type: 'post',
+    agent: 'impl-a',
+    title: 'Initial SSOT report',
+    kind: 'report',
+    mentions: ['coordinator'],
+    text: '@coordinator done',
+  })
+  store.updateMember('sw-ssot', 'impl-a', m => ({
+    ...m,
+    last_read_seq: 2,
+    turn_count: 3,
+    tool_call_count: 5,
+    last_tool_name: 'post_board',
+    applied_model: 'deepseek-reasoner',
+  }))
+
+  // On-disk invariant: ONLY events.jsonl and offsets.json exist (ZERO legacy duplicate files!)
+  const files = fs.readdirSync(store.dirOf('sw-ssot')).sort()
+  assert.deepEqual(files, ['events.jsonl', 'offsets.json'], `Expected strictly 2 SSOT files, got: ${files.join(', ')}`)
+
+  // offsets.json must contain ONLY mutable consumer cursor & runtime telemetry (ZERO domain facts!)
+  const offsetsRaw = JSON.parse(fs.readFileSync(store.pathsOf('sw-ssot').offsetsJson, 'utf8'))
+  const wOffset = offsetsRaw['impl-a']
+  assert.equal(wOffset.last_read_seq, 2)
+  assert.equal(wOffset.turn_count, 3)
+  assert.equal(wOffset.tool_call_count, 5)
+  for (const forbiddenDomainKey of ['role', 'killed', 'brief_seq', 'applied_model', 'session_id', 'title', 'text']) {
+    assert.equal(forbiddenDomainKey in wOffset, false, `offsets.json must NOT duplicate domain field "${forbiddenDomainKey}"`)
+  }
+
+  // Cold-cache read from a brand-new SwarmStore instance must faithfully reconstruct all projections
+  const coldStore = new SwarmStore(baseDir)
+  assert.equal(coldStore.readSwarm('sw-ssot').title, 'SSOT Invariant')
+  assert.equal(coldStore.readPlan('sw-ssot').goal, 'Verify zero duplication')
+  assert.equal(coldStore.readBoard('sw-ssot').length, 2)
+  const coldMember = coldStore.readMembers('sw-ssot')['impl-a']
+  assert.equal(coldMember.role, 'worker')
+  assert.equal(coldMember.applied_model, 'deepseek-reasoner')
+  assert.equal(coldMember.last_read_seq, 2)
+  assert.equal(coldMember.turn_count, 3)
+}
+
+async function test_client_flicker_free_polling_and_yellow_arrival_highlight() {
+  const code = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedMod = null
+  let currentPayload = {
+    ok: true,
+    resolvedSwarmId: 'sw-ui',
+    swarms: [{ swarm_id: 'sw-ui', title: 'UI Flicker Test', head_seq: 1 }],
+    concurrency: { active: 0, limit: 3 },
+    snapshot: {
+      swarm_id: 'sw-ui',
+      headSeq: 1,
+      headOffset: 3,
+      memberSummary: { active: 1, working: 0, waiting: 1, killed: 0 },
+      activeRejections: [],
+      plan: { updated_at: '2026-01-01T00:00:00.000Z' },
+      members: [{ name: 'w1', status: 'waiting', killed: false, last_read_seq: 1, wait_since: 1, last_post_seq: 0, turn_count: 1, tool_call_count: 1, stepSummary: 'waiting' }],
+      posts: [{ seq: 1, type: 'post', agent: 'coordinator', title: 'Opening brief', text: '@w1 start', time: '2026-01-01T00:00:00.000Z' }],
+      events: [],
+    },
+  }
+  const scheduledTimers = []
+  const sandbox = {
+    window: { __ModuleLoader__: { load(spec) { loadedMod = spec.factory(() => null) } } },
+    console: { info() {}, warn() {}, error() {} },
+    fetch: async () => ({ ok: true, json: async () => JSON.parse(JSON.stringify(currentPayload)) }),
+    setTimeout: (fn, ms) => { scheduledTimers.push({ fn, ms }); return scheduledTimers.length },
+    clearTimeout: () => {},
+    Set, Map, Object, Array, Number, String, Symbol, Math, JSON, Date, Promise, encodeURIComponent,
+  }
+  vm.runInNewContext(code, sandbox, { filename: 'client.js' })
+
+  let notifyCount = 0
+  loadedMod.uiStore.subscribe(() => { notifyCount += 1 })
+
+  // Poll 1: initial hydration -> notifies once, historical #1 must NOT flash as fresh
+  await loadedMod.fetchSwarmState('sw-ui')
+  assert.equal(notifyCount, 1, 'Initial poll must hydrate store once')
+  assert.equal(Boolean(loadedMod.uiStore.getSnapshot().freshPostSeqs[1]), false, 'Initial load must not flash historical posts')
+
+  // Polls 2 & 3: identical server snapshot -> 0 extra store notifications (ZERO flicker!)
+  await loadedMod.fetchSwarmState('sw-ui')
+  await loadedMod.fetchSwarmState('sw-ui')
+  assert.equal(notifyCount, 1, 'Unchanged polls must trigger 0 extra uiStore updates')
+
+  // Poll 4: real new board post #2 arrives -> notifies once and flags #2 for yellow arrival animation
+  currentPayload.snapshot.headSeq = 2
+  currentPayload.snapshot.headOffset = 4
+  currentPayload.snapshot.posts.push({ seq: 2, type: 'post', agent: 'w1', title: 'New progress update', text: '@coordinator ready', time: '2026-01-01T00:00:05.000Z' })
+  await loadedMod.fetchSwarmState('sw-ui')
+  assert.equal(notifyCount, 2, 'New post arrival must update store once')
+  assert.equal(loadedMod.uiStore.getSnapshot().freshPostSeqs[2], true, 'Newly arrived post #2 must trigger yellow highlight animation')
+  assert.equal(Boolean(loadedMod.uiStore.getSnapshot().freshPostSeqs[1]), false, 'Older post #1 must stay unhighlighted')
+
+  // Firing the scheduled clear timer removes the temporary fresh highlight cleanly
+  assert.ok(scheduledTimers.length >= 1, 'Fresh highlight must schedule an auto-clear timer')
+  scheduledTimers[scheduledTimers.length - 1].fn()
+  assert.equal(Boolean(loadedMod.uiStore.getSnapshot().freshPostSeqs[2]), false, 'Auto-clear timer must remove fresh highlight after animation completes')
+}
+
+async function test_projector_auto_checkpoints_and_replays_from_second_newest() {
+  const store = new SwarmStore(path.join(tempRoot, 'projector-checkpoints'), { checkpointInterval: 50 })
+  store.initSwarm('sw-cp', { title: 'Checkpoint Scale Test', concurrency_limit: 4, concurrency_confirmed: true })
+
+  // Wave 1 spawns + channel creation + 165 board posts across waves + Wave 1 retirement + Wave 2 spawn
+  store.registerMemberWithBrief('sw-cp', {
+    name: 'impl-w1',
+    session_id: 'sw-cp__impl-w1',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+  store.registerMemberWithBrief('sw-cp', {
+    name: 'qa-w1',
+    session_id: 'sw-cp__qa-w1',
+    role: 'verifier',
+    brief: '[OWNERSHIP] tests\n[FORBIDDEN] a\n[DONE_CRITERIA] verify',
+  })
+  store.appendBoardRecord('sw-cp', {
+    type: 'control',
+    action: 'channel.create',
+    agent: 'coordinator',
+    channel: 'perf',
+  })
+  store.writePlan('sw-cp', { goal: 'Scale to thousands safely', current_wave: 1, waves: [{ id: 1 }, { id: 2 }] })
+
+  for (let i = 1; i <= 165; i += 1) {
+    if (i === 75) {
+      store.appendEvent('sw-cp', { type: 'member.kill', actor: 'coordinator', seq: store.headSeq('sw-cp'), payload: { name: 'impl-w1', released: false } })
+      store.registerMemberWithBrief('sw-cp', {
+        name: 'arch-w2',
+        session_id: 'sw-cp__arch-w2',
+        role: 'architect',
+        brief: '[OWNERSHIP] docs\n[FORBIDDEN] src\n[DONE_CRITERIA] adr',
+      })
+    }
+    store.appendBoardRecord('sw-cp', {
+      type: 'post',
+      agent: i < 75 ? 'impl-w1' : 'arch-w2',
+      title: `Milestone update #${i}`,
+      kind: 'report',
+      mentions: ['qa-w1'],
+      text: `@qa-w1 progress step ${i}`,
+    })
+  }
+
+  const allEvents = store.readEventLog('sw-cp')
+  const checkpoints = allEvents.filter(e => e.type === 'state.checkpoint')
+  assert.ok(checkpoints.length >= 3, `Expected >= 3 auto checkpoints at 50-event intervals, got ${checkpoints.length}`)
+
+  // 1. State projection MUST anchor on the SECOND-NEWEST checkpoint and skip earlier events!
+  const secondNewestCp = checkpoints[checkpoints.length - 2]
+  const projected = SwarmStateProjector.projectState(allEvents, { includeBoard: false })
+  assert.equal(
+    projected.replayMeta.usedCheckpointOffset,
+    secondNewestCp.offset,
+    'Projector must automatically anchor on the second-newest valid checkpoint',
+  )
+  assert.ok(
+    projected.replayMeta.replayedEvents < 120,
+    `Expected O(1)-bounded tail replay (<120 events), actually replayed ${projected.replayMeta.replayedEvents}`,
+  )
+
+  // 2. Projected state MUST be bit-for-bit equivalent to a full genesis replay with ALL checkpoints removed!
+  const domainOnly = allEvents.filter(e => e.type !== 'state.checkpoint')
+  const fullGenesis = SwarmStateProjector.projectState(domainOnly, { includeBoard: false })
+  assert.equal(fullGenesis.replayMeta.usedCheckpointOffset, null)
+  assert.equal(projected.headSeq, fullGenesis.headSeq)
+  assert.equal(projected.postCount, fullGenesis.postCount)
+  assert.deepEqual(projected.swarm, fullGenesis.swarm)
+  assert.deepEqual(projected.plan, fullGenesis.plan)
+  assert.deepEqual(projected.channels.sort(), fullGenesis.channels.sort())
+  assert.deepEqual(
+    projected.activeMembers.map(m => m.name).sort(),
+    fullGenesis.activeMembers.map(m => m.name).sort(),
+  )
+  assert.deepEqual(projected.members, fullGenesis.members)
+
+  // 3. Even if the newest checkpoint is corrupted, projector still recovers identically from the second-newest!
+  const withCorruptedLatest = allEvents.map(ev =>
+    ev.offset === checkpoints[checkpoints.length - 1].offset
+      ? { ...ev, payload: { broken: true } }
+      : ev,
+  )
+  const recovered = SwarmStateProjector.projectState(withCorruptedLatest, { includeBoard: false })
+  assert.equal(recovered.headSeq, fullGenesis.headSeq)
+  assert.deepEqual(recovered.members, fullGenesis.members)
+  assert.equal(recovered.replayMeta.usedCheckpointOffset, checkpoints[checkpoints.length - 3].offset)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -1850,6 +2073,7 @@ async function test_plugin_runtime_contains_zero_cjk_characters() {
   const runtimeFiles = [
     'index.js',
     'client.js',
+    'src/host/projector.js',
     'src/host/store.js',
     'src/host/validators.js',
     'src/host/stop-hook.js',
@@ -1914,6 +2138,9 @@ try {
   await runTest('test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center', test_round_table_preserves_peer_and_killed_edges_and_broadcast_to_center)
   await runTest('test_round_table_restores_historical_active_seats_across_waves', test_round_table_restores_historical_active_seats_across_waves)
   await runTest('test_kafka_event_log_replays_exact_state_by_offset_and_timestamp', test_kafka_event_log_replays_exact_state_by_offset_and_timestamp)
+  await runTest('test_ssot_two_file_storage_no_duplicate_facts', test_ssot_two_file_storage_no_duplicate_facts)
+  await runTest('test_client_flicker_free_polling_and_yellow_arrival_highlight', test_client_flicker_free_polling_and_yellow_arrival_highlight)
+  await runTest('test_projector_auto_checkpoints_and_replays_from_second_newest', test_projector_auto_checkpoints_and_replays_from_second_newest)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
