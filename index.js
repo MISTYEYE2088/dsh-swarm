@@ -1,19 +1,18 @@
 // dsh-swarm Host half (Node ESM entry).
 //
 // Coordinates:
-//   1. Three-file plain-text blackboard (`swarm.json`, `board.jsonl`, `members.json`) + `plan.json`
-//   2. Polite shared-cluster `ConcurrencyGate` on `llm/stream` (1..6 cap, P0..P3 priority, AIMD on 429)
+//   1. Four-file plain-text blackboard (`swarm.json`, `board.jsonl`, `members.json`, `plan.json`)
+//      with Windows-NTFS-resilient atomic writes and lock-serialized telemetry flushing
+//   2. Polite shared-cluster `ConcurrencyGate` on `llm/stream` (P0..P3 priority, AIMD on 429)
 //   3. Zero-idle-token `swarm_wait` (`concludeTurn`) + `agent/turn-stopping` Stop-Hook race lock
-//   4. Anti-deadlock `@monitor` daemon timer (3-minute ticks, `last_post_seq` check, 5-tick auto-sleep)
-//   5. Strict format & semantic validators + detailed SOP prompts for self-hosted `glm5.3` / `deepseek4.1f`
-//   6. Live `swarm` SessionProjection for the deterministic Browser Hive UI (no token-burning narrator)
+//   4. Deterministic host-side Watchdog (`SwarmMonitorDaemon`: 30s health probes + 120s stall checks)
+//   5. Strict format & semantic validators + Peer-Accountability Org-Contract SOP prompts
+//   6. Live `swarm` SessionProjection & `/api/dsh-swarm/*` HTTP bridge for the Browser UI
 //
 // Boot safety rule (host-plugin-reference.md §3 & §9):
-//   - Deliberately exports NO `Config` (Cordis validates `Config` as a Standard Schema;
-//     a plain object throws `Cannot read properties of undefined (reading 'validate')` and breaks boot).
+//   - Deliberately exports NO `Config` (Cordis validates `Config` as a Standard Schema).
 //   - No top-level side effects.
-//   - `apply(ctx, config)` wraps `applyWith(ctx, config)` in `try/catch` so an unexpected
-//     runtime failure never costs the user their DSH profile.
+//   - `apply(ctx, config)` wraps `applyWith(ctx, config)` in `try/catch`.
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -28,14 +27,14 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.2.0'
+export const PLUGIN_VERSION = '0.3.0'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.2.0'
+    if (!fs.existsSync(headFile)) return 'release-0.3.0'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -43,7 +42,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.2.0'
+    return 'release-0.3.0'
   }
 }
 
@@ -69,7 +68,8 @@ const DEFAULTS = Object.freeze({
   defaultConcurrency: 4,
   minSpacingMs: 200,
   agingThresholdMs: 15_000,
-  monitorIntervalMs: 180_000,
+  monitorIntervalMs: 120_000,
+  healthIntervalMs: 30_000,
   defaultProvider: 'inherit',
   defaultModel: 'inherit',
   coordinatorModel: 'inherit',
@@ -191,7 +191,7 @@ export function createSwarmWebRoutes(runtime) {
           if (action === 'concurrency') {
             const limit = Math.floor(Number(body.limit))
             if (!Number.isInteger(limit) || limit < 1) {
-              sendJson(res, 400, { ok: false, error: '并发数必须是 >= 1 的正整数' })
+              sendJson(res, 400, { ok: false, error: '并发槽位数必须是 >= 1 的正整数' })
               return
             }
             concurrencyGate.setLimit(limit)
@@ -237,10 +237,10 @@ export function createSwarmWebRoutes(runtime) {
                 mentions: Array.isArray(body.mentions) ? body.mentions : undefined,
                 text,
               })
-              const woken = await runtime.dispatchPostWakeups(targetSwarmId, postRecord)
+              const wakeRes = await runtime.dispatchPostWakeups(targetSwarmId, postRecord)
               runtime.notifyBoardActivity(targetSwarmId, postRecord)
               runtime.notifyProjectionChanged(targetSwarmId)
-              return { postRecord, woken }
+              return { postRecord, woken: wakeRes.woken }
             })
             sendJson(res, 200, {
               ok: true,
@@ -261,10 +261,10 @@ export function createSwarmWebRoutes(runtime) {
 }
 
 // dup-ok: strict inner host mount implementation paired with boot-safe outer apply()
-// #FUNC Wire the Swarm blackboard, concurrency gate, stop hook, tools, commands, and projection into a Cordis Context.
-// #NOT  Does not export a plain-object `Config`, and does not poll sleeping agents.
-// #EDGE-IN Sibling `session/event` dispatch records transcript events for `statusOf()` liveness → test_host_sibling_event_liveness
-// #WHY  `turnStates` tracks whether an active agent turn invoked `swarm_wait` so `handleTurnStopping` can intercept `glm5.3`/`deepseek4.1f` turns that forget to park.
+// #FUNC Wire the Swarm blackboard, concurrency gate, stop hook, tools, commands, lock-safe telemetry, and projection into a Cordis Context.
+// #NOT  Does not export a plain-object `Config`, does not poll sleeping agents, and never mutates `members.json` outside `store.withLock`.
+// #EDGE-IN Sibling `session/event` dispatch records transcript events for `statusOf()` liveness without lock-bypassing disk races → test_host_sibling_event_liveness
+// #WHY  Keeping high-frequency `session/event` telemetry in memory and flushing coalesced patches inside `store.withLock` eliminates Windows NTFS `EPERM` rename collisions.
 export function applyWith(ctx, config, deps = {}) {
   const settings = mergeSettings(config)
   const log = deps.log ?? ((...args) => console.info('[dsh-swarm]', ...args))
@@ -282,6 +282,8 @@ export function applyWith(ctx, config, deps = {}) {
   const store = deps.store ?? new SwarmStore(swarmRoot)
   const disposers = []
   const sessionEventsByAgent = new Map() // sessionId -> recent SessionEvent[]
+  const memberTelemetry = new Map() // sessionId -> { swarmId, memberName, turn_count, tool_call_count, last_turn_at, last_tool_call_at, last_tool_name, last_error, phase }
+  const pendingTelemetryFlushes = new Map() // swarmId -> Timeout
   const memberHandles = new Map() // `${swarmId}:${memberName}` -> AgentHandle
   const agentMembership = new Map() // agentSessionId -> { swarmId, memberName, role }
   const turnStates = new Map() // agentSessionId -> { calledSwarmWait: boolean, unparkedBlockCount: number }
@@ -298,16 +300,82 @@ export function applyWith(ctx, config, deps = {}) {
     },
   })
 
+  function flushTelemetryForSwarm(swarmId) {
+    const existingTimer = pendingTelemetryFlushes.get(swarmId)
+    if (existingTimer) {
+      clearTimeout(existingTimer)
+      pendingTelemetryFlushes.delete(swarmId)
+    }
+    return store.withLock(swarmId, async () => {
+      if (!store.exists(swarmId)) return
+      const members = store.readMembers(swarmId)
+      let changed = false
+      for (const [sid, t] of memberTelemetry.entries()) {
+        if (t.swarmId !== swarmId) continue
+        const m = members[t.memberName]
+        if (!m || m.session_id !== sid) continue
+        m.turn_count = Math.max(m.turn_count ?? 0, t.turn_count ?? 0)
+        m.tool_call_count = Math.max(m.tool_call_count ?? 0, t.tool_call_count ?? 0)
+        if (t.last_turn_at) m.last_turn_at = t.last_turn_at
+        if (t.last_tool_call_at) m.last_tool_call_at = t.last_tool_call_at
+        if (t.last_tool_name) m.last_tool_name = t.last_tool_name
+        if (t.last_error !== undefined) m.last_error = t.last_error
+        if (t.phase && !m.killed) m.phase = t.phase
+        changed = true
+      }
+      if (changed) {
+        store.writeMembers(swarmId, members)
+      }
+    }).catch((err) => {
+      warn(`telemetry flush skipped for ${swarmId}: ${String(err?.message ?? err)}`)
+    })
+  }
+
+  function scheduleTelemetryFlush(swarmId, immediate = false) {
+    if (immediate) {
+      void flushTelemetryForSwarm(swarmId)
+      return
+    }
+    if (pendingTelemetryFlushes.has(swarmId)) return
+    const timer = setTimeout(() => {
+      pendingTelemetryFlushes.delete(swarmId)
+      void flushTelemetryForSwarm(swarmId)
+    }, 250)
+    if (typeof timer.unref === 'function') timer.unref()
+    pendingTelemetryFlushes.set(swarmId, timer)
+  }
+
   const runtime = {
     settings,
     store,
     worktreesRoot,
     concurrencyGate,
     sessionEventsByAgent,
+    memberTelemetry,
     memberHandles,
     agentMembership,
     turnStates,
     monitorDaemons,
+
+    getMemberTelemetry(sessionId) {
+      if (!sessionId) return null
+      const t = memberTelemetry.get(sessionId)
+      if (!t) return null
+      return {
+        turn_count: t.turn_count,
+        tool_call_count: t.tool_call_count,
+        ...(t.last_turn_at ? { last_turn_at: t.last_turn_at } : {}),
+        ...(t.last_tool_call_at ? { last_tool_call_at: t.last_tool_call_at } : {}),
+        ...(t.last_tool_name ? { last_tool_name: t.last_tool_name } : {}),
+        ...(t.last_error !== undefined ? { last_error: t.last_error } : {}),
+        ...(t.phase ? { phase: t.phase } : {}),
+      }
+    },
+
+    getWatchdogStatus(swarmId) {
+      const daemon = monitorDaemons.get(swarmId)
+      return daemon ? daemon.status() : null
+    },
 
     resolveCaller(agent) {
       const id = agent?.id ?? 'default-swarm'
@@ -340,8 +408,10 @@ export function applyWith(ctx, config, deps = {}) {
     },
 
     getMemberLiveness(swarmId, memberName, memberRecord) {
-      const m = memberRecord ?? store.readMembers(swarmId)[memberName]
-      if (!m) return { status: 'unknown', stepSummary: null }
+      const raw = memberRecord ?? store.readMembers(swarmId)[memberName]
+      if (!raw) return { status: 'unknown', stepSummary: null }
+      const overlay = runtime.getMemberTelemetry(raw.session_id)
+      const m = overlay ? { ...raw, ...overlay } : raw
       const liveAgent = ctx.get?.('agents')?.get?.(m.session_id)
         ?? memberHandles.get(`${swarmId}:${memberName}`)?.agent
       const events = sessionEventsByAgent.get(m.session_id) ?? []
@@ -368,8 +438,8 @@ export function applyWith(ctx, config, deps = {}) {
       }
     },
 
-    getService(name, rootAgent) {
-      return rootAgent?.ctx?.get?.(name) ?? ctx.get?.(name)
+    getService(serviceName, rootAgent) {
+      return rootAgent?.ctx?.get?.(serviceName) ?? ctx.get?.(serviceName)
     },
 
     getParentModelRoute(rootAgent) {
@@ -410,7 +480,7 @@ export function applyWith(ctx, config, deps = {}) {
       const parentRoute = runtime.getParentModelRoute(rootAgent)
       const routes = []
       const seen = new Set()
-      function addRoute(provider, model, name = '') {
+      function addRoute(provider, model, displayName = '') {
         if (!provider || !model) return
         const key = `${provider}/${model}`
         if (seen.has(key)) return
@@ -418,7 +488,7 @@ export function applyWith(ctx, config, deps = {}) {
         routes.push({
           provider,
           model,
-          name: name || model,
+          name: displayName || model,
           label: `${provider}/${model}`,
         })
       }
@@ -427,7 +497,6 @@ export function applyWith(ctx, config, deps = {}) {
         addRoute(parentRoute.provider, parentRoute.model, `${parentRoute.model} (当前会话模型)`)
       }
 
-      // Check DSH subagentModelSelection settings if configured
       try {
         const subSel = runtime.getService('subagentModelSelection', rootAgent)?.current?.()
         if (subSel && Array.isArray(subSel.allowedModels)) {
@@ -435,11 +504,8 @@ export function applyWith(ctx, config, deps = {}) {
             addRoute(r.provider, r.model)
           }
         }
-      } catch {
-        // Ignore if subagentModelSelection is not configured
-      }
+      } catch {}
 
-      // Query registered providers and advertised models from ctx.llm
       try {
         const llm = runtime.getService('llm', rootAgent)
         if (llm && typeof llm.listProviders === 'function') {
@@ -451,14 +517,10 @@ export function applyWith(ctx, config, deps = {}) {
               for (const m of models) {
                 if (m?.id) addRoute(p.id, m.id, m.name || m.id)
               }
-            } catch {
-              // Ignore provider listing failure
-            }
+            } catch {}
           }
         }
-      } catch {
-        // Ignore if llm service is absent in unit test mocks
-      }
+      } catch {}
 
       return { parentRoute, routes }
     },
@@ -468,7 +530,6 @@ export function applyWith(ctx, config, deps = {}) {
       let rawProvider = typeof requestedProvider === 'string' ? requestedProvider.trim() : ''
       let rawModel = typeof requestedModel === 'string' ? requestedModel.trim() : ''
 
-      // Support combined "provider/model" string in requestedModel
       if (rawModel.includes('/')) {
         const slashIdx = rawModel.indexOf('/')
         const prefix = rawModel.slice(0, slashIdx).trim()
@@ -480,7 +541,6 @@ export function applyWith(ctx, config, deps = {}) {
       }
 
       const isInherit = (val) => !val || val === 'inherit' || val === 'default' || val === 'current' || val === 'internal'
-      // R1/R4: Never allow sentinel values ('internal', 'inherit', 'default') to stay in rawProvider/rawModel!
       if (isInherit(rawModel)) {
         const fallbackModel = !isInherit(swarmMeta?.default_model)
           ? swarmMeta.default_model
@@ -524,7 +584,6 @@ export function applyWith(ctx, config, deps = {}) {
           }
         }
       } else {
-        // R4: Even when llm.listProviders() is absent or empty, fall back to parentRoute and strip sentinels
         if (!rawProvider && parentRoute.provider && !isInherit(parentRoute.provider)) {
           rawProvider = parentRoute.provider
         }
@@ -563,19 +622,16 @@ export function applyWith(ctx, config, deps = {}) {
             text: COORDINATOR_SOP_PROMPT,
             interpolate: false,
           })
-        } catch {
-          // Section already registered
-        }
+        } catch {}
       }
     },
 
-    buildChildSetup({ swarmId, memberName, member, rolePrompt, resolvedRoute, rootAgent, isCreate }) {
+    buildChildSetup({ memberName, member, rolePrompt, resolvedRoute, rootAgent, isCreate }) {
       const permPreset = rootAgent?.ctx?.get?.('permissionPresets')?.current?.(rootAgent?.session)
       const sandboxMode = rootAgent?.ctx?.get?.('sandboxPolicy')?.overrideOf?.(rootAgent?.session)
       const hasApprovalSvc = rootAgent?.ctx?.get?.('approval') !== undefined
 
       return function setup(agentCtx, childAgent) {
-        // 1. Join parent's Agent Preset so preset tools (bash, read, write, edit, glob, grep) are mounted!
         try {
           if (rootAgent?.ctx) {
             agentCtx?.get?.('agentPresets')?.composeFrom?.(agentCtx, rootAgent.ctx)
@@ -584,7 +640,6 @@ export function applyWith(ctx, config, deps = {}) {
           warn(`composeFrom parent preset failed for @${memberName}: ${String(err)}`)
         }
 
-        // 2. On fresh creation, append the durable v3 subagent/descriptor and delegated policy events
         if (isCreate && childAgent?.session && typeof childAgent.session.append === 'function') {
           try {
             childAgent.session.append('subagent/descriptor', {
@@ -610,12 +665,9 @@ export function applyWith(ctx, config, deps = {}) {
             if (permPreset === 'auto' || permPreset === 'danger-full-access') {
               childAgent.session.append('permission/preset', { preset: permPreset })
             }
-          } catch {
-            // Ignore if session event schemas are not mounted in minimal test harness
-          }
+          } catch {}
         }
 
-        // 3. Restrict recursive subagent tools on workers so they communicate via board.jsonl
         try {
           const toolsOnChild = agentCtx?.tools ?? agentCtx?.get?.('tools')
           if (toolsOnChild && typeof toolsOnChild.restrict === 'function') {
@@ -623,11 +675,8 @@ export function applyWith(ctx, config, deps = {}) {
               deny: ['subagent', 'subagent_fork', 'workflow', 'swarm_init', 'swarm_add', 'swarm_kill'],
             })
           }
-        } catch {
-          // Ignore if tool restriction is unavailable
-        }
+        } catch {}
 
-        // 4. Mount the role-specific SOP prompt section
         const sp = agentCtx?.systemPrompt ?? agentCtx?.get?.('systemPrompt')
         if (sp && typeof sp.section === 'function') {
           sp.section({
@@ -640,13 +689,109 @@ export function applyWith(ctx, config, deps = {}) {
       }
     },
 
-    async spawnMemberAgent({ swarmId, memberName, member, briefPost, fullBrief, rootAgent }) {
+    /** Step 1 of atomic spawn: create the live DSH agent session BEFORE touching members.json/board.jsonl. */
+    async createMemberAgent({ swarmId, memberName, member, briefSeq, fullBrief, resolvedRoute, rootAgent }) {
+      const agentsSvc = runtime.getService('agents', rootAgent)
+      if (!agentsSvc || typeof agentsSvc.create !== 'function') return null
+
+      const members = store.readMembers(swarmId)
+      const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
+      const rolePrompt = renderRolePrompt(member.role, {
+        memberName,
+        groupName: member.group ?? 'none',
+        workspaceMode: member.workspace_mode,
+        cwd: member.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+        briefSeq,
+        brief: fullBrief,
+        lastReadSeq: member.last_read_seq,
+        verifierName,
+      })
+
+      let seedEvents
+      let inheritedEventCount
+      if (member.fork_from) {
+        const forkTargetId = member.fork_from === 'coordinator'
+          ? swarmId
+          : members[member.fork_from]?.session_id
+        const forkAgent = forkTargetId ? agentsSvc.get?.(forkTargetId) : undefined
+        const logEvents = forkAgent?.session?.events?.()
+        if (Array.isArray(logEvents) && logEvents.length > 0) {
+          seedEvents = logEvents
+          inheritedEventCount = logEvents.length
+        }
+      }
+
+      const agentPreset = rootAgent?.ctx?.get?.('agentPresets')?.composedPreset?.(rootAgent.ctx)
+        ?? rootAgent?.session?.header?.agentPreset
+      const childDepth = (rootAgent?.session?.header?.delegationDepth ?? 0) + 1
+      const agentOptions = {
+        ...(resolvedRoute.provider ? { provider: resolvedRoute.provider } : {}),
+        ...(resolvedRoute.model ? { model: resolvedRoute.model } : {}),
+        ...(resolvedRoute.maxTokens !== undefined ? { maxTokens: resolvedRoute.maxTokens } : {}),
+        ...(resolvedRoute.reasoningEffort !== undefined ? { reasoningEffort: resolvedRoute.reasoningEffort } : {}),
+        subagentDepth: childDepth,
+      }
+
+      return await agentsSvc.create({
+        sessionId: member.session_id,
+        ...(rootAgent ? { parentAgent: rootAgent } : {}),
+        meta: {
+          cwd: member.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+          ...(agentPreset ? { agentPreset } : {}),
+          parentSession: swarmId,
+          isSeeded: Boolean(seedEvents),
+          origin: 'subagent',
+          delegationDepth: childDepth,
+        },
+        ...(seedEvents ? { seed: seedEvents, inheritedEventCount } : {}),
+        agentOptions,
+        setup: runtime.buildChildSetup({
+          swarmId,
+          memberName,
+          member,
+          rolePrompt,
+          resolvedRoute,
+          rootAgent,
+          isCreate: true,
+        }),
+      })
+    },
+
+    /** Step 2 of atomic spawn: bind handle, append parent `subagent/catalog`, and steer the opening brief. */
+    activateSpawnedMember({ swarmId, memberName, member, briefPost, fullBrief, handle, rootAgent }) {
       agentMembership.set(member.session_id, {
         swarmId,
         memberName,
         role: member.role,
       })
+      if (!handle) return
+      memberHandles.set(`${swarmId}:${memberName}`, handle)
 
+      if (rootAgent?.session && typeof rootAgent.session.append === 'function') {
+        try {
+          const childHeader = handle?.agent?.session?.header
+          rootAgent.session.append('subagent/catalog', {
+            version: 0,
+            childId: childHeader?.id ?? member.session_id,
+            childCreatedAt: childHeader?.createdAt ?? Date.now(),
+            mode: 'continuable',
+            label: `@${memberName} (${member.role})`,
+          })
+        } catch (err) {
+          warn(`append subagent/catalog failed for @${memberName}: ${String(err)}`)
+        }
+      }
+
+      handle.agent.steer(
+        buildSwarmSystemMessage(
+          `[Swarm Brief #${briefPost.seq}] 你已被任命为 @${memberName} (${member.role})。\n\n${fullBrief}\n\n你的游标已初始化至 last_read_seq=${member.last_read_seq}（已自动跳过开局其他成员的任务书噪音）。请开始执行任务，完成后调用 post_board 汇报并调用 swarm_wait({"since": <最新seq>}) 休眠。`,
+          `Brief #${briefPost.seq} for @${memberName}`,
+        ),
+      )
+    },
+
+    /** Combined helper preserved for direct callers and smoke tests. */
+    async spawnMemberAgent({ swarmId, memberName, member, briefPost, fullBrief, rootAgent }) {
       const swarmMeta = store.readSwarm(swarmId)
       const resolvedRoute = await runtime.resolveModelRoute({
         requestedProvider: member.applied_provider,
@@ -654,8 +799,6 @@ export function applyWith(ctx, config, deps = {}) {
         rootAgent,
         swarmMeta,
       })
-
-      // Persist the resolved real provider/model back to members.json
       if (resolvedRoute.provider || resolvedRoute.model) {
         member = store.updateMember(swarmId, memberName, curr => ({
           ...curr,
@@ -665,122 +808,46 @@ export function applyWith(ctx, config, deps = {}) {
           applied_model: resolvedRoute.model || curr.applied_model,
         }))
       }
-
-      const members = store.readMembers(swarmId)
-      const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
-      const rolePrompt = renderRolePrompt(member.role, {
+      const handle = await runtime.createMemberAgent({
+        swarmId,
         memberName,
-        groupName: member.group ?? 'none',
-        workspaceMode: member.workspace_mode,
-        cwd: member.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+        member,
         briefSeq: briefPost.seq,
-        brief: fullBrief,
-        lastReadSeq: member.last_read_seq,
-        verifierName,
+        fullBrief,
+        resolvedRoute,
+        rootAgent,
       })
-
-      const agentsSvc = runtime.getService('agents', rootAgent)
-      if (agentsSvc && typeof agentsSvc.create === 'function') {
-        let seedEvents
-        let inheritedEventCount
-        if (member.fork_from) {
-          const forkTargetId = member.fork_from === 'coordinator'
-            ? swarmId
-            : members[member.fork_from]?.session_id
-          const forkAgent = forkTargetId ? agentsSvc.get?.(forkTargetId) : undefined
-          const logEvents = forkAgent?.session?.events?.()
-          if (Array.isArray(logEvents) && logEvents.length > 0) {
-            seedEvents = logEvents
-            inheritedEventCount = logEvents.length
-          }
-        }
-
-        const agentPreset = rootAgent?.ctx?.get?.('agentPresets')?.composedPreset?.(rootAgent.ctx)
-          ?? rootAgent?.session?.header?.agentPreset
-        const childDepth = (rootAgent?.session?.header?.delegationDepth ?? 0) + 1
-        const agentOptions = {
-          ...(resolvedRoute.provider ? { provider: resolvedRoute.provider } : {}),
-          ...(resolvedRoute.model ? { model: resolvedRoute.model } : {}),
-          ...(resolvedRoute.maxTokens !== undefined ? { maxTokens: resolvedRoute.maxTokens } : {}),
-          ...(resolvedRoute.reasoningEffort !== undefined ? { reasoningEffort: resolvedRoute.reasoningEffort } : {}),
-          subagentDepth: childDepth,
-        }
-
-        const handle = await agentsSvc.create({
-          sessionId: member.session_id,
-          ...(rootAgent ? { parentAgent: rootAgent } : {}),
-          meta: {
-            cwd: member.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
-            ...(agentPreset ? { agentPreset } : {}),
-            parentSession: swarmId,
-            isSeeded: Boolean(seedEvents),
-            origin: 'subagent',
-            delegationDepth: childDepth,
-          },
-          ...(seedEvents ? { seed: seedEvents, inheritedEventCount } : {}),
-          agentOptions,
-          setup: runtime.buildChildSetup({
-            swarmId,
-            memberName,
-            member,
-            rolePrompt,
-            resolvedRoute,
-            rootAgent,
-            isCreate: true,
-          }),
-        })
-
-        // Register the child in the parent session's durable subagent/catalog projection
-        // so DSH's SessionHistoryController & ClientSessions resolve its durable parent address!
-        if (rootAgent?.session && typeof rootAgent.session.append === 'function') {
-          try {
-            const childHeader = handle?.agent?.session?.header
-            rootAgent.session.append('subagent/catalog', {
-              version: 0,
-              childId: childHeader?.id ?? member.session_id,
-              childCreatedAt: childHeader?.createdAt ?? Date.now(),
-              mode: 'continuable',
-              label: `@${memberName} (${member.role})`,
-            })
-          } catch (err) {
-            warn(`append subagent/catalog failed for @${memberName}: ${String(err)}`)
-          }
-        }
-
-        memberHandles.set(`${swarmId}:${memberName}`, handle)
-        if (member.role !== 'monitor') {
-          handle.agent.steer(
-            buildSwarmSystemMessage(
-              `[Swarm Brief #${briefPost.seq}] 你已被任命为 @${memberName} (${member.role})。\n\n${fullBrief}\n\n你的游标已初始化至 last_read_seq=${member.last_read_seq}（已自动跳过开局其他成员的任务书噪音）。请开始执行任务，完成后调用 post_board 点名汇报并调用 swarm_wait({"since": <最新seq>}) 休眠。`,
-              `Brief #${briefPost.seq} for @${memberName}`,
-            ),
-          )
-        }
-        return handle
-      }
-      return null
+      runtime.activateSpawnedMember({
+        swarmId,
+        memberName,
+        member,
+        briefPost,
+        fullBrief,
+        handle,
+        rootAgent,
+      })
+      return handle
     },
 
     async dispatchPostWakeups(swarmId, postRecord) {
-      const targets = store.resolveTargetsForPost(swarmId, postRecord)
+      const { wakeTargets, silentTargets } = store.resolveWakeRoutingForPost(swarmId, postRecord)
       const members = store.readMembers(swarmId)
       const woken = []
       const unreachable = []
+      const silentMentions = [...silentTargets]
 
-      for (const targetName of targets) {
-        if (targetName === 'monitor') {
-          const daemon = monitorDaemons.get(swarmId)
-          if (daemon) daemon.notifyBoardActivity(postRecord)
-          if (members.monitor) {
-            store.updateMember(swarmId, 'monitor', curr => ({
-              ...curr,
-              last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
-              last_read_seq: Math.max(curr.last_read_seq ?? 0, postRecord.seq),
-            }))
-          }
-          woken.push('monitor')
-          continue
+      // If someone explicitly mentioned `@monitor`, trigger an immediate Watchdog health check
+      if ((postRecord.mentions ?? []).includes('monitor')) {
+        const daemon = monitorDaemons.get(swarmId)
+        if (daemon) {
+          daemon.notifyBoardActivity(postRecord)
+          void daemon.healthTick()
         }
+        woken.push('monitor')
+      }
+
+      for (const targetName of wakeTargets) {
+        if (targetName === 'monitor') continue
         const m = members[targetName]
         if (!m || m.killed) {
           unreachable.push(targetName)
@@ -794,7 +861,7 @@ export function applyWith(ctx, config, deps = {}) {
             ...curr,
             last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
           }))
-          const wakeText = `[board] the latest message is #${postRecord.seq} from @${postRecord.agent} (channel #${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
+          const wakeText = `[board] the latest message is #${postRecord.seq} from @${postRecord.agent} (kind=${postRecord.kind}, channel=#${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
           } else {
@@ -809,8 +876,8 @@ export function applyWith(ctx, config, deps = {}) {
           unreachable.push(targetName)
         }
       }
-      Object.defineProperty(woken, 'unreachable', { value: unreachable, enumerable: false })
-      return woken
+
+      return { woken, unreachable, silentMentions }
     },
 
     async hotSwapMemberModel({ swarmId, memberName, provider, model, reason }) {
@@ -830,7 +897,6 @@ export function applyWith(ctx, config, deps = {}) {
       const nextProvider = resolvedRoute.provider || provider
       const nextModel = resolvedRoute.model || model
 
-      // Record desired_model first, then apply
       store.updateMember(swarmId, memberName, curr => ({
         ...curr,
         desired_provider: nextProvider,
@@ -851,7 +917,7 @@ export function applyWith(ctx, config, deps = {}) {
           memberName,
           groupName: m.group ?? 'none',
           workspaceMode: m.workspace_mode,
-          cwd: m.worktree_path ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
+          cwd: m.worktree_path ?? swarmMeta?.project_root ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
           briefSeq: m.brief_seq ?? 1,
           brief: '',
           lastReadSeq: m.last_read_seq ?? 0,
@@ -885,6 +951,12 @@ export function applyWith(ctx, config, deps = {}) {
         )
       }
 
+      const t = memberTelemetry.get(m.session_id)
+      if (t) {
+        t.last_error = null
+        t.phase = 'RUNNING'
+      }
+
       const updatedMember = store.updateMember(swarmId, memberName, curr => ({
         ...curr,
         applied_provider: nextProvider,
@@ -898,8 +970,8 @@ export function applyWith(ctx, config, deps = {}) {
         provider: nextProvider,
         model: nextModel,
         member_alive: memberAlive,
-        turn_count: updatedMember.turn_count ?? 0,
-        last_turn_at: updatedMember.last_turn_at ?? null,
+        turn_count: Math.max(updatedMember.turn_count ?? 0, t?.turn_count ?? 0),
+        last_turn_at: t?.last_turn_at ?? updatedMember.last_turn_at ?? null,
       }
     },
 
@@ -922,19 +994,39 @@ export function applyWith(ctx, config, deps = {}) {
         store,
         swarmId,
         intervalMs: settings.monitorIntervalMs,
-        getMemberLiveness: (name, member) => runtime.getMemberLiveness(swarmId, name, member),
-        onPostStall: async ({ target, text, kind, refs }) => {
-          const postRecord = store.appendBoardRecord(swarmId, {
-            type: 'post',
-            agent: 'monitor',
-            channel: 'main',
-            mentions: [target],
-            refs,
-            kind,
-            text,
+        healthIntervalMs: settings.healthIntervalMs,
+        getMemberLiveness: (memberName, member) => runtime.getMemberLiveness(swarmId, memberName, member),
+        onAutoNudge: async (memberName) => {
+          const m = store.readMembers(swarmId)[memberName]
+          if (!m || m.killed) return false
+          const handle = memberHandles.get(`${swarmId}:${memberName}`)
+          const liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
+          if (!liveAgent || typeof liveAgent.steer !== 'function') return false
+          liveAgent.steer(
+            buildSwarmSystemMessage(
+              `[Watchdog Auto-Nudge] 你已被任命为 @${memberName} (Brief #${m.brief_seq ?? 1})，但超过 60s 尚未产生任何进展。请立即调用 read_board({"since": 0}) 开始执行任务！`,
+              `Watchdog auto-nudge for @${memberName}`,
+            ),
+          )
+          return true
+        },
+        onPostStall: async ({ target, text, kind, refs, escalate }) => {
+          await store.withLock(swarmId, async () => {
+            if (!store.exists(swarmId)) return
+            const postRecord = store.appendBoardRecord(swarmId, {
+              type: 'post',
+              agent: 'monitor',
+              channel: 'main',
+              mentions: [target],
+              skip_prose_mention_extraction: true,
+              refs,
+              kind,
+              escalate: escalate === true,
+              text,
+            })
+            await runtime.dispatchPostWakeups(swarmId, postRecord)
+            runtime.notifyProjectionChanged(swarmId)
           })
-          await runtime.dispatchPostWakeups(swarmId, postRecord)
-          runtime.notifyProjectionChanged(swarmId)
         },
       })
       daemon.start()
@@ -954,7 +1046,7 @@ export function applyWith(ctx, config, deps = {}) {
     },
   }
 
-  // 1. Subscribe to `session/event` for transcript liveness (`statusOf`), turn telemetry, and error alerting (R2/R3)
+  // 1. Subscribe to `session/event` for transcript liveness (`statusOf`), lock-safe telemetry, and error alerting
   const reportedErrorSignatures = new Set()
   function resolveMemberForSessionId(sid) {
     if (!sid) return null
@@ -1015,69 +1107,82 @@ export function applyWith(ctx, config, deps = {}) {
     const mapped = resolveMemberForSessionId(sid)
     if (mapped && store.exists(mapped.swarmId)) {
       const { swarmId, memberName } = mapped
-      try {
-        if (event.type === 'turn/start') {
-          store.updateMember(swarmId, memberName, m => ({
-            ...m,
-            turn_count: (m.turn_count ?? 0) + 1,
-            last_turn_at: formatTime(),
-          }))
-        } else if (event.type === 'tool/call') {
-          store.updateMember(swarmId, memberName, m => ({
-            ...m,
-            tool_call_count: (m.tool_call_count ?? 0) + 1,
-            last_tool_call_at: formatTime(),
-            last_tool_name: event.data?.name ?? 'tool',
-            last_error: null,
-            phase: 'RUNNING',
-          }))
-        } else {
-          const failure = extractEventFailure(event)
-          if (failure && memberName !== 'coordinator') {
-            const errRecord = {
-              code: failure.code,
-              message: failure.message,
-              turn: failure.turn,
-              time: formatTime(),
-            }
-            store.updateMember(swarmId, memberName, m => ({
-              ...m,
-              last_error: errRecord,
-              phase: 'ERROR',
-            }))
-            const sig = `${sid}:${failure.turn}:${failure.code}:${failure.message}`
-            if (!reportedErrorSignatures.has(sig)) {
-              reportedErrorSignatures.add(sig)
+      let t = memberTelemetry.get(sid)
+      if (!t) {
+        const existing = store.readMembers(swarmId)[memberName]
+        t = {
+          swarmId,
+          memberName,
+          turn_count: existing?.turn_count ?? 0,
+          tool_call_count: existing?.tool_call_count ?? 0,
+          last_turn_at: existing?.last_turn_at ?? null,
+          last_tool_call_at: existing?.last_tool_call_at ?? null,
+          last_tool_name: existing?.last_tool_name ?? null,
+          last_error: existing?.last_error ?? null,
+          phase: existing?.phase ?? 'RUNNING',
+        }
+        memberTelemetry.set(sid, t)
+      }
+
+      if (event.type === 'turn/start') {
+        t.turn_count += 1
+        t.last_turn_at = formatTime()
+        scheduleTelemetryFlush(swarmId, false)
+      } else if (event.type === 'tool/call') {
+        t.tool_call_count += 1
+        t.last_tool_call_at = formatTime()
+        t.last_tool_name = event.data?.name ?? 'tool'
+        t.last_error = null
+        t.phase = 'RUNNING'
+        scheduleTelemetryFlush(swarmId, false)
+      } else {
+        const failure = extractEventFailure(event)
+        if (failure && memberName !== 'coordinator') {
+          const errRecord = {
+            code: failure.code,
+            message: failure.message,
+            turn: failure.turn,
+            time: formatTime(),
+          }
+          t.last_error = errRecord
+          t.phase = 'ERROR'
+          scheduleTelemetryFlush(swarmId, true)
+
+          const sig = `${sid}:${failure.turn}:${failure.code}:${failure.message}`
+          if (!reportedErrorSignatures.has(sig)) {
+            reportedErrorSignatures.add(sig)
+            void store.withLock(swarmId, async () => {
+              if (!store.exists(swarmId)) return
               const alertPost = store.appendBoardRecord(swarmId, {
                 type: 'post',
                 agent: 'monitor',
                 channel: 'main',
                 mentions: ['coordinator'],
+                skip_prose_mention_extraction: true,
                 kind: 'alert',
-                text: `@coordinator [RUNTIME_ERROR] 成员 @${memberName} 在第 ${failure.turn} 轮执行异常中止：${failure.message} (code=${failure.code})。请调用 swarm_status 查看并执行 swarm_model 切换可用模型或降级处理，切勿无限等待！`,
+                escalate: true,
+                text: `@coordinator [RUNTIME_ERROR] 成员 @${memberName} 在第 ${failure.turn} 轮执行异常中止：${failure.message} (code=${failure.code})。请调用 swarm_status 查看并执行 swarm_model 切换可用模型或 swarm_kill 清理后降级！`,
               })
-              void runtime.dispatchPostWakeups(swarmId, alertPost)
+              await runtime.dispatchPostWakeups(swarmId, alertPost)
               runtime.notifyProjectionChanged(swarmId)
-            }
+            }).catch(() => {})
           }
         }
-      } catch {
-        // Ignore if member record was not yet flushed
       }
     }
   })
   if (typeof disposeSessionEvent === 'function') disposers.push(disposeSessionEvent)
 
-  // 2. Hook `llm/stream` waterfall for polite 1..6 concurrency gating
+  // 2. Hook `llm/stream` waterfall for polite concurrency gating
   const disposeLlmStream = ctx.on('llm/stream', function (options, next) {
-    if ( typeof next !== 'function') return undefined
+    if (typeof next !== 'function') return undefined
     const initiator = ctx.get?.('agents')?.initiator?.()
     const agentId = initiator?.id ?? options?.agentId ?? 'main'
     const mapped = agentMembership.get(agentId)
     const role = mapped?.role ?? 'coordinator'
     const priority = role === 'coordinator'
       ? PRIORITY.COORDINATOR
-      : role === 'verifier'
+      : (role === 'verifier' || role === 'architect')
         ? PRIORITY.VERIFIER
         : role === 'monitor'
           ? PRIORITY.MONITOR
@@ -1123,7 +1228,7 @@ export function applyWith(ctx, config, deps = {}) {
   })
   if (typeof disposeTurnStopping === 'function') disposers.push(disposeTurnStopping)
 
-  // 5. Register model tools via `ctx.inject(['tools'], ...)` (with fallback to `ctx.get('tools')` for mock test contexts)
+  // 5. Register model tools via `ctx.inject(['tools'], ...)`
   let toolsRegistered = false
   function mountToolsOn(svc) {
     if (toolsRegistered || !svc || typeof svc.register !== 'function') return []
@@ -1153,7 +1258,7 @@ export function applyWith(ctx, config, deps = {}) {
     mountToolsOn(ctx.get('tools'))
   }
 
-  // 6. Register `/swarm` human command via `ctx.inject(['commands'], ...)` so it mounts into the `/` slash menu
+  // 6. Register `/swarm` human command via `ctx.inject(['commands'], ...)`
   let commandRegistered = false
   function mountCommandOn(svc) {
     if (commandRegistered || !svc || typeof svc.register !== 'function') return null
@@ -1175,7 +1280,7 @@ export function applyWith(ctx, config, deps = {}) {
     mountCommandOn(ctx.get('commands'))
   }
 
-  // 7. Register HTTP routes `/api/dsh-swarm/state` & `/api/dsh-swarm/action` on `webServer` for the Rightbar UI
+  // 7. Register HTTP routes `/api/dsh-swarm/state` & `/api/dsh-swarm/action` on `webServer`
   let webRoutesRegistered = false
   function mountWebRoutesOn(svc) {
     if (webRoutesRegistered || !svc || typeof svc.register !== 'function') return []
@@ -1209,7 +1314,7 @@ export function applyWith(ctx, config, deps = {}) {
     mountWebRoutesOn(ctx.get('webServer'))
   }
 
-  // 8. Register `swarm` SessionProjection via `ctx.get('sessionProjections')` (optional fallback)
+  // 8. Register `swarm` SessionProjection via `ctx.get('sessionProjections')`
   const projectionsSvc = (ctx.root && typeof ctx.root.get === 'function' ? ctx.root.get('sessionProjections') : undefined)
     ?? (typeof ctx.get === 'function' ? ctx.get('sessionProjections') : undefined)
   if (projectionsSvc && typeof projectionsSvc.register === 'function') {
@@ -1234,6 +1339,8 @@ export function applyWith(ctx, config, deps = {}) {
   }
 
   ctx.effect(() => () => {
+    for (const timer of pendingTelemetryFlushes.values()) clearTimeout(timer)
+    pendingTelemetryFlushes.clear()
     for (const daemon of monitorDaemons.values()) daemon.stop()
     monitorDaemons.clear()
     for (const dispose of disposers) {
@@ -1242,6 +1349,7 @@ export function applyWith(ctx, config, deps = {}) {
   }, 'dsh-swarm: cleanup')
 
   log('active', {
+    version: PLUGIN_VERSION,
     defaultConcurrency: settings.defaultConcurrency,
     defaultModel: settings.defaultModel,
     coordinatorModel: settings.coordinatorModel,

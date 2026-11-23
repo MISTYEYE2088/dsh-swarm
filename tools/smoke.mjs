@@ -36,6 +36,7 @@ import {
   removeIsolatedWorktree,
 } from '../src/host/worktree.js'
 import { detectSwarmStall, SwarmMonitorDaemon } from '../src/host/monitor.js'
+import { toLosslessJson } from '../src/host/tools.js'
 import { applyWith } from '../index.js'
 
 const CLIENT_PATH = fileURLToPath(new URL('../client.js', import.meta.url))
@@ -215,12 +216,20 @@ async function test_validator_blocks_add_before_concurrency_confirmed() {
 
 async function test_validator_rejects_killed_name_reuse() {
   const res = validateSwarmAdd(
-    { name: 'monitor', role: 'monitor', brief: 'monitor' },
+    { name: 'arch-1', role: 'architect', brief: '[OWNERSHIP] docs/\n[FORBIDDEN] src/\n[DONE_CRITERIA] adr' },
     { concurrency_confirmed: true, concurrency_limit: 3 },
-    { monitor: { killed: true, role: 'monitor' } },
+    { 'arch-1': { killed: true, role: 'architect' } },
   )
   assert.equal(res.ok, false)
-  assert.match(res.error, /monitor-2/)
+  assert.match(res.error, /arch-2/)
+
+  const monRes = validateSwarmAdd(
+    { name: 'watcher', role: 'monitor', brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c' },
+    { concurrency_confirmed: true, concurrency_limit: 3 },
+    {},
+  )
+  assert.equal(monRes.ok, false)
+  assert.match(monRes.error, /Watchdog/)
 }
 
 async function test_validator_enforces_three_part_brief() {
@@ -1037,7 +1046,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.2\.0/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.0/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1094,8 +1103,10 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.2\.0/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.0/)
   assert.match(statusRes.text, /status=error/)
+  assert.match(statusRes.text, /LLM In-Flight Slots:/)
+  assert.match(statusRes.text, /Watchdog:/)
 
   // R8: Posting [done] archives the 4-file blackboard into swarm/archive/<id>_.../
   const doneRes = await registeredTools.get('post_board').execute(
@@ -1104,6 +1115,386 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
   )
   assert.equal(doneRes.ok, true)
   assert.ok(doneRes.archive_path && fs.existsSync(path.join(doneRes.archive_path, 'board.jsonl')), 'Archive directory must contain board.jsonl')
+}
+
+// ---------------------------------------------------------------------------
+// 8. v0.3.0 P0/P1 Reliability, Watchdog, Noise Filtering, Merge Gate & Subdir Git
+// ---------------------------------------------------------------------------
+
+function assertStrictlyLosslessJson(value, label = 'value') {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return
+  if (typeof value === 'number') {
+    assert.equal(Number.isFinite(value), true, `${label} must be finite number`)
+    return
+  }
+  if (Array.isArray(value)) {
+    const ownKeys = Object.getOwnPropertyNames(value).filter(k => k !== 'length')
+    assert.equal(ownKeys.length, value.length, `${label} array must have no extra own properties (found: ${ownKeys.join(',')})`)
+    value.forEach((item, i) => assertStrictlyLosslessJson(item, `${label}[${i}]`))
+    return
+  }
+  if (typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      assert.notEqual(v, undefined, `${label}.${k} must not be undefined`)
+      assertStrictlyLosslessJson(v, `${label}.${k}`)
+    }
+    return
+  }
+  assert.fail(`${label} has non-JSON type ${typeof value}`)
+}
+
+async function test_tool_outputs_are_strictly_lossless_json() {
+  const dirtyArr = ['worker-1']
+  Object.defineProperty(dirtyArr, 'unreachable', { value: ['ghost'], enumerable: false })
+  const cleaned = toLosslessJson({ ok: true, woken: dirtyArr, undefField: undefined, badNum: NaN })
+  assertStrictlyLosslessJson(cleaned, 'cleaned')
+  assert.equal('undefField' in cleaned, false)
+  assert.equal(cleaned.badNum, null)
+  assert.deepEqual(cleaned.woken, ['worker-1'])
+}
+
+async function test_concurrent_post_board_and_session_events_zero_duplicates() {
+  const listeners = new Map()
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on(ev, fn) { listeners.set(ev, fn); return () => listeners.delete(ev) },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-stress-d01') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-stress', session: { header: { id: 'sess-stress', cwd: tempRoot } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'Stress D01', concurrency_limit: 4 }, { agent: coordAgent })
+  for (let i = 1; i <= 4; i += 1) {
+    await registeredTools.get('swarm_add').execute(
+      { name: `w-${i}`, role: 'worker', brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c' },
+      { agent: coordAgent },
+    )
+  }
+
+  const onEvent = listeners.get('session/event')
+  const postTool = registeredTools.get('post_board')
+  const jobs = []
+  for (let w = 1; w <= 4; w += 1) {
+    const wAgent = { id: `sess-stress__w-${w}` }
+    for (let k = 1; k <= 10; k += 1) {
+      // Interleave concurrent session/event tool calls right alongside post_board calls
+      onEvent({ id: `sess-stress__w-${w}` }, { type: 'tool/call', seq: k, data: { name: 'read', arguments: '{}' } })
+      jobs.push(postTool.execute(
+        { text: `@coordinator worker ${w} step ${k} completed cleanly`, mentions: ['coordinator'], kind: 'report' },
+        { agent: wAgent },
+      ))
+    }
+  }
+  const outcomes = await Promise.all(jobs)
+  for (const res of outcomes) {
+    assert.equal(res.ok, true)
+    assert.equal(res.deduplicated, false)
+    assertStrictlyLosslessJson(res, 'post_board_res')
+  }
+  // 4 opening briefs + 40 unique posts = 44 exact records, zero drops, zero duplicates
+  assert.equal(runtime.store.readBoard('sess-stress').length, 44)
+
+  // Retry identical post -> deduplicated cleanly without creating #45!
+  const dupRes = await postTool.execute(
+    { text: '@coordinator worker 1 step 1 completed cleanly', mentions: ['coordinator'], kind: 'report' },
+    { agent: { id: 'sess-stress__w-1' } },
+  )
+  assert.equal(dupRes.ok, true)
+  assert.equal(dupRes.deduplicated, true)
+  assert.equal(runtime.store.readBoard('sess-stress').length, 44)
+}
+
+async function test_atomic_swarm_add_rollback_and_never_started_kill_releases_name() {
+  const registeredTools = new Map()
+  let shouldFailCreate = true
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') {
+        return {
+          async create(opts) {
+            if (shouldFailCreate) throw new Error('Simulated spawn failure (EPERM)')
+            return {
+              agent: {
+                id: opts.sessionId,
+                status: 'idle',
+                session: { header: { id: opts.sessionId, createdAt: Date.now() }, append() {} },
+                steer() {},
+              },
+              async dispose() {},
+            }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-atomic-add') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-atom', session: { header: { id: 'sess-atom', cwd: tempRoot } } }
+  await registeredTools.get('swarm_init').execute({ title: 'Atomic Spawn', concurrency_limit: 4 }, { agent: coordAgent })
+
+  // 1. Spawn fails -> must rollback cleanly with 0 board posts and 0 zombie in members.json
+  const failRes = await registeredTools.get('swarm_add').execute(
+    { name: 'arch-v2', role: 'architect', brief: '[OWNERSHIP] docs/\n[FORBIDDEN] src/\n[DONE_CRITERIA] arch' },
+    { agent: coordAgent },
+  )
+  assert.equal(failRes.ok, false)
+  assert.match(failRes.text, /已自动回滚/)
+  assert.equal(runtime.store.readMembers('sess-atom')['arch-v2'], undefined)
+  assert.equal(runtime.store.readBoard('sess-atom').length, 0)
+
+  // 2. Retry with the SAME name `arch-v2` succeeds because rollback released it!
+  shouldFailCreate = false
+  const okRes = await registeredTools.get('swarm_add').execute(
+    { name: 'arch-v2', role: 'architect', brief: '[OWNERSHIP] docs/\n[FORBIDDEN] src/\n[DONE_CRITERIA] arch' },
+    { agent: coordAgent },
+  )
+  assert.equal(okRes.ok, true)
+  assert.equal(okRes.active_members, 2)
+  assert.equal(okRes.llm_slots, 4)
+
+  // Freshly created member with turns=0 must report `starting`, NOT `waiting`!
+  const liveness = runtime.getMemberLiveness('sess-atom', 'arch-v2')
+  assert.equal(liveness.status, 'starting')
+
+  // 3. Killing a never-started member (turns=0, post=0) releases its name for direct reuse
+  const killRes = await registeredTools.get('swarm_kill').execute({ name: 'arch-v2' }, { agent: coordAgent })
+  assert.equal(killRes.ok, true)
+  assert.equal(killRes.name_released, true)
+  assert.equal(runtime.store.readMembers('sess-atom')['arch-v2'], undefined)
+}
+
+async function test_watchdog_catches_zombie_while_peers_working() {
+  const store = new SwarmStore(path.join(tempRoot, 'watchdog-zombie'))
+  store.initSwarm('s-wd', { title: 'Zombie Watchdog', concurrency_confirmed: true })
+  store.registerMemberWithBrief('s-wd', {
+    name: 'impl-busy',
+    session_id: 's-wd__impl-busy',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+  store.registerMemberWithBrief('s-wd', {
+    name: 'arch-zombie',
+    session_id: 's-wd__arch-zombie',
+    role: 'architect',
+    brief: '[OWNERSHIP] docs\n[FORBIDDEN] src\n[DONE_CRITERIA] arch',
+  })
+  // Backdate arch-zombie created_at by 90 seconds so it exceeds the 60s startup grace window
+  store.updateMember('s-wd', 'arch-zombie', m => ({
+    ...m,
+    created_at: new Date(Date.now() - 90_000).toISOString(),
+    turn_count: 0,
+    last_post_seq: 0,
+  }))
+
+  const diag = detectSwarmStall({
+    store,
+    swarmId: 's-wd',
+    getMemberLiveness: (name) => (
+      name === 'impl-busy'
+        ? { status: 'working', stepSummary: 'Running tests' }
+        : { status: 'zombie', stepSummary: 'Never started' }
+    ),
+  })
+  assert.equal(diag.stalled, true)
+  assert.equal(diag.kind, 'member_zombie')
+  assert.equal(diag.memberName, 'arch-zombie')
+  assert.equal(diag.target, 'coordinator')
+}
+
+async function test_noise_reduction_wake_kinds_escalate_silent_and_prose_mentions() {
+  const registeredTools = new Map()
+  const wokenByAgent = new Map()
+  const coordAgent = {
+    id: 'sess-noise',
+    status: 'idle',
+    session: { header: { id: 'sess-noise', cwd: tempRoot } },
+    steer(msg) {
+      wokenByAgent.set('coordinator', (wokenByAgent.get('coordinator') ?? 0) + 1)
+      return msg
+    },
+  }
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') return { get(id) { return id === 'sess-noise' ? coordAgent : undefined } }
+      return undefined
+    },
+  }
+
+  applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-noise') }, { log: () => {}, warn: () => {} })
+  await registeredTools.get('swarm_init').execute({ title: 'Noise Control', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-a', role: 'worker', brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c' },
+    { agent: coordAgent },
+  )
+  const rb = await registeredTools.get('read_board').execute({}, { agent: coordAgent })
+  // Coordinator parks with wake_kinds excluding routine `report`
+  const waitRes = await registeredTools.get('swarm_wait').execute(
+    { since: rb.last_read_seq, mentions_only: true, wake_kinds: ['alert', 'question', 'decision', 'review'] },
+    { agent: coordAgent, concludeTurn() {} },
+  )
+  assert.equal(waitRes.ok, true)
+  assert.equal(waitRes.status, 'DONE')
+
+  const workerAgent = { id: 'sess-noise__impl-a' }
+  // 1. Routine report @coordinator -> filtered by wake_kinds, does NOT wake Coordinator!
+  const repRes = await registeredTools.get('post_board').execute(
+    { text: '@coordinator 常规进度更新，顺便提一下下一波的 @future-qa 成员', mentions: ['coordinator'], kind: 'report' },
+    { agent: workerAgent },
+  )
+  assert.equal(repRes.ok, true)
+  assert.deepEqual(repRes.woken, [])
+  assert.deepEqual(repRes.silent_mentions, ['coordinator'])
+  assert.deepEqual(repRes.ignored_prose_mentions, ['future-qa'])
+  assert.equal(wokenByAgent.get('coordinator') ?? 0, 0)
+
+  // 2. Same kind `report` with `escalate: true` -> bypasses wake_kinds and wakes Coordinator!
+  const escRes = await registeredTools.get('post_board').execute(
+    { text: '@coordinator 紧急升级：环境端口冲突需要拍板', mentions: ['coordinator'], kind: 'report', escalate: true },
+    { agent: workerAgent },
+  )
+  assert.equal(escRes.ok, true)
+  assert.deepEqual(escRes.woken, ['coordinator'])
+  assert.equal(wokenByAgent.get('coordinator'), 1)
+
+  // 3. Silent log post with empty mentions -> allowed!
+  const silentRes = await registeredTools.get('post_board').execute(
+    { text: '本地中间测试日志已保存至 scratch/out.log', silent: true, kind: 'report' },
+    { agent: workerAgent },
+  )
+  assert.equal(silentRes.ok, true)
+  assert.deepEqual(silentRes.woken, [])
+}
+
+async function test_merge_gate_reject_approve_override_and_supersedes_read_filter() {
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-gate') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-gate', session: { header: { id: 'sess-gate', cwd: tempRoot } } }
+  await registeredTools.get('swarm_init').execute({ title: 'Gate & Supersedes', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-gate', role: 'verifier', brief: '[OWNERSHIP] tests/\n[FORBIDDEN] src/\n[DONE_CRITERIA] qa' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-core', role: 'worker', brief: '[OWNERSHIP] src/\n[FORBIDDEN] tests/\n[DONE_CRITERIA] core' },
+    { agent: coordAgent },
+  )
+
+  const qaAgent = { id: 'sess-gate__qa-gate' }
+  const postTool = registeredTools.get('post_board')
+  const readTool = registeredTools.get('read_board')
+
+  // QA posts a rejection
+  const rejRes = await postTool.execute(
+    { text: '@impl-core [REJECT] 射程断言未通过，请修复', mentions: ['impl-core'], kind: 'review', verdict: 'reject' },
+    { agent: qaAgent },
+  )
+  assert.equal(rejRes.ok, true)
+
+  // Coordinator tries to post `[done]` while rejection is open -> BLOCKED by runtime gate!
+  const blockedDone = await postTool.execute(
+    { text: '[done] 尝试直接结案', kind: 'done', mentions: ['coordinator'] },
+    { agent: coordAgent },
+  )
+  assert.equal(blockedDone.ok, false)
+  assert.match(blockedDone.text, /GATE_BLOCKED/)
+
+  // QA posts a new decision superseding the rejection AND approves
+  const appRes = await postTool.execute(
+    { text: '@coordinator [VERDICT: ALL PASS] 复测通过', mentions: ['coordinator'], kind: 'review', verdict: 'approve', supersedes: [rejRes.seq] },
+    { agent: qaAgent },
+  )
+  assert.equal(appRes.ok, true)
+
+  // `read_board` marks superseded floor and `hide_superseded: true` omits it
+  const fullRead = await readTool.execute({ since: 0, kinds: ['review'] }, { agent: coordAgent })
+  assert.equal(fullRead.posts.length, 2)
+  assert.equal(fullRead.posts[0].superseded_by, appRes.seq)
+  assert.match(fullRead.text, /SUPERSEDED by/)
+
+  const filteredRead = await readTool.execute({ since: 0, kinds: ['review'], hide_superseded: true }, { agent: coordAgent })
+  assert.equal(filteredRead.posts.length, 1)
+  assert.equal(filteredRead.posts[0].seq, appRes.seq)
+
+  // Now `[done]` succeeds!
+  const okDone = await postTool.execute(
+    { text: '[done] 全部门禁通过，结案归档', kind: 'done', mentions: ['coordinator'] },
+    { agent: coordAgent },
+  )
+  assert.equal(okDone.ok, true)
+}
+
+async function test_project_root_subdir_git_worktree_isolation() {
+  const parentDir = path.join(tempRoot, 'parent-non-git')
+  const subRepo = path.join(parentDir, 'sub-app')
+  fs.mkdirSync(subRepo, { recursive: true })
+  await runGit(['init'], { cwd: subRepo })
+  await runGit(['config', 'user.name', 'Test'], { cwd: subRepo })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: subRepo })
+  fs.writeFileSync(path.join(subRepo, 'app.js'), 'export const v = 1\n', 'utf8')
+  await runGit(['add', 'app.js'], { cwd: subRepo })
+  await runGit(['commit', '-m', 'init'], { cwd: subRepo })
+
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  applyWith(
+    fakeCtx,
+    { swarmDir: path.join(tempRoot, 'e2e-subdir-git'), worktreesDir: path.join(tempRoot, 'e2e-subdir-wt') },
+    { log: () => {}, warn: () => {} },
+  )
+  const coordAgent = { id: 'sess-subgit', session: { header: { id: 'sess-subgit', cwd: parentDir } } }
+
+  // 1. First init at parentDir discovers child git repo `sub-app`
+  const probeInit = await registeredTools.get('swarm_init').execute(
+    { title: 'Subdir Probe', concurrency_limit: 4 },
+    { agent: coordAgent },
+  )
+  assert.equal(probeInit.ok, true)
+  assert.equal(probeInit.git_worktree_available, false)
+  assert.equal(probeInit.discovered_child_git_repos.includes('sub-app'), true)
+
+  // 2. Re-init with `project_root: 'sub-app'` unlocks `workspace: 'share'` worktree isolation!
+  const realInit = await registeredTools.get('swarm_init').execute(
+    { title: 'Subdir Worktree', concurrency_limit: 4, project_root: 'sub-app' },
+    { agent: coordAgent },
+  )
+  assert.equal(realInit.ok, true)
+  assert.equal(realInit.git_worktree_available, true)
+
+  const addShare = await registeredTools.get('swarm_add').execute(
+    { name: 'impl-iso', role: 'worker', workspace: 'share', brief: '[OWNERSHIP] app.js\n[FORBIDDEN] none\n[DONE_CRITERIA] edit' },
+    { agent: coordAgent },
+  )
+  assert.equal(addShare.ok, true)
+  assert.equal(addShare.created[0].workspace, 'share')
+
+  const killClean = await registeredTools.get('swarm_kill').execute({ name: 'impl-iso', force: true }, { agent: coordAgent })
+  assert.equal(killClean.ok, true)
 }
 
 // Run all tests
@@ -1141,6 +1532,13 @@ try {
   await runTest('test_slash_command_and_rightbar_registration', test_slash_command_and_rightbar_registration)
   await runTest('test_subagent_creation_inherits_real_model_preset_and_durable_address', test_subagent_creation_inherits_real_model_preset_and_durable_address)
   await runTest('test_r0_to_r8_error_observability_monitor_deps_and_archive', test_r0_to_r8_error_observability_monitor_deps_and_archive)
+  await runTest('test_tool_outputs_are_strictly_lossless_json', test_tool_outputs_are_strictly_lossless_json)
+  await runTest('test_concurrent_post_board_and_session_events_zero_duplicates', test_concurrent_post_board_and_session_events_zero_duplicates)
+  await runTest('test_atomic_swarm_add_rollback_and_never_started_kill_releases_name', test_atomic_swarm_add_rollback_and_never_started_kill_releases_name)
+  await runTest('test_watchdog_catches_zombie_while_peers_working', test_watchdog_catches_zombie_while_peers_working)
+  await runTest('test_noise_reduction_wake_kinds_escalate_silent_and_prose_mentions', test_noise_reduction_wake_kinds_escalate_silent_and_prose_mentions)
+  await runTest('test_merge_gate_reject_approve_override_and_supersedes_read_filter', test_merge_gate_reject_approve_override_and_supersedes_read_filter)
+  await runTest('test_project_root_subdir_git_worktree_isolation', test_project_root_subdir_git_worktree_isolation)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }

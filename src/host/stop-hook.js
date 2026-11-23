@@ -1,18 +1,20 @@
 // Stop-Hook race lock (`agent/turn-stopping`) and transcript-based liveness (`statusOf`).
 //
-// Implements the two core anti-polling mechanisms from the AGY Swarm design:
+// Implements the two core anti-polling mechanisms:
 // 1. When an agent is about to finish its turn (either after `swarm_wait` or
 //    natural completion), `handleTurnStopping` atomically checks `board.jsonl`:
-//      a) If new matching posts arrived after `Math.max(last_read_seq, wait_since)`,
-//         it updates `last_park_blocked_seq = headSeq` and steers a `[board]`
-//         wake reminder into `agent.inbox.nextStep`, blocking termination.
-//      b) If a `glm5.3` / `deepseek4.1f` worker/verifier forgot to call `swarm_wait`
-//         and forgot to post a report during its turn, it blocks termination up to
-//         `maxUnparkedBlocks` times to force proper board handoff.
-// 2. `statusOf` derives member liveness from the real session transcript tail
-//    and the `ConcurrencyGate` queue rather than blindly trusting `wake_mode`.
+//      a) If new matching posts arrived after `Math.max(last_read_seq, wait_since)`
+//         (respecting `wake_kinds` + `escalate`), it updates `last_park_blocked_seq`
+//         and steers a `[board]` wake reminder into `agent.inbox.nextStep`.
+//      b) If a worker/architect/verifier forgot to call `swarm_wait`, it blocks
+//         termination up to `maxUnparkedBlocks` times to force proper board handoff.
+// 2. `statusOf` derives member liveness from the real session transcript tail,
+//    `liveAgent`, and `ConcurrencyGate`, explicitly distinguishing `starting`
+//    and `zombie` from healthy `waiting`.
 
 import { randomUUID } from 'node:crypto'
+
+export const DEFAULT_STARTUP_GRACE_MS = 60_000
 
 /** Construct a DSH UserMessage suitable for `agent.steer()` or `agent.inject()`. */
 export function buildSwarmSystemMessage(text, summary = 'Swarm board notification') {
@@ -29,7 +31,7 @@ export function buildSwarmSystemMessage(text, summary = 'Swarm board notificatio
 }
 
 // #FUNC Block turn termination on `agent/turn-stopping` when unread board messages arrived or a worker forgot `swarm_wait`.
-// #NOT  Never infinite-loops: unparked-worker reminders are capped at `maxUnparkedBlocks` per turn.
+// #NOT  Never infinite-loops: unparked-worker reminders are capped at `maxUnparkedBlocks` per turn, and `wake_kinds` filters out non-subscribed noise.
 // #EDGE-IN A new board mention arriving right after `swarm_wait(10)` sets `last_park_blocked_seq: 11` and steers the agent → test_stop_hook_blocks_on_race_message
 // #EDGE-IN A worker ending its turn without calling `swarm_wait` is intercepted and told to post/park → test_stop_hook_catches_worker_forgetting_swarm_wait
 // #WHY  `last_park_blocked_seq` records the exact floor where the Stop Hook prevented a missed-wakeup race condition.
@@ -49,11 +51,11 @@ export function handleTurnStopping({
   const member = members[memberName]
   if (!member || member.killed) return { blocked: false }
 
-  const headSeq = store.headSeq(swarmId)
   const baselineSeq = Math.max(member.last_read_seq ?? 0, member.wait_since ?? 0)
   const mentionsOnly = member.wake_mode !== 'anything'
   const unreadMatching = store.queryVisiblePosts(swarmId, memberName, baselineSeq, {
     mentionsOnly,
+    wakeKinds: member.wake_kinds,
   })
 
   // Case 1: New relevant messages landed on `board.jsonl` before the turn closed!
@@ -76,16 +78,16 @@ export function handleTurnStopping({
     }
   }
 
-  // Case 2: Safeguard for glm5.3 / deepseek4.1f — worker or verifier finished its step
-  // without calling `swarm_wait` AND without posting `[done]`.
+  // Case 2: Safeguard — worker, architect, or verifier finished its step
+  // without calling `swarm_wait`.
   if (
-    (member.role === 'worker' || member.role === 'verifier')
+    (member.role === 'worker' || member.role === 'architect' || member.role === 'verifier')
     && turnState
     && turnState.calledSwarmWait !== true
     && (turnState.unparkedBlockCount ?? 0) < maxUnparkedBlocks
   ) {
     turnState.unparkedBlockCount = (turnState.unparkedBlockCount ?? 0) + 1
-    const notice = `Stop hook blocked termination: 你尚未调用 post_board 汇报结果，也没有调用 swarm_wait({"since": ${member.last_read_seq ?? 0}}) 进入休眠！请先发帖点名 @verifier 或 @coordinator，然后必须调用 swarm_wait 结束本轮。`
+    const notice = `Stop hook blocked termination: 你尚未调用 post_board 汇报结果，也没有调用 swarm_wait({"since": ${member.last_read_seq ?? 0}}) 进入休眠！请先发帖交接，然后必须调用 swarm_wait 结束本轮。`
     agent.steer(buildSwarmSystemMessage(notice, 'Stop hook: missing swarm_wait'))
     return {
       blocked: true,
@@ -97,18 +99,24 @@ export function handleTurnStopping({
   return { blocked: false }
 }
 
-// #FUNC Derive a member's real liveness and current tool step from its session transcript tail and concurrency queue.
-// #NOT  Does not blindly trust `member.wake_mode`, because a human message or callback can wake a sleeping agent without flipping `wake_mode`.
+// #FUNC Derive a member's real liveness and current tool step from its session transcript tail, live handle, and concurrency queue.
+// #NOT  Never masks a never-started or unreachable zombie member as healthy `waiting`.
 // #EDGE-IN A member with `wake_mode: "mentions"` whose transcript ends with an active `tool/call` is reported as `working` → test_liveness_reads_transcript_over_wake_mode
-// #WHY  `statusOf` inspects `sessionEvents` and `concurrencyGate` directly so the UI and `@monitor` never misclassify a running tool or queued LLM call as sleeping.
-export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [] } = {}) {
+// #WHY  `statusOf` inspects `sessionEvents`, `liveAgent`, `turn_count`, and `concurrencyGate` directly so Coordinator and Watchdog can distinguish `starting`/`zombie` from `waiting`.
+export function statusOf(member, {
+  liveAgent,
+  concurrencyGate,
+  sessionEvents = [],
+  nowMs = Date.now(),
+  startupGraceMs = DEFAULT_STARTUP_GRACE_MS,
+} = {}) {
   if (!member) return { status: 'unknown', stepSummary: null }
   if (member.killed) return { status: 'killed', stepSummary: 'Killed (retired)' }
   if (member.role === 'monitor' && member.system_builtin) {
     return { status: 'daemon', stepSummary: 'Background watchdog timer (0 token standby)' }
   }
 
-  // R2/R3: Surface any recorded turn/adapter error immediately instead of masking it as 'working' or 'waiting'
+  // Surface any recorded turn/adapter error immediately instead of masking it as 'working' or 'waiting'
   if (member.last_error) {
     const code = member.last_error.code || 'ERROR'
     const msg = member.last_error.message || String(member.last_error)
@@ -124,13 +132,13 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
     if (pos > 0) {
       return {
         status: 'queued',
-        stepSummary: `Waiting for concurrency slot (#${pos} in queue)`,
+        stepSummary: `Waiting for LLM slot (#${pos} in queue)`,
       }
     }
     if (concurrencyGate.isStreaming(sessionId)) {
       return {
         status: 'working',
-        stepSummary: `Streaming response (${member.applied_model || 'model'})`,
+        stepSummary: `Streaming LLM response (${member.applied_model || 'model'})`,
       }
     }
   }
@@ -198,9 +206,37 @@ export function statusOf(member, { liveAgent, concurrencyGate, sessionEvents = [
     }
   }
 
+  const turns = member.turn_count ?? 0
+  const lastPost = member.last_post_seq ?? 0
+  const createdMs = member.created_at ? Date.parse(member.created_at) : NaN
+  const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : 0
+
+  // Distinguish never-started / zombie members from genuinely parked `waiting` members
+  if (member.role !== 'coordinator' && turns === 0 && lastPost === 0) {
+    if (member.spawned_live_agent === true && !liveAgent) {
+      return {
+        status: 'zombie',
+        stepSummary: 'Zombie (live session lost before Turn 1; turns=0)',
+      }
+    }
+    if (ageMs >= startupGraceMs) {
+      return {
+        status: 'zombie',
+        stepSummary: `Zombie (never started after ${Math.round(ageMs / 1000)}s; turns=0, live=${Boolean(liveAgent)})`,
+      }
+    }
+    return {
+      status: 'starting',
+      stepSummary: `Starting Turn 1 (${Math.round(ageMs / 1000)}s elapsed, turns=0)`,
+    }
+  }
+
   const wakeLabel = member.wake_mode === 'anything' ? 'anything' : 'mentions'
+  const kindsNote = Array.isArray(member.wake_kinds) && member.wake_kinds.length > 0
+    ? `, kinds=${member.wake_kinds.join('|')}`
+    : ''
   return {
     status: 'waiting',
-    stepSummary: `Parked since #${member.wait_since ?? member.last_read_seq ?? 0} (wake=${wakeLabel}, turns=${member.turn_count ?? 0})`,
+    stepSummary: `Parked since #${member.wait_since ?? member.last_read_seq ?? 0} (wake=${wakeLabel}${kindsNote}, turns=${turns})`,
   }
 }

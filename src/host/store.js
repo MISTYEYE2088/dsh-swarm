@@ -5,14 +5,31 @@
 //   <rootDir>/<swarmId>/plan.json
 //
 // Also owns event-sourced channel replay (`channelsAt` / `activeAt`) from
-// `type: "control"` frames embedded inside `board.jsonl`.
+// `type: "control"` frames embedded inside `board.jsonl`, post superseding maps,
+// merge-gate rejection tracking, and Windows-NTFS-resilient atomic JSON writes.
 
 import fs from 'node:fs'
-import fsp from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
 export const PLAN_MAX_BYTES = 65_536
+export const VALID_POST_KINDS = Object.freeze(['brief', 'report', 'question', 'review', 'decision', 'alert', 'done'])
+export const VALID_VERDICTS = Object.freeze(['approve', 'reject', 'override'])
+
+const RETRYABLE_FS_CODES = new Set(['EPERM', 'EBUSY', 'EACCES'])
+const SLEEP_BUFFER = new Int32Array(new SharedArrayBuffer(4))
+
+function sleepSync(ms) {
+  if (ms <= 0) return
+  try {
+    Atomics.wait(SLEEP_BUFFER, 0, 0, ms)
+  } catch {
+    const end = Date.now() + ms
+    while (Date.now() < end) {
+      // Fallback busy wait only if Atomics.wait is disallowed on main thread
+    }
+  }
+}
 
 /** Format a timestamp in readable ISO-like local/UTC form. */
 export function formatTime(now = new Date()) {
@@ -27,17 +44,44 @@ export function defaultSwarmRoot(env = process.env) {
   return path.join(dshHome, 'swarm')
 }
 
-// #FUNC Atomically write a JSON object to disk using a sibling temp file and rename.
-// #NOT  Does not mutate the target file in place, preventing half-written JSON on crash.
-// #EDGE-IN Concurrent writes to the same path are serialized by the caller's mutex → test_atomic_store_roundtrip
-// #WHY  `renameSync` replaces the destination atomically on POSIX and modern NTFS so readers never see truncated JSON.
+// #FUNC Atomically write a JSON object to disk using a sibling temp file and Windows-NTFS-resilient rename.
+// #NOT  Does not leave orphaned `.tmp` files behind or fail permanently on transient Windows `EPERM`/`EBUSY` rename locks.
+// #EDGE-IN Concurrent writes to the same path are serialized by the caller's mutex and retry transient EPERM → test_atomic_store_roundtrip
+// #WHY  `renameSync` replaces the destination atomically on POSIX and NTFS, while bounded backoff + fallback avoids transient Windows indexer/AV `EPERM` lock failures.
 export function writeJsonAtomicSync(filePath, value) {
   const dir = path.dirname(filePath)
   fs.mkdirSync(dir, { recursive: true })
   const tempPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random().toString(16).slice(2)}.tmp`
   const payload = JSON.stringify(value, null, 2) + '\n'
   fs.writeFileSync(tempPath, payload, 'utf8')
-  fs.renameSync(tempPath, filePath)
+
+  const delays = [5, 12, 25, 45, 75, 100]
+  try {
+    let lastErr = null
+    for (let attempt = 0; attempt <= delays.length; attempt += 1) {
+      try {
+        fs.renameSync(tempPath, filePath)
+        return
+      } catch (err) {
+        lastErr = err
+        if (!RETRYABLE_FS_CODES.has(err?.code)) throw err
+        if (attempt < delays.length) sleepSync(delays[attempt])
+      }
+    }
+    // Final Windows-NTFS fallback: if antivirus/indexer held a rename lock on the target,
+    // write directly in place so we never lose state or crash after board.jsonl succeeded.
+    if (lastErr && RETRYABLE_FS_CODES.has(lastErr.code)) {
+      fs.writeFileSync(filePath, payload, 'utf8')
+      return
+    }
+    throw lastErr
+  } finally {
+    try {
+      if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath)
+    } catch {
+      // Best-effort temp cleanup
+    }
+  }
 }
 
 /** Read and parse a JSON file, returning fallback if the file does not exist. */
@@ -146,6 +190,21 @@ export function extractScreenshotsFromPosts(posts) {
   return reel
 }
 
+/** Compute a map of `supersededSeq -> supersedingSeq` from `supersedes` fields in board records. */
+export function computeSupersededMap(records) {
+  const supersededBy = new Map()
+  for (const rec of records) {
+    if (!rec || rec.type === 'control' || !Array.isArray(rec.supersedes)) continue
+    for (const oldSeq of rec.supersedes) {
+      const n = Number(oldSeq)
+      if (Number.isSafeInteger(n) && n >= 1 && n < rec.seq) {
+        supersededBy.set(n, rec.seq)
+      }
+    }
+  }
+  return supersededBy
+}
+
 /**
  * Per-Swarm store managing `swarm.json`, `board.jsonl`, `members.json`, and `plan.json`
  * inside `<baseDir>/<swarmId>/`.
@@ -202,7 +261,7 @@ export class SwarmStore {
     }
     const items = []
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue
+      if (!entry.isDirectory() || entry.name === 'archive') continue
       const swarmJsonPath = path.join(this.baseDir, entry.name, 'swarm.json')
       if (!fs.existsSync(swarmJsonPath)) continue
       try {
@@ -243,9 +302,9 @@ export class SwarmStore {
   }
 
   // #FUNC Initialize the 3 core blackboard files (`swarm.json`, `board.jsonl`, `members.json`) for a coordinator session.
-  // #NOT  Does not allow `swarm_add` until `concurrency_confirmed` is set true.
+  // #NOT  Does not allow `swarm_add` until `concurrency_confirmed` is set true, and does not insert a fake `monitor` LLM member into `members.json`.
   // #EDGE-IN Calling `initSwarm` on an existing swarm updates title/concurrency without wiping `board.jsonl` → test_init_preserves_existing_board
-  // #WHY  `concurrency_confirmed` gates member creation so the coordinator must ask the user for the concurrency limit first.
+  // #WHY  `concurrency_confirmed` gates member creation so the coordinator confirms concurrency before spawning, while the Watchdog runs deterministically outside the LLM roster.
   initSwarm(swarmId, options = {}) {
     const paths = this.pathsOf(swarmId)
     fs.mkdirSync(paths.dir, { recursive: true })
@@ -264,6 +323,7 @@ export class SwarmStore {
       title: options.title ?? existing?.title ?? 'Untitled Swarm',
       backend: options.backend ?? existing?.backend ?? 'local',
       status: options.status ?? existing?.status ?? 'ACTIVE',
+      project_root: options.project_root !== undefined ? options.project_root : (existing?.project_root ?? null),
       concurrency_confirmed: options.concurrency_confirmed ?? existing?.concurrency_confirmed ?? false,
       concurrency_limit: options.concurrency_limit ?? existing?.concurrency_limit ?? 4,
       default_provider: options.default_provider ?? existing?.default_provider ?? 'inherit',
@@ -286,6 +346,7 @@ export class SwarmStore {
         role: 'coordinator',
         group: null,
         parent: null,
+        can_block_merge: false,
         desired_state: 'RUNNING',
         phase: 'RUNNING',
         desired_provider: swarmMeta.default_provider,
@@ -296,40 +357,7 @@ export class SwarmStore {
         worktree_path: null,
         base_commit: null,
         wake_mode: 'anything',
-        channels: ['main'],
-        wait_since: 0,
-        last_read_seq: 0,
-        last_nudged_seq: 0,
-        last_park_blocked_seq: 0,
-        last_post_seq: 0,
-        turn_count: 0,
-        tool_call_count: 0,
-        last_turn_at: null,
-        last_tool_call_at: null,
-        last_tool_name: null,
-        last_error: null,
-        killed: false,
-        created_at: nowIso,
-      }
-      membersChanged = true
-    }
-    if (!members.monitor) {
-      members.monitor = {
-        session_id: `${swarmId}__monitor-daemon`,
-        role: 'monitor',
-        system_builtin: true,
-        group: null,
-        parent: 'coordinator',
-        desired_state: 'RUNNING',
-        phase: 'RUNNING',
-        desired_provider: swarmMeta.default_provider,
-        desired_model: swarmMeta.coordinator_model,
-        applied_provider: swarmMeta.default_provider,
-        applied_model: swarmMeta.coordinator_model,
-        workspace_mode: 'inherit',
-        worktree_path: null,
-        base_commit: null,
-        wake_mode: 'mentions',
+        wake_kinds: null,
         channels: ['main'],
         wait_since: 0,
         last_read_seq: 0,
@@ -390,6 +418,15 @@ export class SwarmStore {
     return next
   }
 
+  /** Remove a never-started or rolled-back member entry from `members.json` so its name is not locked. */
+  removeMemberRecord(swarmId, name) {
+    const members = this.readMembers(swarmId)
+    if (!members[name]) return false
+    delete members[name]
+    this.writeMembers(swarmId, members)
+    return true
+  }
+
   readBoard(swarmId) {
     const { boardJsonl } = this.pathsOf(swarmId)
     if (!fs.existsSync(boardJsonl)) return []
@@ -411,15 +448,46 @@ export class SwarmStore {
     return records.length === 0 ? 0 : records[records.length - 1].seq
   }
 
+  /** Check whether an identical post (by `idempotency_key` or same agent/channel/kind/text within `windowMs`) already landed. */
+  findDuplicatePost(swarmId, entry, windowMs = 60_000) {
+    if (!entry || entry.type === 'control') return null
+    const records = this.readBoard(swarmId)
+    const nowMs = Date.now()
+    const channel = (entry.channel ?? 'main').replace(/^#/, '')
+    const kind = entry.kind ?? 'report'
+    const text = String(entry.text ?? '')
+    const idemKey = typeof entry.idempotency_key === 'string' && entry.idempotency_key.trim()
+      ? entry.idempotency_key.trim()
+      : null
+
+    for (let i = records.length - 1; i >= 0; i -= 1) {
+      const rec = records[i]
+      if (!rec || rec.type === 'control') continue
+      if (idemKey && rec.idempotency_key === idemKey) return rec
+      const recMs = typeof rec.created_ms === 'number' ? rec.created_ms : 0
+      if (recMs > 0 && nowMs - recMs > windowMs) break
+      if (
+        rec.agent === entry.agent
+        && (rec.channel || 'main') === channel
+        && (rec.kind || 'report') === kind
+        && rec.text === text
+      ) {
+        return rec
+      }
+    }
+    return null
+  }
+
   // #FUNC Append one post or channel control frame to `board.jsonl` with a monotonic `seq`.
   // #NOT  Does not allow duplicate seq numbers or multi-line unescaped JSON records.
   // #EDGE-IN Mentioning `@group` expands to all active members of that group → test_post_board_group_and_cursor
-  // #WHY  `last_post_seq` is updated on the author's member record here so `@monitor` can distinguish real replies from failed turns.
+  // #WHY  `last_post_seq` is updated on the author's member record here so the Watchdog can distinguish real replies from failed turns.
   appendBoardRecord(swarmId, entry) {
     const paths = this.pathsOf(swarmId)
     const records = this.readBoard(swarmId)
     const nextSeq = records.length === 0 ? 1 : records[records.length - 1].seq + 1
     const nowText = entry.time ?? formatTime()
+    const nowMs = typeof entry.created_ms === 'number' ? entry.created_ms : Date.now()
 
     let record
     if (entry.type === 'control') {
@@ -431,14 +499,24 @@ export class SwarmStore {
         channel: (entry.channel ?? '').replace(/^#/, ''),
         ...(entry.target ? { target: entry.target } : {}),
         time: nowText,
+        created_ms: nowMs,
       }
     } else {
-      const parsedTextMentions = extractMentionsFromText(entry.text ?? '')
       const explicitMentions = Array.isArray(entry.mentions)
         ? entry.mentions.map(m => String(m).replace(/^@/, '').trim()).filter(Boolean)
         : []
-      const allMemberMentions = [...new Set([...explicitMentions.filter(m => !m.startsWith('#')), ...parsedTextMentions.members])]
+      const explicitChannelMentions = Array.isArray(entry.channel_mentions)
+        ? entry.channel_mentions.map(c => String(c).replace(/^#/, '').trim()).filter(Boolean)
+        : []
+      const parsedTextMentions = entry.skip_prose_mention_extraction
+        ? { members: [], channels: [] }
+        : extractMentionsFromText(entry.text ?? '')
+      const allMemberMentions = [...new Set([
+        ...explicitMentions.filter(m => !m.startsWith('#')),
+        ...parsedTextMentions.members,
+      ])]
       const allChannelMentions = [...new Set([
+        ...explicitChannelMentions,
         ...explicitMentions.filter(m => m.startsWith('#')).map(m => m.slice(1)),
         ...parsedTextMentions.channels,
       ])]
@@ -447,6 +525,9 @@ export class SwarmStore {
         ? entry.refs.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1)
         : []
       const refs = [...new Set([...explicitRefs, ...parsedRefs])]
+      const supersedes = Array.isArray(entry.supersedes)
+        ? [...new Set(entry.supersedes.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1 && n < nextSeq))]
+        : []
 
       record = {
         seq: nextSeq,
@@ -457,8 +538,14 @@ export class SwarmStore {
         ...(allChannelMentions.length > 0 ? { channel_mentions: allChannelMentions } : {}),
         refs,
         kind: entry.kind ?? 'report',
+        ...(entry.verdict && VALID_VERDICTS.includes(entry.verdict) ? { verdict: entry.verdict } : {}),
+        ...(supersedes.length > 0 ? { supersedes } : {}),
+        ...(entry.escalate === true ? { escalate: true } : {}),
+        ...(entry.silent === true ? { silent: true } : {}),
+        ...(entry.idempotency_key ? { idempotency_key: String(entry.idempotency_key) } : {}),
         text: entry.text,
         time: nowText,
+        created_ms: nowMs,
         origin: entry.origin ?? `${entry.agent}@local`,
         actor_kind: entry.actor_kind ?? 'AGENT',
       }
@@ -497,6 +584,10 @@ export class SwarmStore {
     }
     const swarm = this.readSwarm(swarmId)
     const nowIso = new Date().toISOString()
+    const role = spec.role ?? 'worker'
+    const canBlockMerge = spec.can_block_merge !== undefined
+      ? Boolean(spec.can_block_merge)
+      : (role === 'verifier' || role === 'architect')
 
     // First post the public brief on board.jsonl so every member and verifier can cite its #seq
     const briefPost = this.appendBoardRecord(swarmId, {
@@ -504,6 +595,7 @@ export class SwarmStore {
       agent: spec.parent ?? 'coordinator',
       channel: spec.channel ?? 'main',
       mentions: [spec.name],
+      skip_prose_mention_extraction: true,
       kind: 'brief',
       text: `@${spec.name} ${spec.brief}`,
     })
@@ -511,7 +603,8 @@ export class SwarmStore {
     const updatedMembers = this.readMembers(swarmId)
     updatedMembers[spec.name] = {
       session_id: spec.session_id,
-      role: spec.role ?? 'worker',
+      role,
+      can_block_merge: canBlockMerge,
       group: spec.group ?? null,
       parent: spec.parent ?? 'coordinator',
       desired_state: 'RUNNING',
@@ -525,7 +618,9 @@ export class SwarmStore {
       base_commit: spec.base_commit ?? null,
       baseline_tree: spec.baseline_tree ?? null,
       fork_from: spec.fork_from ?? null,
-      wake_mode: spec.role === 'monitor' ? 'mentions' : 'working',
+      spawned_live_agent: spec.spawned_live_agent === true,
+      wake_mode: 'working',
+      wake_kinds: null,
       channels: ['main'],
       brief_seq: briefPost.seq,
       wait_since: briefPost.seq,
@@ -558,6 +653,51 @@ export class SwarmStore {
 
     this.writeMembers(swarmId, updatedMembers)
     return { member: updatedMembers[spec.name], briefPost }
+  }
+
+  /**
+   * Compute unresolved `[REJECT]` merge-gate blocks from active members with `can_block_merge === true`.
+   * A reviewer's rejection stays active until that reviewer posts `verdict: "approve"` (or a review
+   * containing `[VERDICT: ALL PASS]` / `[APPROVE]`) or until the rejection post is superseded.
+   */
+  computeActiveRejections(swarmId) {
+    const records = this.readBoard(swarmId)
+    const members = this.readMembers(swarmId)
+    const supersededBy = computeSupersededMap(records)
+    const byReviewer = new Map()
+
+    for (const rec of records) {
+      if (!rec || rec.type === 'control') continue
+      const author = members[rec.agent]
+      if (!author || author.killed) continue
+      const canBlock = author.can_block_merge === true
+        || author.role === 'verifier'
+        || author.role === 'architect'
+      if (!canBlock) continue
+
+      const text = String(rec.text ?? '')
+      const isReject = rec.verdict === 'reject'
+        || (rec.kind === 'review' && /\[REJECT\b/i.test(text) && rec.verdict !== 'approve')
+      const isApprove = rec.verdict === 'approve'
+        || (rec.kind === 'review' && (/\[VERDICT:\s*ALL\s*PASS\]/i.test(text) || /\[APPROVE\b/i.test(text)) && !/\[REJECT\b/i.test(text))
+
+      if (isReject) {
+        if (!supersededBy.has(rec.seq)) {
+          byReviewer.set(rec.agent, {
+            seq: rec.seq,
+            reviewer: rec.agent,
+            role: author.role,
+            mentions: rec.mentions ?? [],
+            time: rec.time,
+            summary: text.slice(0, 180),
+          })
+        }
+      } else if (isApprove) {
+        byReviewer.delete(rec.agent)
+      }
+    }
+
+    return [...byReviewer.values()]
   }
 
   // #FUNC Write `plan.json` (static Overview state) while enforcing the 64 KB zero-trust size limit.
@@ -606,12 +746,13 @@ export class SwarmStore {
   }
 
   /**
-   * Resolve which active members should be notified/woken by a board post,
+   * Resolve which active members are addressed by a board post,
    * accounting for `@name`, `@group`, `@#channel` (via event-sourced `replayChannelsAt`),
    * `@all`, and members with `wake_mode === 'anything'`.
    */
   resolveTargetsForPost(swarmId, postRecord) {
     if (!postRecord || postRecord.type === 'control') return []
+    if (postRecord.silent === true) return []
     const members = this.readMembers(swarmId)
     const records = this.readBoard(swarmId)
     const channelState = replayChannelsAt(records, postRecord.seq)
@@ -648,7 +789,7 @@ export class SwarmStore {
         targets.add(name)
         continue
       }
-      // 4. @all (wakes everyone except monitor, unless monitor was explicitly @mentioned)
+      // 4. @all (wakes everyone except monitor)
       if (isAll && member.role !== 'monitor') {
         targets.add(name)
         continue
@@ -663,22 +804,56 @@ export class SwarmStore {
   }
 
   /**
+   * Partition addressed members into `wakeTargets` vs `silentTargets` using each recipient's
+   * `wake_kinds` filter (from `swarm_wait`) and the post's `escalate` flag.
+   */
+  resolveWakeRoutingForPost(swarmId, postRecord) {
+    if (!postRecord || postRecord.type === 'control' || postRecord.silent === true) {
+      return { wakeTargets: [], silentTargets: [] }
+    }
+    const members = this.readMembers(swarmId)
+    const candidates = this.resolveTargetsForPost(swarmId, postRecord)
+    const postKind = postRecord.kind || 'report'
+    const forceEscalate = postRecord.escalate === true
+
+    const wakeTargets = []
+    const silentTargets = []
+
+    for (const name of candidates) {
+      const m = members[name]
+      if (!m || m.killed) continue
+      const filterKinds = Array.isArray(m.wake_kinds) && m.wake_kinds.length > 0 ? m.wake_kinds : null
+      if (!forceEscalate && filterKinds && !filterKinds.includes(postKind)) {
+        silentTargets.push(name)
+      } else {
+        wakeTargets.push(name)
+      }
+    }
+    return { wakeTargets, silentTargets }
+  }
+
+  /**
    * Query unread posts for `memberName` after `sinceSeq` on subscribed channels
-   * (or any post that directly `@mentioned` the member).
+   * (or any post that directly `@mentioned` the member), optionally filtering by `wakeKinds`.
    */
   queryVisiblePosts(swarmId, memberName, sinceSeq = 0, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
     const member = members[memberName]
     const mentionsOnly = options.mentionsOnly === true
+    const wakeKinds = Array.isArray(options.wakeKinds) && options.wakeKinds.length > 0
+      ? options.wakeKinds
+      : null
 
     const results = []
     for (const rec of records) {
       if (!rec || rec.seq <= sinceSeq) continue
       if (rec.type === 'control') {
-        if (!mentionsOnly) results.push(rec)
+        if (!mentionsOnly && !wakeKinds) results.push(rec)
         continue
       }
+      if (mentionsOnly && rec.silent === true) continue
+
       const channelState = replayChannelsAt(records, rec.seq)
       const subs = new Set(channelState.subscriptionsOf(memberName))
       const directMention = (rec.mentions ?? []).includes(memberName)
@@ -686,11 +861,15 @@ export class SwarmStore {
         || ((rec.mentions ?? []).includes('all') && member?.role !== 'monitor')
         || ((rec.channel_mentions ?? []).some(ch => ch !== 'main' && subs.has(ch)))
 
-      if (mentionsOnly) {
-        if (directMention && rec.agent !== memberName) results.push(rec)
-      } else if (directMention || subs.has(rec.channel || 'main')) {
-        results.push(rec)
+      const visible = mentionsOnly
+        ? (directMention && rec.agent !== memberName)
+        : (directMention || subs.has(rec.channel || 'main'))
+      if (!visible) continue
+
+      if (wakeKinds && rec.escalate !== true && !wakeKinds.includes(rec.kind || 'report')) {
+        continue
       }
+      results.push(rec)
     }
     return results
   }

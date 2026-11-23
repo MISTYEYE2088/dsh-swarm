@@ -1,15 +1,20 @@
 // Strict tool-argument format & semantic validators for glm5.3 / deepseek4.1f.
 //
-// Because self-hosted glm5.3 and deepseek4.1f frequently slip on complex tool
-// conventions (omitting @mentions, reusing killed member names, passing a high
-// `since` to `swarm_wait` to skip unread posts, or writing briefs without
-// explicit ownership boundaries), every validator returns a self-healing error
-// message with a copy-pasteable JSON example whenever a check fails.
+// Returns self-healing error messages with copy-pasteable JSON examples whenever
+// validation fails, while avoiding false rejections on prose `@future` mentions
+// and supporting silent logging (`silent: true`), `wake_kinds` noise filtering,
+// `verdict`, and `supersedes`.
 
-import { PLAN_MAX_BYTES, extractMentionsFromText } from './store.js'
+import {
+  PLAN_MAX_BYTES,
+  VALID_POST_KINDS,
+  VALID_VERDICTS,
+  extractMentionsFromText,
+} from './store.js'
 
 export const MEMBER_NAME_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
-export const RESERVED_NAMES = new Set(['all', 'main', 'coordinator', 'system', 'user'])
+export const RESERVED_NAMES = new Set(['all', 'main', 'coordinator', 'system', 'user', 'monitor'])
+export const VALID_ROLES = Object.freeze(['worker', 'architect', 'verifier'])
 export const REQUIRED_BRIEF_TAGS = ['[OWNERSHIP]', '[FORBIDDEN]', '[DONE_CRITERIA]']
 export const MAX_POST_CHARS = 4_000
 export const MIN_POST_CHARS = 6
@@ -29,14 +34,15 @@ function formatError(toolName, reason, exampleObj, extraNote = '') {
 
 /** Suggest the next available numbered member name when a killed/taken name is requested. */
 export function suggestNextMemberName(requestedName, existingMembers = {}) {
-  const base = String(requestedName || 'worker')
+  const cleaned = String(requestedName || 'worker')
     .toLowerCase()
     .replace(/[^a-z0-9-]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .replace(/-\d+$/, '') || 'worker'
-  if (!existingMembers[base] && !RESERVED_NAMES.has(base)) return base
-  let index = 2
-  while (existingMembers[`${base}-${index}`]) index += 1
+    .replace(/^-+|-+$/g, '') || 'worker'
+  const numMatch = /^(.*)-(\d+)$/.exec(cleaned)
+  const base = (numMatch ? numMatch[1] : cleaned) || 'worker'
+  if (!numMatch && !existingMembers[base] && !RESERVED_NAMES.has(base)) return base
+  let index = numMatch ? Number(numMatch[2]) + 1 : 2
+  while (existingMembers[`${base}-${index}`] || RESERVED_NAMES.has(`${base}-${index}`)) index += 1
   return `${base}-${index}`
 }
 
@@ -65,7 +71,7 @@ export function validateSwarmInit(args) {
   if (!Number.isInteger(limit) || limit < 1) {
     return formatError(
       'swarm_init',
-      `concurrency_limit (${args.concurrency_limit}) 非法！并发限制必须是 >= 1 的正整数（例如 2、4、6、8 等）。`,
+      `concurrency_limit (${args.concurrency_limit}) 非法！并发槽位数（模型在途请求并发上限，≠ 成员人数上限）必须是 >= 1 的正整数（例如 2、4、6、8 等）。`,
       {
         title,
         concurrency_limit: 4,
@@ -73,11 +79,15 @@ export function validateSwarmInit(args) {
       },
     )
   }
+  const projectRoot = typeof args.project_root === 'string' && args.project_root.trim()
+    ? args.project_root.trim()
+    : null
   return {
     ok: true,
     value: {
       title,
       concurrency_limit: limit,
+      project_root: projectRoot,
       default_provider: typeof args.default_provider === 'string' && args.default_provider.trim()
         ? args.default_provider.trim()
         : 'inherit',
@@ -92,23 +102,23 @@ export function validateSwarmInit(args) {
 }
 
 // dup-ok: dedicated per-tool validator for swarm_add
-// #FUNC Validate `swarm_add` parameters, enforcing Phase-0 concurrency confirmation, tombstone name lock, and 3-part brief tags.
-// #NOT  Does not allow adding workers before `concurrency_confirmed` is true, nor reusing a `killed` member's name, and does not cap active worker parallelism.
-// #EDGE-IN Calling `swarm_add` before `concurrency_confirmed` returns a gate error telling Coordinator to ask the user first → test_validator_blocks_add_before_concurrency_confirmed
-// #EDGE-IN Reusing a killed member name `monitor` suggests `monitor-2` → test_validator_rejects_killed_name_reuse
-// #EDGE-IN A brief missing `[OWNERSHIP]` or `[FORBIDDEN]` or `[DONE_CRITERIA]` is rejected → test_validator_enforces_three_part_brief
-// #WHY  `REQUIRED_BRIEF_TAGS` forces `glm5.3` and `deepseek4.1f` to state explicit file boundaries so parallel workers do not overwrite each other's files.
+// #FUNC Validate `swarm_add` parameters, enforcing Phase-0 concurrency confirmation, tombstone name lock, role presets (`worker`/`architect`/`verifier`), and 3-part brief tags.
+// #NOT  Does not allow adding workers before `concurrency_confirmed` is true, nor spawning an LLM `monitor` member (Watchdog is deterministic and built-in), nor reusing a `killed` member's name.
+// #EDGE-IN Calling `swarm_add` before `concurrency_confirmed` returns a gate error telling Coordinator to confirm parameters first → test_validator_blocks_add_before_concurrency_confirmed
+// #EDGE-IN Reusing a killed member name `arch-1` suggests `arch-2` → test_validator_rejects_killed_name_reuse
+// #EDGE-IN A brief missing `[OWNERSHIP]` or `[FORBIDDEN]` or `[DONE_CRITERIA]` echoes recognized vs missing tags → test_validator_enforces_three_part_brief
+// #WHY  `REQUIRED_BRIEF_TAGS` forces explicit ownership boundaries while echoing recognized tags eliminates blind trial-and-error.
 export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerName = 'coordinator') {
   if (!swarmMeta) {
     return formatError(
       'swarm_add',
-      'Swarm 状态不存在或已被清理（swarm.json 未找到）！请先调用 ask_user_question 询问并发数与模型偏好，再调用 swarm_init 初始化黑板。',
+      'Swarm 状态不存在或已被清理（swarm.json 未找到）！请先确认目标与并发槽位，再调用 swarm_init 初始化黑板。',
       {
         title: '任务标题',
         concurrency_limit: 4,
         default_model: 'inherit',
       },
-      '请先调用 ask_user_question 再调用 swarm_init！',
+      '请先调用 swarm_init 初始化黑板！',
     )
   }
   if (swarmMeta.status === 'DONE') {
@@ -125,22 +135,44 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   if (swarmMeta.concurrency_confirmed !== true) {
     return formatError(
       'swarm_add',
-      '尚未向用户确认本次 Swarm 的并发限额！在调用 swarm_add 建人之前，你必须先调用 ask_user_question 询问用户需要几个并发（如 4 / 6 / 自定义），然后调用 swarm_init 设置 concurrency_limit。',
+      '尚未确认本次 Swarm 的模型并发槽位数！若用户未在指令中指定并发数，请先调用 ask_user_question 询问，再调用 swarm_init 设置 concurrency_limit（若用户已明确给出，直接调用 swarm_init 即可）。',
       {
         title: '任务标题',
         concurrency_limit: 4,
         default_model: 'inherit',
       },
-      '请先调用 ask_user_question 再调用 swarm_init！',
+      '请先调用 swarm_init 设置 concurrency_limit！',
     )
   }
 
   if (!args || typeof args !== 'object') {
     return formatError('swarm_add', '参数必须是 JSON 对象。', {
-      name: 'worker-1',
+      name: 'impl-core',
       role: 'worker',
       workspace: 'inherit',
-      brief: '[OWNERSHIP] src/foo.js\n[FORBIDDEN] src/bar.js\n[DONE_CRITERIA] 跑通单测并汇报 @verifier',
+      brief: '[OWNERSHIP]\nsrc/core/\n[FORBIDDEN]\nsrc/ui/\n[DONE_CRITERIA]\n冒烟自测通过并 @qa-gate 验收',
+    })
+  }
+
+  const role = args.role ?? 'worker'
+  if (role === 'monitor') {
+    return formatError(
+      'swarm_add',
+      '无需手动创建 role="monitor" 成员！看门狗（Watchdog）已作为零 Token 确定性后台服务自动运行（每 30 秒独立探活僵尸/报错成员）。请使用 "worker"、"architect" 或 "verifier"。',
+      {
+        name: args.name && args.name !== 'monitor' ? args.name : 'qa-gate',
+        role: 'verifier',
+        workspace: 'inherit',
+        brief: '[OWNERSHIP]\ntests/\n[FORBIDDEN]\nsrc/\n[DONE_CRITERIA]\n独立推导断言并交付实测报告',
+      },
+    )
+  }
+  if (!VALID_ROLES.includes(role)) {
+    return formatError('swarm_add', `role "${role}" 非法，只能是 "worker" | "architect" | "verifier"。`, {
+      name: args.name || 'impl-core',
+      role: 'worker',
+      workspace: 'inherit',
+      brief: '[OWNERSHIP]\n...\n[FORBIDDEN]\n...\n[DONE_CRITERIA]\n...',
     })
   }
 
@@ -149,12 +181,12 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   if (!rawName || rawName.length > 24 || !MEMBER_NAME_REGEX.test(rawName) || RESERVED_NAMES.has(rawName)) {
     return formatError(
       'swarm_add',
-      `成员名 "${rawName}" 不合法！名字必须为 1~24 位小写字母、数字和连字符（^[a-z0-9]+(?:-[a-z0-9]+)*$），且不能是 all/main/coordinator。`,
+      `成员名 "${rawName}" 不合法！名字必须为 1~24 位小写字母、数字和连字符（^[a-z0-9]+(?:-[a-z0-9]+)*$），且不能是保留名 (${[...RESERVED_NAMES].join('/')})。`,
       {
         name: suggested,
-        role: args.role || 'worker',
+        role,
         workspace: args.workspace || 'inherit',
-        brief: '[OWNERSHIP] 负责模块\n[FORBIDDEN] 禁止触碰模块\n[DONE_CRITERIA] 完成标准与核验命令',
+        brief: '[OWNERSHIP]\n负责模块\n[FORBIDDEN]\n禁止触碰模块\n[DONE_CRITERIA]\n完成标准与核验命令',
       },
     )
   }
@@ -164,9 +196,9 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
     return formatError('swarm_add', `批量创建数量 n (${args.n}) 必须为 >= 1 的正整数。`, {
       name: rawName,
       n: 2,
-      role: 'worker',
+      role,
       workspace: 'inherit',
-      brief: '[OWNERSHIP] ...\n[FORBIDDEN] ...\n[DONE_CRITERIA] ...',
+      brief: '[OWNERSHIP]\n...\n[FORBIDDEN]\n...\n[DONE_CRITERIA]\n...',
     })
   }
 
@@ -181,26 +213,16 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       return formatError(
         'swarm_add',
         wasKilled
-          ? `成员名 "${candidate}" 已被销毁（killed），按 Swarm 规范名字永久锁死不可复用！请顺延使用新名字 "${nextSuggestion}"。`
+          ? `成员名 "${candidate}" 曾产出过历史记录并已退役（killed），为保持黑板因果溯源名字永久锁死！请顺延使用新名字 "${nextSuggestion}"。`
           : `成员名 "${candidate}" 已存在！请使用新名字 "${nextSuggestion}"。`,
         {
           name: nextSuggestion,
-          role: args.role || 'worker',
+          role,
           workspace: args.workspace || 'inherit',
-          brief: args.brief || '[OWNERSHIP] ...\n[FORBIDDEN] ...\n[DONE_CRITERIA] ...',
+          brief: args.brief || '[OWNERSHIP]\n...\n[FORBIDDEN]\n...\n[DONE_CRITERIA]\n...',
         },
       )
     }
-  }
-
-  const role = args.role ?? 'worker'
-  if (!['worker', 'verifier', 'monitor'].includes(role)) {
-    return formatError('swarm_add', `role "${role}" 非法，只能是 "worker" | "verifier" | "monitor"。`, {
-      name: rawName,
-      role: 'worker',
-      workspace: 'inherit',
-      brief: '[OWNERSHIP] ...\n[FORBIDDEN] ...\n[DONE_CRITERIA] ...',
-    })
   }
 
   const workspace = args.workspace ?? 'inherit'
@@ -209,25 +231,37 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       name: rawName,
       role,
       workspace: 'inherit',
-      brief: '[OWNERSHIP] ...\n[FORBIDDEN] ...\n[DONE_CRITERIA] ...',
+      brief: '[OWNERSHIP]\n...\n[FORBIDDEN]\n...\n[DONE_CRITERIA]\n...',
     })
   }
 
   const brief = typeof args.brief === 'string' ? args.brief.trim() : ''
-  if (role !== 'monitor') {
-    const missingTags = REQUIRED_BRIEF_TAGS.filter(tag => !brief.includes(tag))
-    if (missingTags.length > 0) {
-      return formatError(
-        'swarm_add',
-        `brief 缺少必填结构标签：${missingTags.join(', ')}！为了防止 glm5.3 / deepseek4.1f 越界改文件，brief 必须显式包含 [OWNERSHIP]、[FORBIDDEN] 和 [DONE_CRITERIA] 三段。`,
-        {
-          name: rawName,
-          role,
-          workspace,
-          brief: '[OWNERSHIP]\n负责排查或修改的具体文件路径\n[FORBIDDEN]\n严禁修改或触碰的文件路径\n[DONE_CRITERIA]\n完成标准、实测验证命令以及完成后需 @verifier 或 @coordinator',
-        },
-      )
+  const foundTags = REQUIRED_BRIEF_TAGS.filter(tag => brief.includes(tag))
+  const missingTags = REQUIRED_BRIEF_TAGS.filter(tag => !brief.includes(tag))
+  if (missingTags.length > 0) {
+    const proseHints = []
+    if (missingTags.includes('[FORBIDDEN]') && /(?:禁区|禁止|forbidden)/i.test(brief)) {
+      proseHints.push('检测到正文中写了类似“禁区/禁止”的描述，但缺少字面量标签 `[FORBIDDEN]`')
     }
+    if (missingTags.includes('[OWNERSHIP]') && /(?:负责|归属|ownership)/i.test(brief)) {
+      proseHints.push('检测到正文中写了类似“负责/归属”的描述，但缺少字面量标签 `[OWNERSHIP]`')
+    }
+    if (missingTags.includes('[DONE_CRITERIA]') && /(?:完成标准|验收|done)/i.test(brief)) {
+      proseHints.push('检测到正文中写了类似“完成标准/验收”的描述，但缺少字面量标签 `[DONE_CRITERIA]`')
+    }
+    const foundSummary = foundTags.length > 0 ? `已识别标签: ${foundTags.join(', ')}` : '已识别标签: 无'
+    const hintLine = proseHints.length > 0 ? `诊断提示：${proseHints.join('；')}。请将缺失标签以字面量独立成行补齐。` : ''
+    return formatError(
+      'swarm_add',
+      `brief 缺少必填字面量标签：${missingTags.join(', ')}（${foundSummary}）。brief 必须同时包含 [OWNERSHIP]、[FORBIDDEN] 和 [DONE_CRITERIA] 三个独立标签段。`,
+      {
+        name: rawName,
+        role,
+        workspace,
+        brief: '[OWNERSHIP]\n负责模块与交付物\n[FORBIDDEN]\n严禁越界触碰的模块/行为\n[DONE_CRITERIA]\n完成标准、核验命令以及交接对象',
+      },
+      hintLine,
+    )
   }
 
   if (args.fork !== undefined && args.fork !== null && args.fork !== '') {
@@ -247,6 +281,10 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
     }
   }
 
+  const canBlockMerge = args.can_block_merge !== undefined
+    ? Boolean(args.can_block_merge)
+    : (role === 'verifier' || role === 'architect')
+
   return {
     ok: true,
     value: {
@@ -254,8 +292,9 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       targetNames,
       group: count > 1 ? rawName : (args.group ?? null),
       role,
+      can_block_merge: canBlockMerge,
       workspace,
-      brief: brief || '[OWNERSHIP] 全局黑板死锁巡检\n[FORBIDDEN] 严禁修改任何业务文件\n[DONE_CRITERIA] 发现静默死锁时发 [stall] 提醒',
+      brief,
       provider: args.provider ?? swarmMeta.default_provider ?? 'inherit',
       model: args.model ?? swarmMeta.default_model ?? 'inherit',
       fork: args.fork ? String(args.fork).trim() : null,
@@ -265,12 +304,12 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   }
 }
 
-// #FUNC Validate `post_board` calls, blocking `@#main` broadcasts, oversized log dumps, dead targets, and unaddressed worker reports.
-// #NOT  Does not let a worker or verifier post a report that forgets to `@mention` anyone.
-// #EDGE-IN Worker posting without any `@mention` is rejected with the active roster list → test_validator_rejects_unaddressed_worker_post
+// #FUNC Validate `post_board` calls, supporting silent logging, strict explicit `mentions` checks, prose `@future` tolerance, `verdict`, and `supersedes`.
+// #NOT  Does not let an unaddressed worker post silently unless `silent: true` is explicitly passed; never lets `@#main` broadcast or dead targets pass.
+// #EDGE-IN Worker posting without any `@mention` and without `silent: true` is rejected with the active roster list → test_validator_rejects_unaddressed_worker_post
 // #EDGE-IN Posting `@#main` is rejected to prevent disguised `@all` storms → test_validator_rejects_channel_main_broadcast
 // #EDGE-IN Mentioning a `killed` member is rejected with active alternatives → test_validator_rejects_mentioning_killed_member
-// #WHY  `MAX_POST_CHARS` and mandatory `@mention` checks stop `glm5.3`/`deepseek4.1f` from pasting 20KB logs or posting orphan reports that stall the swarm.
+// #WHY  Strict validation on explicit `mentions` catches typos while tolerating unregistered prose `@tokens` prevents false rejections when mentioning future wave roles.
 export function validatePostBoard(args, existingMembers = {}, callerName = 'coordinator', activeChannels = ['main']) {
   if (!args || typeof args !== 'object') {
     return formatError('post_board', '参数必须是 JSON 对象。', {
@@ -300,10 +339,35 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     )
   }
 
+  const kind = args.kind !== undefined ? String(args.kind).trim() : 'report'
+  if (!VALID_POST_KINDS.includes(kind)) {
+    return formatError('post_board', `kind "${kind}" 非法，只能是 ${VALID_POST_KINDS.join(' | ')}。`, {
+      mentions: args.mentions || ['coordinator'],
+      kind: 'report',
+      text,
+    })
+  }
+
+  const verdict = args.verdict !== undefined && args.verdict !== null && args.verdict !== ''
+    ? String(args.verdict).trim()
+    : null
+  if (verdict && !VALID_VERDICTS.includes(verdict)) {
+    return formatError('post_board', `verdict "${verdict}" 非法，只能是 ${VALID_VERDICTS.join(' | ')}。`, {
+      mentions: args.mentions || ['coordinator'],
+      kind: 'review',
+      verdict: 'reject',
+      text,
+    })
+  }
+
+  const silent = args.silent === true
+  const escalate = args.escalate === true
+
   const extracted = extractMentionsFromText(text)
   const explicitMentions = Array.isArray(args.mentions)
     ? args.mentions.map(m => String(m).replace(/^@/, '').trim()).filter(Boolean)
     : []
+  const explicitMemberTargets = explicitMentions.filter(m => !m.startsWith('#'))
 
   const channelMentions = new Set([
     ...extracted.channels,
@@ -320,13 +384,8 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     )
   }
 
-  const memberMentions = [...new Set([
-    ...explicitMentions.filter(m => !m.startsWith('#')),
-    ...extracted.members,
-  ])]
-
   const activeNames = Object.entries(existingMembers)
-    .filter(([, m]) => !m.killed)
+    .filter(([, m]) => !m.killed && !m.system_builtin)
     .map(([name]) => name)
   const activeGroups = new Set(
     Object.values(existingMembers)
@@ -334,20 +393,27 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
       .map(m => m.group),
   )
 
-  for (const target of memberMentions) {
-    if (target === 'all' || target === 'monitor') continue
-    if (activeGroups.has(target)) continue
+  const rosterSummary = activeNames
+    .map(n => {
+      const rm = existingMembers[n]
+      return `@${n}[${rm?.role ?? 'worker'}, post=#${rm?.last_post_seq ?? 0}${rm?.last_tool_call_at ? ', active=' + rm.last_tool_call_at : ''}]`
+    })
+    .join(', ')
+
+  const resolvedMentions = new Set()
+  const ignoredProseMentions = []
+
+  // 1. Strict validation on explicit `args.mentions`
+  for (const target of explicitMemberTargets) {
+    if (target === 'all' || target === 'monitor' || activeGroups.has(target)) {
+      resolvedMentions.add(target)
+      continue
+    }
     const record = existingMembers[target]
-    const rosterSummary = activeNames
-      .map(n => {
-        const rm = existingMembers[n]
-        return `@${n}[${rm?.role ?? 'worker'}, post=#${rm?.last_post_seq ?? 0}${rm?.last_tool_call_at ? ', active=' + rm.last_tool_call_at : ''}]`
-      })
-      .join(', ')
     if (!record) {
       return formatError(
         'post_board',
-        `点名的目标 "@${target}" 不存在！当前存活可点名成员为：${rosterSummary}`,
+        `mentions 中指定的目标 "@${target}" 不存在！当前存活可点名成员为：${rosterSummary}（以及系统看门狗 @monitor）`,
         {
           mentions: ['coordinator'],
           text: `@coordinator ${text}`,
@@ -364,27 +430,55 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
         },
       )
     }
+    resolvedMentions.add(target)
   }
 
+  // 2. Prose `@tokens`: match live members/groups, reject killed members, tolerate unregistered prose mentions
+  for (const target of extracted.members) {
+    if (resolvedMentions.has(target)) continue
+    if (target === 'all' || target === 'monitor' || activeGroups.has(target)) {
+      resolvedMentions.add(target)
+      continue
+    }
+    const record = existingMembers[target]
+    if (record && record.killed) {
+      return formatError(
+        'post_board',
+        `正文中点名的目标 "@${target}" 已经被销毁（killed），无法接收消息！当前存活可点名成员为：${rosterSummary}`,
+        {
+          mentions: ['coordinator'],
+          text: text.replaceAll(`@${target}`, '@coordinator'),
+        },
+      )
+    }
+    if (record && !record.killed) {
+      resolvedMentions.add(target)
+    } else {
+      ignoredProseMentions.push(target)
+    }
+  }
+
+  const memberMentions = silent ? [] : [...resolvedMentions]
   const caller = existingMembers[callerName]
   const callerRole = caller?.role ?? 'worker'
-  const isDonePost = text.includes('[done]') || args.kind === 'done'
+  const isDonePost = text.includes('[done]') || kind === 'done'
   if (
-    (callerRole === 'worker' || callerRole === 'verifier' || callerRole === 'monitor')
+    !silent
+    && (callerRole === 'worker' || callerRole === 'architect' || callerRole === 'verifier')
     && memberMentions.length === 0
     && channelMentions.size === 0
     && !isDonePost
   ) {
     const defaultTarget = callerRole === 'worker'
-      ? (activeNames.find(n => existingMembers[n]?.role === 'verifier') ?? 'coordinator')
+      ? (activeNames.find(n => existingMembers[n]?.role === 'verifier' || existingMembers[n]?.role === 'architect') ?? 'coordinator')
       : 'coordinator'
     return formatError(
       'post_board',
-      `你是 ${callerRole} (@${callerName})，发帖必须至少点名一个接收人（例如 @${defaultTarget}），否则没有任何人会被唤醒接手你的结果！`,
+      `你是 ${callerRole} (@${callerName})，发帖必须至少点名一个接收人（例如 @${defaultTarget}），或显式传入 "silent": true 表示仅沉默记账不唤醒任何人！`,
       {
         mentions: [defaultTarget],
         refs: args.refs || [caller?.last_read_seq || 1],
-        kind: args.kind || 'report',
+        kind,
         text: `@${defaultTarget} ${text}`,
       },
     )
@@ -405,24 +499,42 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     )
   }
 
+  const supersedes = Array.isArray(args.supersedes)
+    ? [...new Set(args.supersedes.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1))]
+    : []
+
+  const idempotencyKey = typeof args.idempotency_key === 'string' && args.idempotency_key.trim()
+    ? args.idempotency_key.trim()
+    : null
+  const overrideReason = typeof args.override_reason === 'string' && args.override_reason.trim()
+    ? args.override_reason.trim()
+    : null
+
   return {
     ok: true,
     value: {
       channel,
       mentions: memberMentions,
-      channel_mentions: [...channelMentions],
+      channel_mentions: silent ? [] : [...channelMentions],
+      ignored_prose_mentions: ignoredProseMentions,
       refs: Array.isArray(args.refs) ? args.refs.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1) : [],
-      kind: args.kind ?? 'report',
+      kind,
+      verdict,
+      supersedes,
+      escalate,
+      silent,
+      idempotency_key: idempotencyKey,
+      override_reason: overrideReason,
       text,
     },
   }
 }
 
 // dup-ok: dedicated per-tool validator for swarm_wait
-// #FUNC Validate `swarm_wait`, ensuring `since` never skips beyond the caller's actual `last_read_seq`.
+// #FUNC Validate `swarm_wait`, ensuring `since` never skips beyond the caller's actual `last_read_seq` and validating optional `wake_kinds`.
 // #NOT  Does not permit passing the board's head seq if the caller has not read up to that floor via `read_board`.
 // #EDGE-IN Passing `since: 15` when `last_read_seq` is `10` fails loudly and instructs the agent to call `read_board` → test_validator_blocks_wait_ahead_of_last_read_seq
-// #WHY  Checking `since > lastReadSeq` guarantees a busy agent never sleeps over posts that arrived while it was running tools.
+// #WHY  Checking `since > lastReadSeq` guarantees a busy agent never sleeps over posts that arrived while it was running tools, while `wake_kinds` enables structured noise filtering.
 export function validateSwarmWait(args, memberRecord, headSeq) {
   if (!args || typeof args !== 'object' || args.since === undefined) {
     const lastRead = memberRecord?.last_read_seq ?? 0
@@ -449,11 +561,38 @@ export function validateSwarmWait(args, memberRecord, headSeq) {
       },
     )
   }
+
+  let wakeKinds = null
+  if (args.wake_kinds !== undefined && args.wake_kinds !== null) {
+    if (!Array.isArray(args.wake_kinds)) {
+      return formatError('swarm_wait', 'wake_kinds 必须是字符串数组（如 ["alert", "question", "decision", "review"]）。', {
+        since,
+        mentions_only: true,
+        wake_kinds: ['alert', 'question', 'decision', 'review'],
+      })
+    }
+    const normalized = [...new Set(args.wake_kinds.map(k => String(k).trim()).filter(Boolean))]
+    const invalid = normalized.filter(k => !VALID_POST_KINDS.includes(k))
+    if (invalid.length > 0) {
+      return formatError(
+        'swarm_wait',
+        `wake_kinds 包含非法类型: ${invalid.join(', ')}。可选值: ${VALID_POST_KINDS.join(', ')}。`,
+        {
+          since,
+          mentions_only: true,
+          wake_kinds: ['alert', 'question', 'decision', 'review'],
+        },
+      )
+    }
+    wakeKinds = normalized.length > 0 ? normalized : null
+  }
+
   return {
     ok: true,
     value: {
       since,
       mentions_only: args.mentions_only !== false,
+      wake_kinds: wakeKinds,
     },
   }
 }
@@ -465,8 +604,8 @@ export function validateSwarmPlan(args) {
     return formatError('swarm_plan', '参数必须是 JSON 对象。', {
       goal: '总体目标描述',
       current_wave: 1,
-      waves: [{ wave: 1, title: '第 1 波：只读排查', status: 'IN_PROGRESS', members: ['worker-1', 'verifier'] }],
-      tracks: [{ name: '子方向 A', owner: 'worker-1', status: 'IN_PROGRESS', evidence_seqs: [1] }],
+      waves: [{ wave: 1, title: '第 1 波：接口协商与实现', status: 'IN_PROGRESS', members: ['arch-lead', 'impl-core', 'qa-gate'] }],
+      tracks: [{ name: '子方向 A', owner: 'impl-core', status: 'IN_PROGRESS', evidence_seqs: [1] }],
     })
   }
   const goal = typeof args.goal === 'string' ? args.goal.trim() : ''

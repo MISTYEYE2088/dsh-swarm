@@ -21,7 +21,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.2.0'
+    var VERSION = '0.3.0'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -414,10 +414,37 @@ window.__ModuleLoader__.load({
       var members = snap && Array.isArray(snap.members) ? snap.members : []
       var plan = snap && snap.plan ? snap.plan : null
       var screenshots = snap && Array.isArray(snap.screenshots) ? snap.screenshots : []
+      var activeRejections = snap && Array.isArray(snap.activeRejections) ? snap.activeRejections : []
+      var watchdog = snap && snap.watchdog ? snap.watchdog : null
+      var memberSummary = snap && snap.memberSummary ? snap.memberSummary : null
 
       return React.createElement(
         'div',
         { style: { display: 'flex', flexDirection: 'column', gap: '10px' } },
+        // Active Merge-Gate Rejections warning banner
+        activeRejections.length > 0
+          ? React.createElement(
+              'div',
+              {
+                style: {
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  border: '1px solid var(--dsw-alias-state-danger-primary, #ef4444)',
+                  background: 'var(--dsw-alias-bg-layer-2)',
+                  fontSize: '12px',
+                  color: 'var(--dsw-alias-state-danger-primary, #ef4444)',
+                },
+              },
+              React.createElement('div', { style: { fontWeight: 600, marginBottom: '4px' } }, '⛔ 合并/结案门禁已触发 (' + activeRejections.length + ' 条未解除 [REJECT])'),
+              activeRejections.map(function (rej, idx) {
+                return React.createElement(
+                  'div',
+                  { key: idx, style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginTop: '2px' } },
+                  '#' + rej.seq + ' @' + rej.reviewer + ' (' + rej.role + ')',
+                )
+              }),
+            )
+          : null,
         // Concurrency control card
         React.createElement(
           'div',
@@ -435,14 +462,28 @@ window.__ModuleLoader__.load({
             React.createElement(
               'span',
               { style: { fontWeight: 600, fontSize: '12px', color: 'var(--dsw-alias-label-primary)' } },
-              '并发调度池 (Concurrency Gate)',
+              'LLM 在途并发槽位 (≠ 成员人数)',
             ),
             React.createElement(
               'span',
               { style: { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)', fontVariantNumeric: 'tabular-nums' } },
-              '活跃 ' + conc.active + ' / 上限 ' + conc.effectiveLimit + ' · 排队 ' + conc.queued,
+              '在途 ' + conc.active + ' / 上限 ' + conc.effectiveLimit + ' · 排队 ' + conc.queued,
             ),
           ),
+          watchdog
+            ? React.createElement(
+                'div',
+                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-tertiary)', marginBottom: '6px' } },
+                'Watchdog: ' + (watchdog.active ? '● 运行中' : '休眠') + ' (探活 ' + watchdog.healthIntervalSec + 's · 告警 ' + watchdog.alertsPosted + ')',
+              )
+            : null,
+          memberSummary
+            ? React.createElement(
+                'div',
+                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '6px', fontVariantNumeric: 'tabular-nums' } },
+                '成员状态: ' + memberSummary.working + ' working · ' + memberSummary.waiting + ' waiting · ' + memberSummary.starting + ' starting' + (memberSummary.zombie > 0 ? ' · ⚠️ ' + memberSummary.zombie + ' zombie' : '') + (memberSummary.error > 0 ? ' · ❌ ' + memberSummary.error + ' error' : ''),
+              )
+            : null,
           React.createElement(
             'div',
             { style: { display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' } },
@@ -797,7 +838,13 @@ window.__ModuleLoader__.load({
             )
           : filtered.map(function (p) {
               var isHighlighted = ui.highlightedSeq === p.seq
+              var isSuperseded = Boolean(p.superseded_by)
               var tokens = tokenizeBoardText(p.text)
+              var badges = []
+              if (p.verdict) badges.push('verdict:' + p.verdict)
+              if (p.escalate) badges.push('ESCALATE')
+              if (p.silent) badges.push('SILENT')
+              if (isSuperseded) badges.push('已作废→#' + p.superseded_by)
               return React.createElement(
                 'div',
                 {
@@ -809,6 +856,7 @@ window.__ModuleLoader__.load({
                       ? '1px solid var(--dsw-alias-state-business-primary)'
                       : '0.5px solid var(--dsw-alias-border-l2)',
                     background: isHighlighted ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-2)',
+                    opacity: isSuperseded ? 0.65 : 1,
                     fontSize: '12px',
                   },
                 },
@@ -827,7 +875,7 @@ window.__ModuleLoader__.load({
                   React.createElement(
                     'span',
                     { style: { fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } },
-                    '#' + p.seq + ' · @' + p.agent + (p.channel && p.channel !== 'main' ? ' [#' + p.channel + ']' : '') + (p.kind ? ' (' + p.kind + ')' : ''),
+                    '#' + p.seq + ' · @' + p.agent + (p.channel && p.channel !== 'main' ? ' [#' + p.channel + ']' : '') + (p.kind ? ' (' + p.kind + ')' : '') + (badges.length > 0 ? ' [' + badges.join(' | ') + ']' : ''),
                   ),
                   React.createElement('span', { style: { color: 'var(--dsw-alias-label-tertiary)' } }, p.time || ''),
                 ),
