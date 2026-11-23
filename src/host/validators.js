@@ -41,15 +41,15 @@ export function suggestNextMemberName(requestedName, existingMembers = {}) {
 }
 
 // dup-ok: dedicated per-tool validator for swarm_init
-// #FUNC Validate `swarm_init` parameters including the polite 1..6 concurrency ceiling.
-// #NOT  Does not permit concurrency limits above 6 on the shared internal model cluster.
-// #EDGE-IN Concurrency limit 12 is rejected with a cap reminder → test_validator_rejects_excessive_concurrency
-// #WHY  `concurrency_limit` is clamped/checked against `[1, 6]` so a hallucinating model cannot hog the company's shared vLLM cluster.
+// #FUNC Validate `swarm_init` parameters without imposing an artificial upper ceiling on concurrency.
+// #NOT  Does not permit non-positive or non-integer concurrency limits (`limit < 1`).
+// #EDGE-IN Non-positive concurrency limit 0 is rejected while high parallelism (e.g. 16) is allowed → test_validator_rejects_excessive_concurrency
+// #WHY  `concurrency_limit` is validated as a positive integer (`limit < 1`) without an arbitrary upper cap so the user can choose any parallelism level.
 export function validateSwarmInit(args) {
   if (!args || typeof args !== 'object') {
     return formatError('swarm_init', '参数必须是 JSON 对象。', {
       title: '模块排查与修复',
-      concurrency_limit: 2,
+      concurrency_limit: 4,
       default_model: 'deepseek4.1f',
     })
   }
@@ -57,18 +57,18 @@ export function validateSwarmInit(args) {
   if (title.length < 2 || title.length > 120) {
     return formatError('swarm_init', 'title 必须是非空字符串（2~120 字符）。', {
       title: 'PDF 导出乱码排查与修复',
-      concurrency_limit: 2,
+      concurrency_limit: 4,
       default_model: 'deepseek4.1f',
     })
   }
   const limit = Number(args.concurrency_limit)
-  if (!Number.isInteger(limit) || limit < 1 || limit > 6) {
+  if (!Number.isInteger(limit) || limit < 1) {
     return formatError(
       'swarm_init',
-      `concurrency_limit (${args.concurrency_limit}) 非法！公司内部模型并发限制必须在 1 ~ 6 的整数之间（推荐 2 ~ 4）。`,
+      `concurrency_limit (${args.concurrency_limit}) 非法！并发限制必须是 >= 1 的正整数（例如 2、4、6、8 等）。`,
       {
         title,
-        concurrency_limit: 2,
+        concurrency_limit: 4,
         default_model: args.default_model || 'deepseek4.1f',
       },
     )
@@ -93,7 +93,7 @@ export function validateSwarmInit(args) {
 
 // dup-ok: dedicated per-tool validator for swarm_add
 // #FUNC Validate `swarm_add` parameters, enforcing Phase-0 concurrency confirmation, tombstone name lock, and 3-part brief tags.
-// #NOT  Does not allow adding workers before `concurrency_confirmed` is true, nor reusing a `killed` member's name.
+// #NOT  Does not allow adding workers before `concurrency_confirmed` is true, nor reusing a `killed` member's name, and does not cap active worker parallelism.
 // #EDGE-IN Calling `swarm_add` before `concurrency_confirmed` returns a gate error telling Coordinator to ask the user first → test_validator_blocks_add_before_concurrency_confirmed
 // #EDGE-IN Reusing a killed member name `monitor` suggests `monitor-2` → test_validator_rejects_killed_name_reuse
 // #EDGE-IN A brief missing `[OWNERSHIP]` or `[FORBIDDEN]` or `[DONE_CRITERIA]` is rejected → test_validator_enforces_three_part_brief
@@ -102,10 +102,10 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   if (!swarmMeta || swarmMeta.concurrency_confirmed !== true) {
     return formatError(
       'swarm_add',
-      '尚未向用户确认本次 Swarm 的并发限额！在调用 swarm_add 建人之前，你必须先调用 ask_user_question 询问用户需要几个并发（2 / 3 / 4 / 6），然后调用 swarm_init 设置 concurrency_limit。',
+      '尚未向用户确认本次 Swarm 的并发限额！在调用 swarm_add 建人之前，你必须先调用 ask_user_question 询问用户需要几个并发（如 4 / 6 / 自定义），然后调用 swarm_init 设置 concurrency_limit。',
       {
         title: '任务标题',
-        concurrency_limit: 2,
+        concurrency_limit: 4,
         default_model: 'deepseek4.1f',
       },
       '请先调用 ask_user_question 再调用 swarm_init！',
@@ -137,8 +137,8 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   }
 
   const count = args.n !== undefined ? Number(args.n) : (Array.isArray(args.tasks) && args.tasks.length > 0 ? args.tasks.length : 1)
-  if (!Number.isInteger(count) || count < 1 || count > 6) {
-    return formatError('swarm_add', `批量创建数量 n (${args.n}) 必须为 1~6 之间的整数。`, {
+  if (!Number.isInteger(count) || count < 1) {
+    return formatError('swarm_add', `批量创建数量 n (${args.n}) 必须为 >= 1 的正整数。`, {
       name: rawName,
       n: 2,
       role: 'worker',
@@ -188,19 +188,6 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       workspace: 'inherit',
       brief: '[OWNERSHIP] ...\n[FORBIDDEN] ...\n[DONE_CRITERIA] ...',
     })
-  }
-
-  // Gentle cluster protection: active non-monitor workers cannot wildly exceed concurrency_limit + 2
-  const activeWorkers = Object.values(existingMembers).filter(
-    m => !m.killed && m.role !== 'coordinator' && m.role !== 'monitor',
-  ).length
-  const maxAllowedActive = (swarmMeta.concurrency_limit ?? 2) + 2
-  if (role !== 'monitor' && activeWorkers + targetNames.length > maxAllowedActive) {
-    return formatError(
-      'swarm_add',
-      `当前活跃干活成员已有 ${activeWorkers} 人，加上本次 ${targetNames.length} 人将超过温和并发预算上限 (${maxAllowedActive} 人，当前 concurrency_limit=${swarmMeta.concurrency_limit})！请采用“分波次”策略：等当前波次成员做完并调用 swarm_kill 清场后，再开启下一波成员。`,
-      { name: '先调用 swarm_wait 等待当前波完成，或 swarm_kill 清理已完成成员' },
-    )
   }
 
   const brief = typeof args.brief === 'string' ? args.brief.trim() : ''
@@ -406,7 +393,7 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
 // #FUNC Validate `swarm_wait`, ensuring `since` never skips beyond the caller's actual `last_read_seq`.
 // #NOT  Does not permit passing the board's head seq if the caller has not read up to that floor via `read_board`.
 // #EDGE-IN Passing `since: 15` when `last_read_seq` is `10` fails loudly and instructs the agent to call `read_board` → test_validator_blocks_wait_ahead_of_last_read_seq
-// #WHY  Enforcing `since <= lastReadSeq` guarantees a busy agent never sleeps over posts that arrived while it was running tools.
+// #WHY  Checking `since > lastReadSeq` guarantees a busy agent never sleeps over posts that arrived while it was running tools.
 export function validateSwarmWait(args, memberRecord, headSeq) {
   if (!args || typeof args !== 'object' || args.since === undefined) {
     const lastRead = memberRecord?.last_read_seq ?? 0

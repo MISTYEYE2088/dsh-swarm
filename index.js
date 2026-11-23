@@ -43,8 +43,7 @@ export const name = 'dsh-swarm'
 
 const DEFAULTS = Object.freeze({
   enabled: true,
-  defaultConcurrency: 2,
-  maxConcurrency: 6,
+  defaultConcurrency: 4,
   minSpacingMs: 200,
   agingThresholdMs: 15_000,
   monitorIntervalMs: 180_000,
@@ -61,8 +60,181 @@ function mergeSettings(raw) {
   for (const key of Object.keys(DEFAULTS)) {
     if (src[key] !== undefined) merged[key] = src[key]
   }
-  merged.defaultConcurrency = Math.min(6, Math.max(1, Number(merged.defaultConcurrency) || 2))
+  merged.defaultConcurrency = Math.max(1, Math.floor(Number(merged.defaultConcurrency) || 4))
   return merged
+}
+
+/** Read and parse a JSON HTTP request body (up to 128 KB). */
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let total = 0
+    req.on('data', (chunk) => {
+      total += chunk.length
+      if (total > 131_072) {
+        reject(new Error('Payload too large'))
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8').trim()
+        resolve(raw ? JSON.parse(raw) : {})
+      } catch (err) {
+        reject(err)
+      }
+    })
+    req.on('error', reject)
+  })
+}
+
+/** Write a JSON HTTP response with status code. */
+function sendJson(res, statusCode, payload) {
+  const body = JSON.stringify(payload)
+  res.statusCode = statusCode
+  res.setHeader('content-type', 'application/json; charset=utf-8')
+  res.setHeader('cache-control', 'no-store')
+  res.end(body)
+}
+
+/** Build the `/api/dsh-swarm/state` and `/api/dsh-swarm/action` route definitions for `webServer`. */
+export function createSwarmWebRoutes(runtime) {
+  const { store, concurrencyGate } = runtime
+  return [
+    {
+      kind: 'exact',
+      path: '/api/dsh-swarm/state',
+      async handler(req, res) {
+        try {
+          const url = new URL(req.url ?? '/api/dsh-swarm/state', 'http://127.0.0.1')
+          const requestedSessionId = url.searchParams.get('sessionId') || ''
+          const explicitSwarmId = url.searchParams.get('swarmId') || ''
+          const resolvedSwarmId = (explicitSwarmId && store.exists(explicitSwarmId))
+            ? explicitSwarmId
+            : store.resolveSwarmId(requestedSessionId)
+          const snapshot = resolvedSwarmId
+            ? buildSwarmProjectionSnapshot({ store, swarmId: resolvedSwarmId, runtime })
+            : null
+          sendJson(res, 200, {
+            ok: true,
+            requestedSessionId,
+            resolvedSwarmId,
+            swarms: store.listSwarms(),
+            concurrency: concurrencyGate.snapshot(),
+            snapshot,
+          })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: '/api/dsh-swarm/action',
+      async handler(req, res) {
+        if (req.method !== 'POST') {
+          sendJson(res, 405, { ok: false, error: 'Method Not Allowed' })
+          return
+        }
+        try {
+          const body = await readJsonBody(req)
+          const action = String(body.action ?? '').trim()
+          const targetSwarmId = (body.swarmId && store.exists(body.swarmId))
+            ? String(body.swarmId)
+            : (store.resolveSwarmId(body.sessionId || body.swarmId) || String(body.swarmId || body.sessionId || 'default-swarm'))
+
+          if (action === 'init') {
+            const limit = Math.max(1, Math.floor(Number(body.concurrency_limit) || runtime.settings.defaultConcurrency))
+            const title = String(body.title || 'Swarm Task').trim().slice(0, 120) || 'Swarm Task'
+            await store.withLock(targetSwarmId, async () => {
+              store.initSwarm(targetSwarmId, {
+                title,
+                concurrency_limit: limit,
+                concurrency_confirmed: true,
+              })
+            })
+            concurrencyGate.setLimit(limit)
+            runtime.ensureMonitorDaemon(targetSwarmId)
+            runtime.notifyProjectionChanged(targetSwarmId)
+            sendJson(res, 200, {
+              ok: true,
+              resolvedSwarmId: targetSwarmId,
+              snapshot: buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime }),
+            })
+            return
+          }
+
+          if (action === 'concurrency') {
+            const limit = Math.floor(Number(body.limit))
+            if (!Number.isInteger(limit) || limit < 1) {
+              sendJson(res, 400, { ok: false, error: '并发数必须是 >= 1 的正整数' })
+              return
+            }
+            concurrencyGate.setLimit(limit)
+            if (store.exists(targetSwarmId)) {
+              await store.withLock(targetSwarmId, async () => {
+                store.updateSwarm(targetSwarmId, {
+                  concurrency_limit: limit,
+                  concurrency_confirmed: true,
+                })
+              })
+              runtime.notifyProjectionChanged(targetSwarmId)
+            }
+            sendJson(res, 200, {
+              ok: true,
+              concurrency: concurrencyGate.snapshot(),
+              snapshot: store.exists(targetSwarmId)
+                ? buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime })
+                : null,
+            })
+            return
+          }
+
+          if (action === 'post') {
+            const text = String(body.text ?? '').trim()
+            if (!text) {
+              sendJson(res, 400, { ok: false, error: '消息内容不能为空' })
+              return
+            }
+            const result = await store.withLock(targetSwarmId, async () => {
+              if (!store.exists(targetSwarmId)) {
+                store.initSwarm(targetSwarmId, {
+                  title: 'Swarm Task',
+                  concurrency_limit: runtime.settings.defaultConcurrency,
+                  concurrency_confirmed: true,
+                })
+              }
+              const postRecord = store.appendBoardRecord(targetSwarmId, {
+                type: 'post',
+                agent: String(body.agent || 'coordinator'),
+                actor_kind: 'HUMAN',
+                channel: String(body.channel || 'main'),
+                kind: String(body.kind || 'decision'),
+                mentions: Array.isArray(body.mentions) ? body.mentions : undefined,
+                text,
+              })
+              const woken = await runtime.dispatchPostWakeups(targetSwarmId, postRecord)
+              runtime.notifyBoardActivity(targetSwarmId, postRecord)
+              runtime.notifyProjectionChanged(targetSwarmId)
+              return { postRecord, woken }
+            })
+            sendJson(res, 200, {
+              ok: true,
+              post: result.postRecord,
+              woken: result.woken,
+              snapshot: buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime }),
+            })
+            return
+          }
+
+          sendJson(res, 400, { ok: false, error: `Unknown action "${action}"` })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
+        }
+      },
+    },
+  ]
 }
 
 // dup-ok: strict inner host mount implementation paired with boot-safe outer apply()
@@ -467,23 +639,93 @@ export function applyWith(ctx, config, deps = {}) {
   })
   if (typeof disposeTurnStopping === 'function') disposers.push(disposeTurnStopping)
 
-  // 5. Register model tools via `ctx.get('tools')` (never access `ctx.tools` directly without `inject`)
-  const toolsSvc = typeof ctx.get === 'function' ? ctx.get('tools') : undefined
-  if (toolsSvc && typeof toolsSvc.register === 'function') {
+  // 5. Register model tools via `ctx.inject(['tools'], ...)` (with fallback to `ctx.get('tools')` for mock test contexts)
+  let toolsRegistered = false
+  function mountToolsOn(svc) {
+    if (toolsRegistered || !svc || typeof svc.register !== 'function') return []
+    toolsRegistered = true
+    const list = []
     for (const tool of createSwarmTools(runtime)) {
-      const disp = toolsSvc.register(tool)
-      if (typeof disp === 'function') disposers.push(disp)
+      const disp = svc.register(tool)
+      if (typeof disp === 'function') {
+        disposers.push(disp)
+        list.push(disp)
+      }
     }
+    return list
+  }
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['tools'], (toolsCtx) => {
+      const svc = toolsCtx.tools ?? toolsCtx.get?.('tools')
+      const list = mountToolsOn(svc)
+      toolsCtx.effect?.(() => () => {
+        for (const d of list) {
+          try { d() } catch {}
+        }
+      }, 'dsh-swarm: tools')
+    })
+  }
+  if (!toolsRegistered && typeof ctx.get === 'function') {
+    mountToolsOn(ctx.get('tools'))
   }
 
-  // 6. Register `/swarm` human command via `ctx.get('commands')`
-  const commandsSvc = typeof ctx.get === 'function' ? ctx.get('commands') : undefined
-  if (commandsSvc && typeof commandsSvc.register === 'function') {
-    const disp = commandsSvc.register(createSwarmCommand(runtime))
+  // 6. Register `/swarm` human command via `ctx.inject(['commands'], ...)` so it mounts into the `/` slash menu
+  let commandRegistered = false
+  function mountCommandOn(svc) {
+    if (commandRegistered || !svc || typeof svc.register !== 'function') return null
+    commandRegistered = true
+    const disp = svc.register(createSwarmCommand(runtime))
     if (typeof disp === 'function') disposers.push(disp)
+    return disp
+  }
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['commands'], (cmdCtx) => {
+      const svc = cmdCtx.commands ?? cmdCtx.get?.('commands')
+      const disp = mountCommandOn(svc)
+      cmdCtx.effect?.(() => () => {
+        try { if (typeof disp === 'function') disp() } catch {}
+      }, 'dsh-swarm: command')
+    })
+  }
+  if (!commandRegistered && typeof ctx.get === 'function') {
+    mountCommandOn(ctx.get('commands'))
   }
 
-  // 7. Register `swarm` SessionProjection via `ctx.get('sessionProjections')`
+  // 7. Register HTTP routes `/api/dsh-swarm/state` & `/api/dsh-swarm/action` on `webServer` for the Rightbar UI
+  let webRoutesRegistered = false
+  function mountWebRoutesOn(svc) {
+    if (webRoutesRegistered || !svc || typeof svc.register !== 'function') return []
+    webRoutesRegistered = true
+    const list = []
+    for (const route of createSwarmWebRoutes(runtime)) {
+      try {
+        const disp = svc.register(route)
+        if (typeof disp === 'function') {
+          disposers.push(disp)
+          list.push(disp)
+        }
+      } catch (err) {
+        warn('webServer route registration skipped: ' + String(err))
+      }
+    }
+    return list
+  }
+  if (typeof ctx.inject === 'function') {
+    ctx.inject(['webServer'], (webCtx) => {
+      const svc = webCtx.webServer ?? webCtx.get?.('webServer')
+      const list = mountWebRoutesOn(svc)
+      webCtx.effect?.(() => () => {
+        for (const d of list) {
+          try { d() } catch {}
+        }
+      }, 'dsh-swarm: webServer routes')
+    })
+  }
+  if (!webRoutesRegistered && typeof ctx.get === 'function') {
+    mountWebRoutesOn(ctx.get('webServer'))
+  }
+
+  // 8. Register `swarm` SessionProjection via `ctx.get('sessionProjections')` (optional fallback)
   const projectionsSvc = (ctx.root && typeof ctx.root.get === 'function' ? ctx.root.get('sessionProjections') : undefined)
     ?? (typeof ctx.get === 'function' ? ctx.get('sessionProjections') : undefined)
   if (projectionsSvc && typeof projectionsSvc.register === 'function') {

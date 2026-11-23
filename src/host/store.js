@@ -188,7 +188,58 @@ export class SwarmStore {
   }
 
   exists(swarmId) {
-    return fs.existsSync(this.pathsOf(swarmId).swarmJson)
+    return Boolean(swarmId) && fs.existsSync(this.pathsOf(swarmId).swarmJson)
+  }
+
+  /** List all initialized Swarms on disk sorted by most recently updated first. */
+  listSwarms() {
+    if (!fs.existsSync(this.baseDir)) return []
+    let entries = []
+    try {
+      entries = fs.readdirSync(this.baseDir, { withFileTypes: true })
+    } catch {
+      return []
+    }
+    const items = []
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      const swarmJsonPath = path.join(this.baseDir, entry.name, 'swarm.json')
+      if (!fs.existsSync(swarmJsonPath)) continue
+      try {
+        const meta = readJsonSync(swarmJsonPath, null)
+        if (!meta) continue
+        items.push({
+          swarm_id: meta.swarm_id ?? entry.name,
+          title: meta.title ?? entry.name,
+          status: meta.status ?? 'ACTIVE',
+          concurrency_limit: meta.concurrency_limit ?? 4,
+          updated_at: meta.updated_at ?? meta.created_at ?? '',
+        })
+      } catch {
+        // Ignore unreadable directory entry
+      }
+    }
+    items.sort((a, b) => String(b.updated_at).localeCompare(String(a.updated_at)))
+    return items
+  }
+
+  /** Resolve a root sessionId or child worker sessionId (`<swarmId>__<member>`) to an existing swarmId on disk. */
+  resolveSwarmId(sessionId) {
+    if (sessionId && this.exists(sessionId)) return sessionId
+    if (typeof sessionId === 'string' && sessionId.includes('__')) {
+      const prefix = sessionId.split('__')[0]
+      if (prefix && this.exists(prefix)) return prefix
+    }
+    const all = this.listSwarms()
+    if (sessionId) {
+      for (const item of all) {
+        const members = this.readMembers(item.swarm_id)
+        for (const m of Object.values(members)) {
+          if (m && m.session_id === sessionId) return item.swarm_id
+        }
+      }
+    }
+    return all.length > 0 ? all[0].swarm_id : null
   }
 
   // #FUNC Initialize the 3 core blackboard files (`swarm.json`, `board.jsonl`, `members.json`) for a coordinator session.

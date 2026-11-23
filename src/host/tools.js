@@ -126,11 +126,11 @@ export function createSwarmTools(runtime) {
 
   const swarmInitTool = makeTool({
     name: 'swarm_init',
-    description: 'Initialize or update the Swarm blackboard (swarm.json, board.jsonl, members.json) AFTER asking the user for concurrency_limit (1..6) via ask_user_question.',
+    description: 'Initialize or update the Swarm blackboard (swarm.json, board.jsonl, members.json) AFTER asking the user for concurrency_limit via ask_user_question.',
     parameters: {
       properties: {
         title: { type: 'string', description: 'Short descriptive title for this Swarm.' },
-        concurrency_limit: { type: 'integer', description: 'User-confirmed concurrency limit between 1 and 6 (recommended 2..4).' },
+        concurrency_limit: { type: 'integer', description: 'User-confirmed positive integer concurrency limit (e.g. 2, 4, 6, 8, ...).' },
         default_provider: { type: 'string', description: 'LLM provider route name (default: internal).' },
         default_model: { type: 'string', description: 'Default worker/verifier model (e.g. deepseek4.1f or glm5.3).' },
         coordinator_model: { type: 'string', description: 'Coordinator/monitor model (e.g. glm5.3).' },
@@ -230,7 +230,7 @@ export function createSwarmTools(runtime) {
         provider: { type: 'string', description: 'Optional provider override.' },
         model: { type: 'string', description: 'Optional model override (e.g. deepseek4.1f or glm5.3).' },
         fork: { type: 'string', description: 'Optional existing member name (or "coordinator") to fork conversation history from.' },
-        n: { type: 'integer', description: 'Optional homogeneous copy count (1..6).' },
+        n: { type: 'integer', description: 'Optional homogeneous copy count (positive integer >= 1).' },
         tasks: { type: 'array', items: { type: 'string' }, description: 'Optional per-shard task slices (<name>-1..k).' },
       },
       required: ['name', 'brief'],
@@ -735,8 +735,13 @@ export function createSwarmTools(runtime) {
 /** Register the human `/swarm` slash command on `ctx.commands`. */
 export function createSwarmCommand(runtime) {
   return {
+    definitionId: 'dsh-swarm',
     name: 'swarm',
-    description: 'Start or control a multi-agent Swarm (/swarm <task>, /swarm status, /swarm concurrency <1..6>, /swarm pause, /swarm resume)',
+    description: 'Start or inspect a multi-agent blackboard Swarm (/swarm <task>, /swarm status, /swarm concurrency <N>)',
+    input: {
+      hint: '[<task> | status | board | concurrency <N>]',
+      attachments: true,
+    },
     async handler(invocation) {
       const raw = String(invocation.rawInput ?? '').trim()
       const agent = invocation.agent
@@ -745,11 +750,11 @@ export function createSwarmCommand(runtime) {
 
       if (raw === 'status' || raw === 'board') {
         if (!store.exists(swarmId)) {
-          return { kind: 'message', text: '当前会话尚未启动 Swarm。使用 `/swarm <任务描述>` 启动。' }
+          return { kind: 'success', text: '当前会话尚未启动 Swarm。使用 `/swarm <任务描述>` 启动。' }
         }
         const snap = buildSwarmProjectionSnapshot({ store, swarmId, runtime })
         return {
-          kind: 'message',
+          kind: 'success',
           text: `🐝 Swarm "${snap.swarm.title}" (${snap.swarm.status}) · 并发槽: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} (排队 ${snap.concurrency.queued}) · 黑板共 #${snap.headSeq} 帖`,
         }
       }
@@ -757,15 +762,15 @@ export function createSwarmCommand(runtime) {
       const concMatch = /^concurrency\s+(\d+)$/i.exec(raw)
       if (concMatch) {
         const limit = Number(concMatch[1])
-        if (limit < 1 || limit > 6) {
-          return { kind: 'error', message: '并发上限必须在 1 ~ 6 之间。' }
+        if (!Number.isInteger(limit) || limit < 1) {
+          return { kind: 'error', text: '并发上限必须是 >= 1 的正整数。' }
         }
         concurrencyGate.setLimit(limit)
         if (store.exists(swarmId)) {
           store.updateSwarm(swarmId, { concurrency_limit: limit, concurrency_confirmed: true })
           runtime.notifyProjectionChanged(swarmId)
         }
-        return { kind: 'message', text: `[dsh-swarm] 已将并发上限热更新为 ${limit}。` }
+        return { kind: 'success', text: `[dsh-swarm] 已将并发上限热更新为 ${limit}。` }
       }
 
       // Default: `/swarm <task>` — initialize unconfirmed swarm entry and steer the Coordinator
@@ -782,11 +787,11 @@ export function createSwarmCommand(runtime) {
       runtime.activateCoordinatorMode(agent)
       runtime.notifyProjectionChanged(swarmId)
 
-      const kickoffPrompt = `[USER INVOKED /swarm]\n任务目标：${raw || '请协助完成任务'}\n\n【强制第一步】在调用 swarm_add 创建任何成员之前，你必须立即先调用 ask_user_question 询问用户本次允许占用的并发槽位数（2 / 3 / 4 / 6）及模型选择（glm5.3 / deepseek4.1f），拿到用户回答后再调用 swarm_init -> swarm_plan -> swarm_add！`
+      const kickoffPrompt = `[USER INVOKED /swarm]\n任务目标：${raw || '请协助完成任务'}\n\n【强制第一步】在调用 swarm_add 创建任何成员之前，你必须立即先调用 ask_user_question 询问用户本次希望使用的并发槽位数（如 4 / 6 / 2 / 8 或自定义）及模型选择（glm5.3 / deepseek4.1f），拿到用户回答后再调用 swarm_init -> swarm_plan -> swarm_add！`
       agent.steer(buildSwarmSystemMessage(kickoffPrompt, 'Swarm kickoff'))
       return {
-        kind: 'message',
-        text: `🐝 已进入 Swarm 协调模式，正在向您确认本次任务的并发预算...`,
+        kind: 'success',
+        text: `🐝 已进入 Swarm 协调模式，正在向您确认本次任务的并发数与模型分配...`,
       }
     },
   }

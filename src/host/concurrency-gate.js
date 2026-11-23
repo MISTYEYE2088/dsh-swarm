@@ -38,7 +38,7 @@ export function isConcurrencyFailure(failureOrError) {
 
 export class ConcurrencyGate {
   constructor(options = {}) {
-    this.configuredLimit = Math.min(6, Math.max(1, Number(options.limit ?? 2)))
+    this.configuredLimit = Math.max(1, Math.floor(Number(options.limit ?? 4) || 4))
     this.effectiveLimit = this.configuredLimit
     this.minSpacingMs = Math.max(0, Number(options.minSpacingMs ?? 200))
     this.agingThresholdMs = Math.max(1_000, Number(options.agingThresholdMs ?? 15_000))
@@ -58,10 +58,10 @@ export class ConcurrencyGate {
   }
 
   setLimit(newLimit) {
-    const clamped = Math.min(6, Math.max(1, Number(newLimit)))
-    if (!Number.isInteger(clamped)) return this.configuredLimit
-    this.configuredLimit = clamped
-    this.effectiveLimit = clamped
+    const parsed = Math.floor(Number(newLimit))
+    if (!Number.isInteger(parsed) || parsed < 1) return this.configuredLimit
+    this.configuredLimit = parsed
+    this.effectiveLimit = parsed
     this._pump()
     this.onChange(this.snapshot())
     return this.configuredLimit

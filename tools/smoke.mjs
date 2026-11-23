@@ -179,9 +179,28 @@ async function test_plan_json_size_guard() {
 // ---------------------------------------------------------------------------
 
 async function test_validator_rejects_excessive_concurrency() {
-  const res = validateSwarmInit({ title: 'Big swarm', concurrency_limit: 12 })
-  assert.equal(res.ok, false)
-  assert.match(res.error, /1 ~ 6/)
+  const bad = validateSwarmInit({ title: 'Invalid swarm', concurrency_limit: 0 })
+  assert.equal(bad.ok, false)
+  assert.match(bad.error, /正整数/)
+
+  // High concurrency and large worker batch (no artificial cap) must succeed
+  const high = validateSwarmInit({ title: 'Large parallel swarm', concurrency_limit: 16 })
+  assert.equal(high.ok, true)
+  assert.equal(high.value.concurrency_limit, 16)
+
+  const batchAdd = validateSwarmAdd(
+    {
+      name: 'shard',
+      n: 10,
+      role: 'worker',
+      workspace: 'inherit',
+      brief: '[OWNERSHIP] src/\n[FORBIDDEN] dist/\n[DONE_CRITERIA] test',
+    },
+    { concurrency_confirmed: true, concurrency_limit: 2 },
+    {},
+  )
+  assert.equal(batchAdd.ok, true)
+  assert.equal(batchAdd.value.targetNames.length, 10)
 }
 
 async function test_validator_blocks_add_before_concurrency_confirmed() {
@@ -697,6 +716,7 @@ async function test_host_sibling_event_liveness() {
   assert.match(liveness.stepSummary, /read_file/)
 }
 
+// dup-ok: smoke test exercising client.js tokenizeBoardText
 async function test_client_tokenize_board_text() {
   const code = fs.readFileSync(CLIENT_PATH, 'utf8')
   let loadedMod = null
@@ -761,6 +781,115 @@ async function test_client_graph_replay_aggregation() {
   assert.equal(w2v.count, 2)
 }
 
+async function test_slash_command_and_rightbar_registration() {
+  // 1. Verify Host ctx.inject(['commands']) and ctx.inject(['webServer'])
+  let registeredCmd = null
+  const registeredRoutes = new Map()
+  const injectCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get() { return undefined },
+    inject(deps, cb) {
+      if (deps.includes('commands')) {
+        cb({
+          commands: {
+            register(def) { registeredCmd = def; return () => {} },
+          },
+          effect(fn) { return fn() },
+        })
+      } else if (deps.includes('webServer')) {
+        cb({
+          webServer: {
+            register(route) { registeredRoutes.set(route.path, route); return () => {} },
+          },
+          effect(fn) { return fn() },
+        })
+      }
+    },
+  }
+  applyWith(injectCtx, { swarmDir: path.join(tempRoot, 'e2e-cmd-web') }, { log: () => {}, warn: () => {} })
+
+  assert.ok(registeredCmd, '/swarm command must register via ctx.inject(["commands"])')
+  assert.equal(registeredCmd.name, 'swarm')
+  assert.ok(registeredCmd.input && typeof registeredCmd.input.hint === 'string', '/swarm must declare input.hint for the / menu')
+
+  const steered = []
+  const cmdRes = await registeredCmd.handler({
+    rawInput: 'Fix PDF font export',
+    attachments: [],
+    agent: { id: 'sess-slash-1', steer(m) { steered.push(m) } },
+  })
+  assert.equal(cmdRes.kind, 'success')
+  assert.equal(steered.length, 1)
+
+  const concRes = await registeredCmd.handler({
+    rawInput: 'concurrency 12',
+    attachments: [],
+    agent: { id: 'sess-slash-1', steer() {} },
+  })
+  assert.equal(concRes.kind, 'success')
+  assert.match(concRes.text, /12/)
+
+  assert.equal(registeredRoutes.has('/api/dsh-swarm/state'), true)
+  assert.equal(registeredRoutes.has('/api/dsh-swarm/action'), true)
+
+  // 2. Verify Client rightbar tab registration into sidebarRightTabs & sidebar.right.pane.tab
+  const code = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedMod = null
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load(spec) { loadedMod = spec.factory(() => null) },
+      },
+    },
+    console: { info() {}, warn() {}, error() {} },
+    Set,
+    Map,
+    Object,
+    Array,
+    Number,
+    String,
+    Symbol,
+  }
+  vm.runInNewContext(code, sandbox, { filename: 'client.js' })
+
+  const registeredTabs = []
+  const registeredSlotKeys = []
+  const mockSlots = {
+    inject(_name, fn) { return fn() },
+    register(spec) {
+      registeredSlotKeys.push(`${spec.name}:${spec.key || spec.id}`)
+      return () => {}
+    },
+  }
+  const mockClientCtx = {
+    slots: mockSlots,
+    effect(fn) { return fn() },
+    inject(deps, cb) {
+      if (deps.includes('sidebarRightTabs')) {
+        cb({
+          slots: mockSlots,
+          sidebarRightTabs: {
+            register(def) { registeredTabs.push(def); return () => {} },
+          },
+          sidebarRight: {
+            openTab() {},
+            isExpanded() { return false },
+            active() { return null },
+          },
+          effect(fn) { return fn() },
+        })
+      }
+    },
+  }
+  loadedMod.apply(mockClientCtx)
+  assert.equal(registeredTabs.length, 1)
+  assert.equal(registeredTabs[0].id, 'dsh-swarm')
+  assert.equal(registeredTabs[0].kind, 'swarm')
+  assert.equal(registeredSlotKeys.includes('sidebar.right.pane.tab:dsh-swarm'), true)
+  assert.equal(registeredSlotKeys.includes('sidebar.right.pane.tab.title:dsh-swarm'), true)
+}
+
 // Run all tests
 try {
   await runTest('test_atomic_store_roundtrip', test_atomic_store_roundtrip)
@@ -793,6 +922,7 @@ try {
   await runTest('test_host_sibling_event_liveness', test_host_sibling_event_liveness)
   await runTest('test_client_tokenize_board_text', test_client_tokenize_board_text)
   await runTest('test_client_graph_replay_aggregation', test_client_graph_replay_aggregation)
+  await runTest('test_slash_command_and_rightbar_registration', test_slash_command_and_rightbar_registration)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
 }
