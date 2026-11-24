@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 (2026-11-23)
+
+- **Compact Wire Format & Token Optimization (~60–75% Smaller Recurring Injections)**:
+  - Compacted all high-frequency Swarm messages injected into agent contexts: board wakeups (`[board] #N @agent (kind): title -> read_board(since=M)`), `post_board` receipts (`OK #N (read=#N, woke:@x)`), `read_board` headers/rows (`HH:MM:SS` only, omit default `#main` & repetitive UUID), `swarm_wait` receipts (`PARKED #N (mentions)`), `swarm_status` roster lines (~63% shorter per member), Stop-Hook notices, and tool parameter schemas.
+  - Extended Stop-Hook unparked-member protection to cover `lore_master` alongside `worker`, `architect`, and `verifier`.
+
 ## 0.3.8 (2026-11-23)
 
 - **New Role Preset: `lore_master` (Read-Only Domain & Spec Oracle)**:

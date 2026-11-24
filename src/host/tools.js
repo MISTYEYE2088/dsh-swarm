@@ -298,7 +298,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.8', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.9', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -656,24 +656,24 @@ export function createSwarmTools(runtime) {
 
   const postBoardTool = makeTool({
     name: 'post_board',
-    description: 'Post a message to board.jsonl. REQUIRES a concise, meaningful `title` (4..100 chars, shown on collapsed board cards) plus `text`. Supports idempotency dedup, `silent: true`, `escalate: true`, `verdict` (merge gate), and `supersedes`. Always cite floors with #seq.',
+    description: 'Post to the Swarm board (requires meaningful `title` 4..100 chars + `text`). Supports `mentions`, `kind`, `verdict`, `supersedes`, `escalate`, `silent`, and channel control.',
     isConcurrencySafe: true,
     parameters: {
       properties: {
-        title: { type: 'string', description: 'REQUIRED meaningful one-line summary title (4..100 chars, e.g. "Freeze combat state schema with 5 ADR overrides"). Never use generic words like "update" or "report".' },
-        text: { type: 'string', description: 'Markdown message body (6..4000 chars). Use #seq to cite earlier floors and @name to wake recipients.' },
-        mentions: { type: 'array', items: { type: 'string' }, description: 'Target member names (e.g. ["qa-gate"] or ["coordinator"]).' },
-        refs: { type: 'array', items: { type: 'integer' }, description: 'Referenced floor numbers (e.g. [5, 6]).' },
-        channel: { type: 'string', description: 'Target channel (default: "main").' },
-        kind: { type: 'string', enum: [...VALID_POST_KINDS], description: 'Semantic kind: brief, report, question, review, decision, alert, done.' },
-        verdict: { type: 'string', enum: [...VALID_VERDICTS], description: 'Optional review/decision verdict: "reject" (blocks merge/done for can_block_merge roles), "approve" (clears rejection), or "override".' },
-        supersedes: { type: 'array', items: { type: 'integer' }, description: 'Optional list of earlier floor numbers obsoleted by this post (solves concurrent decision races).' },
-        escalate: { type: 'boolean', description: 'If true, bypasses recipients\' `wake_kinds` filter to force immediate wakeup.' },
-        silent: { type: 'boolean', description: 'If true, logs this post to board.jsonl without waking anyone (allows empty `mentions`).' },
-        idempotency_key: { type: 'string', description: 'Optional unique key to prevent duplicate posts on retry.' },
-        override_reason: { type: 'string', description: 'Optional PM reason to explicitly override active `[REJECT]` gates when posting `[done]`.' },
-        control_action: { type: 'string', enum: ['channel.create', 'channel.subscribe', 'channel.unsubscribe', 'channel.archive'], description: 'Optional event-sourced channel control operation.' },
-        control_target: { type: 'string', description: 'Optional member name for channel.subscribe / channel.unsubscribe.' },
+        title: { type: 'string', description: 'Meaningful 1-line summary (4..100 chars; no generic words like "update").' },
+        text: { type: 'string', description: 'Message body (6..4000 chars). Cite floors with #seq.' },
+        mentions: { type: 'array', items: { type: 'string' }, description: 'Recipient member names (e.g. ["qa-gate"]).' },
+        refs: { type: 'array', items: { type: 'integer' }, description: 'Referenced floor numbers.' },
+        channel: { type: 'string', description: 'Channel name (default: "main").' },
+        kind: { type: 'string', enum: [...VALID_POST_KINDS], description: 'brief|report|question|review|decision|alert|done.' },
+        verdict: { type: 'string', enum: [...VALID_VERDICTS], description: 'reject (blocks merge/done), approve, or override.' },
+        supersedes: { type: 'array', items: { type: 'integer' }, description: 'Earlier floor numbers obsoleted by this post.' },
+        escalate: { type: 'boolean', description: 'Bypass recipients\' wake_kinds filter.' },
+        silent: { type: 'boolean', description: 'Log without waking anyone.' },
+        idempotency_key: { type: 'string', description: 'Optional dedup key.' },
+        override_reason: { type: 'string', description: 'PM reason to override active reject gates on done.' },
+        control_action: { type: 'string', enum: ['channel.create', 'channel.subscribe', 'channel.unsubscribe', 'channel.archive'], description: 'Channel control action.' },
+        control_target: { type: 'string', description: 'Member name for subscribe/unsubscribe.' },
       },
       required: ['title', 'text'],
     },
@@ -799,36 +799,35 @@ export function createSwarmTools(runtime) {
 
         const notes = []
         if (val.silent) {
-          notes.push('silent=true (no recipients woken)')
+          notes.push('silent')
         } else if (wokenTargets.length > 0) {
-          notes.push(`woken: ${wokenTargets.map(n => '@' + n).join(', ')}`)
-        } else {
-          notes.push('no recipients woken')
+          notes.push(`woke:${wokenTargets.map(n => '@' + n).join(',')}`)
         }
         if (silentMentions.length > 0) {
-          notes.push(`filtered by wake_kinds: ${silentMentions.map(n => '@' + n).join(', ')}`)
+          notes.push(`filtered:${silentMentions.map(n => '@' + n).join(',')}`)
         }
         if (unreachableTargets.length > 0) {
-          notes.push(`unreachable (no live instance): ${unreachableTargets.map(n => '@' + n).join(', ')}`)
+          notes.push(`offline:${unreachableTargets.map(n => '@' + n).join(',')}`)
         }
         if (val.ignored_prose_mentions.length > 0) {
-          notes.push(`ignored unregistered prose @tokens: ${val.ignored_prose_mentions.map(n => '@' + n).join(', ')}`)
+          notes.push(`ignored:${val.ignored_prose_mentions.map(n => '@' + n).join(',')}`)
         }
         if (postRecord.supersedes && postRecord.supersedes.length > 0) {
-          notes.push(`supersedes: ${postRecord.supersedes.map(s => '#' + s).join(', ')}`)
+          notes.push(`supersedes:${postRecord.supersedes.map(s => '#' + s).join(',')}`)
         }
         if (postRecord.verdict) {
           notes.push(`verdict=${postRecord.verdict}`)
         }
 
         const archiveNote = archivePath
-          ? `\n[SWARM_ARCHIVED] Archived blackboard artifacts to: ${archivePath}`
+          ? `\n[SWARM_ARCHIVED] ${archivePath}`
           : ''
         const hygieneNote = releaseHygiene
-          ? `\n[RELEASE_HYGIENE_WARN] ${releaseHygiene.dirty_count} uncommitted/untracked path(s) remain in project_root${releaseHygiene.has_scratch_artifacts ? ' (includes scratch/mutants/tmp artifacts!)' : ''}: ${releaseHygiene.sample.join(', ')}. Inspect \`git status\` and clean temporary files before sharing.`
+          ? `\n[RELEASE_HYGIENE_WARN] ${releaseHygiene.dirty_count} dirty path(s)${releaseHygiene.has_scratch_artifacts ? ' (includes scratch/mutants/tmp!)' : ''}: ${releaseHygiene.sample.join(', ')}`
           : ''
         const fp = typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null
-        const fpNote = (archivePath && fp) ? `\n[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})` : ''
+        const fpNote = (archivePath && fp) ? `\n[RUNTIME] dsh-swarm v${fp.version} (${fp.commit})` : ''
+        const notesSuffix = notes.length > 0 ? `, ${notes.join(', ')}` : ''
 
         return {
           ok: true,
@@ -841,7 +840,7 @@ export function createSwarmTools(runtime) {
           ignored_prose_mentions: val.ignored_prose_mentions,
           ...(archivePath ? { archive_path: archivePath } : {}),
           ...(releaseHygiene ? { release_hygiene: releaseHygiene } : {}),
-          text: `[post_board OK] Posted #${postRecord.seq} "${postRecord.title}" (channel=#${postRecord.channel}, kind=${postRecord.kind}; ${notes.join('; ')}). Your last_read_seq is now ${postRecord.seq}.${hygieneNote}${archiveNote}${fpNote}${!archivePath ? ` If your turn is done, call swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) to park.` : ''}`,
+          text: `OK #${postRecord.seq} (read=#${postRecord.seq}${notesSuffix})${hygieneNote}${archiveNote}${fpNote}`,
         }
       })
     },
@@ -849,17 +848,17 @@ export function createSwarmTools(runtime) {
 
   const readBoardTool = makeTool({
     name: 'read_board',
-    description: 'Read messages from board.jsonl after `since` (defaults to your last_read_seq). Supports filtering by `kinds`, `agent`, `channel`, `limit`, and `hide_superseded` to reduce context bloat, and annotates superseded floors with `[SUPERSEDED by #N]`.',
+    description: 'Read board posts after `since` (default: your last_read_seq). Supports `kinds`, `agent`, `channel`, `limit`, `hide_superseded`.',
     isConcurrencySafe: true,
     parameters: {
       properties: {
-        since: { type: 'integer', description: 'Floor seq after which to read (0 reads from the start).' },
-        channel: { type: 'string', description: 'Optional channel filter.' },
-        mentions_only: { type: 'boolean', description: 'If true, only return posts that @mentioned you.' },
-        kinds: { type: 'array', items: { type: 'string', enum: [...VALID_POST_KINDS] }, description: 'Optional list of post kinds to include (e.g. ["decision", "review", "alert"]).' },
-        agent: { type: 'string', description: 'Optional author member name filter.' },
-        limit: { type: 'integer', description: 'Optional max number of most-recent matching posts to return.' },
-        hide_superseded: { type: 'boolean', description: 'If true, omit earlier posts that were obsoleted via `supersedes`.' },
+        since: { type: 'integer', description: 'Read after this floor seq (0 = all).' },
+        channel: { type: 'string', description: 'Channel filter.' },
+        mentions_only: { type: 'boolean', description: 'Only posts mentioning you.' },
+        kinds: { type: 'array', items: { type: 'string', enum: [...VALID_POST_KINDS] }, description: 'Kind filter.' },
+        agent: { type: 'string', description: 'Author filter.' },
+        limit: { type: 'integer', description: 'Max recent posts.' },
+        hide_superseded: { type: 'boolean', description: 'Omit superseded posts.' },
       },
     },
     async execute(args, exec) {
@@ -931,33 +930,37 @@ export function createSwarmTools(runtime) {
         runtime.notifyProjectionChanged(swarmId)
 
         const formatted = annotatedPosts.length === 0
-          ? `(No matching posts after #${sinceSeq}; board head is #${headSeq})`
+          ? ''
           : annotatedPosts.map((p) => {
+              const shortTime = p.time ? String(p.time).slice(11, 19) || String(p.time) : ''
               if (p.type === 'control') {
-                return `#${p.seq} [CONTROL ${p.time}] @${p.agent}: ${p.action} #${p.channel} ${p.target ? '-> @' + p.target : ''}`
+                return `#${p.seq} ${shortTime} CTRL @${p.agent} ${p.action} #${p.channel}${p.target ? ' -> @' + p.target : ''}`
               }
               const badges = []
               if (p.verdict) badges.push(`verdict=${p.verdict}`)
               if (p.escalate) badges.push('ESCALATE')
               if (p.silent) badges.push('SILENT')
               if (p.superseded_by) badges.push(`SUPERSEDED by #${p.superseded_by}`)
-              const badgeText = badges.length > 0 ? ` [${badges.join(' | ')}]` : ''
-              return `#${p.seq} [${p.time}] [#${p.channel || 'main'}] @${p.agent} (${p.kind}) — ${p.title}${badgeText}\n${p.text}`
-            }).join('\n\n---\n\n')
+              const badgeText = badges.length > 0 ? ` [${badges.join('|')}]` : ''
+              const chPart = p.channel && p.channel !== 'main' ? ` #${p.channel}` : ''
+              return `#${p.seq} ${shortTime}${chPart} @${p.agent} (${p.kind}) ${p.title}${badgeText}\n${p.text}`
+            }).join('\n---\n')
 
         const swarmMeta = store.readSwarm(swarmId)
-        const filterNote = isFilteredView
-          ? ` (filtered view${truncatedCount > 0 ? `, truncated ${truncatedCount} older` : ''}; last_read_seq stays #${newReadSeq})`
-          : ` (advanced last_read_seq to #${newReadSeq})`
+        const gen = swarmMeta?.generation ?? 1
+        const metaParts = [`head=#${headSeq}`, `read=#${newReadSeq}`]
+        if (gen > 1) metaParts.push(`gen=${gen}`)
+        if (isFilteredView) metaParts.push(truncatedCount > 0 ? `filtered,-${truncatedCount}` : 'filtered')
+        const header = `board ${annotatedPosts.length} (${metaParts.join(', ')})`
         return {
           ok: true,
           swarm_id: swarmId,
-          generation: swarmMeta?.generation ?? 1,
+          generation: gen,
           head_seq: headSeq,
           last_read_seq: newReadSeq,
           count: annotatedPosts.length,
           posts: annotatedPosts,
-          text: `[read_board OK] (swarm_id=${swarmId}, gen=${swarmMeta?.generation ?? 1}) Returned ${annotatedPosts.length} record(s)${filterNote}:\n\n${formatted}`,
+          text: formatted ? `${header}\n${formatted}` : header,
         }
       })
     },
@@ -965,12 +968,12 @@ export function createSwarmTools(runtime) {
 
   const swarmWaitTool = makeTool({
     name: 'swarm_wait',
-    description: 'End your current turn and sleep on the board at 0 token cost until a matching message arrives. Supports optional `wake_kinds` (e.g. ["alert", "question", "decision", "review"]) for noise reduction so routine `report` posts do not wake you unless `escalate: true`.',
+    description: 'Park at 0 token cost until matching board posts arrive. Optional `wake_kinds` filters noise (bypassed by `escalate: true`).',
     parameters: {
       properties: {
-        since: { type: 'integer', description: 'The latest floor seq you have actually read via read_board.' },
-        mentions_only: { type: 'boolean', description: 'True (default) wakes only on @name / @group / @#channel / @all; false wakes on any new post.' },
-        wake_kinds: { type: 'array', items: { type: 'string', enum: [...VALID_POST_KINDS] }, description: 'Optional kind filter: only wake when a post matches one of these kinds (or has `escalate: true`).' },
+        since: { type: 'integer', description: 'Latest floor seq read via read_board.' },
+        mentions_only: { type: 'boolean', description: 'True (default) = wake on mentions only; false = wake on any post.' },
+        wake_kinds: { type: 'array', items: { type: 'string', enum: [...VALID_POST_KINDS] }, description: 'Only wake for these post kinds.' },
       },
       required: ['since'],
     },
@@ -1003,12 +1006,12 @@ export function createSwarmTools(runtime) {
             }))
           }
           runtime.notifyProjectionChanged(swarmId)
-          const preview = pending.map(p => `#${p.seq} @${p.agent} (${p.kind}) — ${p.title || deriveFallbackTitle(p.text)}:\n${p.text}`).join('\n---\n')
+          const preview = pending.map(p => `#${p.seq} @${p.agent} (${p.kind}) ${p.title || deriveFallbackTitle(p.text)}\n${p.text}`).join('\n---\n')
           return {
             ok: true,
             status: 'NEW_MESSAGES_ARRIVED',
             posts: pending,
-            text: `[swarm_wait BLOCKED] ${pending.length} matching post(s) arrived after #${since} (latest #${newest}); parking canceled and loaded below:\n\n${preview}\n\nHandle them before calling swarm_wait({"since": ${newest}}).`,
+            text: `[swarm_wait BLOCKED] +${pending.length} (#${pending[0].seq}..#${newest}):\n${preview}`,
           }
         }
 
@@ -1026,14 +1029,14 @@ export function createSwarmTools(runtime) {
         }
         runtime.notifyProjectionChanged(swarmId)
 
-        const kindsDesc = wake_kinds ? `, wake_kinds=[${wake_kinds.join(',')}]` : ''
+        const kindsDesc = wake_kinds ? ` kinds=${wake_kinds.join(',')}` : ''
         return {
           ok: true,
           status: 'DONE',
           parked_at_seq: since,
           wake_mode: mentions_only ? 'mentions' : 'anything',
           wake_kinds: wake_kinds ?? null,
-          text: `DONE (parked on board since #${since}, wake_mode=${mentions_only ? 'mentions' : 'anything'}${kindsDesc}, 0 token standby)`,
+          text: `PARKED #${since} (${mentions_only ? 'mentions' : 'all'}${kindsDesc})`,
         }
       })
     },
@@ -1050,7 +1053,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.8', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.9', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1070,19 +1073,22 @@ export function createSwarmTools(runtime) {
 
       const HIGH_TOOL_CALL_THRESHOLD = 80
       const lines = [
-        `Runtime: dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
-        `Swarm: "${snap.swarm.title}" (id=${swarmId}, gen=${snap.swarm.generation ?? 1}, status=${snap.swarm.status}, head=#${snap.headSeq}${snap.swarm.project_root ? ', project_root=' + snap.swarm.project_root : ''})`,
-        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} active (configured=${snap.concurrency.configuredLimit}, queued=${snap.concurrency.queued}, 429_hits=${snap.concurrency.rateLimitHits}) [caps in-flight LLM requests, NOT active member count]`,
-        `Members Summary: ${ms.totalActive} active (${ms.working} working, ${ms.queued} queued, ${ms.waiting} waiting, ${ms.starting} starting, ${ms.zombie} zombie, ${ms.error} error) | ${ms.killed} killed`,
+        `Runtime: dsh-swarm v${fp.version} (${fp.commit}) | "${snap.swarm.title}" ${snap.swarm.status} head=#${snap.headSeq}${snap.swarm.project_root ? ' root=' + snap.swarm.project_root : ''}`,
+        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} (cfg=${snap.concurrency.configuredLimit}, q=${snap.concurrency.queued}, 429=${snap.concurrency.rateLimitHits}) | Members: ${ms.totalActive} active (${ms.working}w/${ms.waiting}idle/${ms.starting}start${ms.zombie ? '/' + ms.zombie + 'zmb' : ''}${ms.error ? '/' + ms.error + 'err' : ''}, ${ms.killed} killed)`,
         wdLine,
-        rejLine,
-        `Channels: ${snap.channels.map(c => '#' + c).join(', ')}`,
-        'Roster:',
+        ...(snap.activeRejections.length > 0 ? [rejLine] : []),
         ...snap.members.map(m => {
+          const shortLastAt = m.last_tool_call_at ? String(m.last_tool_call_at).slice(11, 19) || m.last_tool_call_at : ''
+          const route = `${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''}`
+          const lastTool = shortLastAt ? ` (${m.last_tool_name}@${shortLastAt})` : ''
+          const qPart = m.queue_position > 0 ? ` q=#${m.queue_position}` : ''
+          const errPart = m.last_error ? ` ERR=${m.last_error.code}:${m.last_error.message}` : ''
+          const blkPart = m.last_park_blocked_seq > 0 ? ` blk=#${m.last_park_blocked_seq}` : ''
+          const stepPart = m.stepSummary && m.status !== 'waiting' && m.status !== 'killed' ? ` | ${m.stepSummary}` : ''
           const budgetWarn = !m.killed && m.tool_call_count >= HIGH_TOOL_CALL_THRESHOLD
-            ? ` [BUDGET_WARN: ${m.tool_call_count} tool calls — inspect for rework/wheel-reinvention]`
+            ? ` [BUDGET_WARN: ${m.tool_call_count} tool calls]`
             : ''
-          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '| ' + m.stepSummary : ''}${budgetWarn}`
+          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} ${route} ${m.workspace_mode} t=${m.turn_count} tc=${m.tool_call_count}${lastTool}${qPart}${errPart} r=#${m.last_read_seq} w=#${m.wait_since} p=#${m.last_post_seq}${blkPart}${stepPart}${budgetWarn}`
         }),
       ]
       return {

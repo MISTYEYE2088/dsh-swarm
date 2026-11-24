@@ -21,14 +21,14 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.8'
+export const PLUGIN_VERSION = '0.3.9'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.8'
+    if (!fs.existsSync(headFile)) return 'release-0.3.9'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -764,8 +764,9 @@ export function applyWith(ctx, config, deps = {}) {
             ...curr,
             last_nudged_seq: Math.max(curr.last_nudged_seq ?? 0, postRecord.seq),
           }))
-          const titlePart = postRecord.title ? ` "${postRecord.title}"` : ''
-          const wakeText = `[board] New message #${postRecord.seq}${titlePart} from @${postRecord.agent} (kind=${postRecord.kind}, channel=#${postRecord.channel || 'main'}). Call read_board({"since": ${m.last_read_seq ?? 0}}) to read and respond.`
+          const chPart = postRecord.channel && postRecord.channel !== 'main' ? ` #${postRecord.channel}` : ''
+          const titlePart = postRecord.title ? `: ${postRecord.title}` : ''
+          const wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})`
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
           } else {

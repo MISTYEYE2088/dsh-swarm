@@ -385,7 +385,7 @@ async function test_stop_hook_blocks_on_race_message() {
   assert.equal(outcome.last_park_blocked_seq, 2)
   assert.equal(store.readMembers('s-race')['fixer-templates'].last_park_blocked_seq, 2)
   assert.equal(steered.length, 1)
-  assert.match(steered[0].content[0].text, /Stop hook blocked termination/)
+  assert.match(steered[0].content[0].text, /Stop hook: unread/)
 }
 
 async function test_stop_hook_catches_worker_forgetting_swarm_wait() {
@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.8/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.9/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.8/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.9/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)

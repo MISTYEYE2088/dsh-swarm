@@ -68,8 +68,8 @@ export function handleTurnStopping({
       last_nudged_seq: Math.max(current.last_nudged_seq ?? 0, newestSeq),
       wake_mode: 'working',
     }))
-    const notice = `Stop hook blocked termination: [board] new messages arrived (${seqList}); call read_board({"since": ${member.last_read_seq ?? 0}}) before waiting again.`
-    agent.steer(buildSwarmSystemMessage(notice, `Stop hook: unread board posts ${seqList}`))
+    const notice = `Stop hook: unread ${seqList} -> call read_board(since=${member.last_read_seq ?? 0}).`
+    agent.steer(buildSwarmSystemMessage(notice, `Stop hook: unread ${seqList}`))
     return {
       blocked: true,
       reason: 'unread_messages',
@@ -78,16 +78,16 @@ export function handleTurnStopping({
     }
   }
 
-  // Case 2: Safeguard — worker, architect, or verifier finished its step without calling `swarm_wait`.
+  // Case 2: Safeguard — worker, architect, verifier, or lore_master finished without calling `swarm_wait`.
   if (
-    (member.role === 'worker' || member.role === 'architect' || member.role === 'verifier')
+    (member.role === 'worker' || member.role === 'architect' || member.role === 'verifier' || member.role === 'lore_master')
     && turnState
     && turnState.calledSwarmWait !== true
     && (turnState.unparkedBlockCount ?? 0) < maxUnparkedBlocks
   ) {
     turnState.unparkedBlockCount = (turnState.unparkedBlockCount ?? 0) + 1
-    const notice = `Stop hook blocked termination: you have not called swarm_wait({"since": ${member.last_read_seq ?? 0}, "mentions_only": true}) to park! Post your handoff via post_board (with a meaningful title) if needed, then end your turn by calling swarm_wait.`
-    agent.steer(buildSwarmSystemMessage(notice, 'Stop hook: missing swarm_wait'))
+    const notice = `Stop hook: unparked -> post handoff if needed, then call swarm_wait(since=${member.last_read_seq ?? 0}).`
+    agent.steer(buildSwarmSystemMessage(notice, 'Stop hook: unparked'))
     return {
       blocked: true,
       reason: 'missing_swarm_wait',
