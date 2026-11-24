@@ -833,16 +833,8 @@ async function test_slash_command_and_rightbar_registration() {
   assert.equal(cmdRes.kind, 'success')
   assert.equal(steered.length, 1)
 
-  const concRes = await registeredCmd.handler({
-    rawInput: 'concurrency 12',
-    attachments: [],
-    agent: { id: 'sess-slash-1', steer() {} },
-  })
-  assert.equal(concRes.kind, 'success')
-  assert.match(concRes.text, /12/)
-
   assert.equal(registeredRoutes.has('/api/dsh-swarm/state'), true)
-  assert.equal(registeredRoutes.has('/api/dsh-swarm/action'), true)
+  assert.equal(registeredRoutes.has('/api/dsh-swarm/action'), false, 'Browser UI must stay read-only; no /api/dsh-swarm/action route')
 
   // 2. Verify Client rightbar tab registration into sidebarRightTabs & sidebar.right.pane.tab
   const code = fs.readFileSync(CLIENT_PATH, 'utf8')
@@ -1048,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.5/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.6/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1105,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.5/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.6/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -1840,29 +1832,6 @@ async function test_kafka_event_log_replays_exact_state_by_offset_and_timestamp(
   assert.deepEqual(Array.from(clientEnd.seats.map(s => s.name)).sort(), ['arch-w2', 'coordinator'])
   assert.equal(clientEnd.latestEdges[0].to, '__table__')
   assert.equal(clientEnd.latestEdges[0].broadcast, true)
-
-  // 4. Legacy backfill: verify a pre-v0.3.4 directory (swarm.json + board.jsonl + members.json without events.jsonl) replays cleanly
-  const legacyDir = store.dirOf('sw-legacy')
-  fs.mkdirSync(legacyDir, { recursive: true })
-  fs.writeFileSync(path.join(legacyDir, 'swarm.json'), JSON.stringify({
-    swarm_id: 'sw-legacy',
-    title: 'Legacy Swarm',
-    created_at: '2026-01-01T00:00:00.000Z',
-    concurrency_limit: 2,
-    concurrency_confirmed: true,
-    next_seq: 3,
-  }))
-  fs.writeFileSync(path.join(legacyDir, 'members.json'), JSON.stringify({
-    'legacy-w1': { name: 'legacy-w1', role: 'worker', spawned_at: '2026-01-01T00:00:01.000Z', brief_seq: 1, killed: false },
-  }))
-  fs.writeFileSync(path.join(legacyDir, 'board.jsonl'), [
-    JSON.stringify({ seq: 1, time: '2026-01-01T00:00:01.000Z', type: 'post', agent: 'coordinator', title: 'Brief @legacy-w1', kind: 'brief', mentions: ['legacy-w1'], text: '@legacy-w1 do work' }),
-    JSON.stringify({ seq: 2, time: '2026-01-01T00:00:05.000Z', type: 'post', agent: 'legacy-w1', title: 'Legacy result', kind: 'report', mentions: ['coordinator'], text: '@coordinator done' }),
-  ].join('\n') + '\n')
-  const backfilled = store.readEventLog('sw-legacy')
-  assert.ok(backfilled.length >= 4, 'Legacy backfill must synthesize init + spawn + post events')
-  assert.equal(store.readBoard('sw-legacy').length, 2)
-  assert.equal(store.readMembers('sw-legacy')['legacy-w1'].role, 'worker')
 }
 
 async function test_ssot_two_file_storage_no_duplicate_facts() {
@@ -2068,60 +2037,50 @@ async function test_projector_auto_checkpoints_and_replays_from_second_newest() 
   assert.equal(recovered.replayMeta.usedCheckpointOffset, checkpoints[checkpoints.length - 3].offset)
 }
 
-async function test_legacy_swarm_mutation_preserves_full_history_and_self_heals() {
-  const store = new SwarmStore(path.join(tempRoot, 'legacy-migrate'))
-  const dir1 = store.dirOf('sw-legacy-click')
-  fs.mkdirSync(dir1, { recursive: true })
-  fs.writeFileSync(path.join(dir1, 'swarm.json'), JSON.stringify({
-    swarm_id: 'sw-legacy-click',
-    title: 'Legacy Production Swarm',
-    created_at: '2026-01-01T00:00:00.000Z',
-    concurrency_limit: 4,
-    concurrency_confirmed: true,
-  }))
-  fs.writeFileSync(path.join(dir1, 'members.json'), JSON.stringify({
-    coordinator: { name: 'coordinator', role: 'coordinator', last_read_seq: 2 },
-    'impl-1': { name: 'impl-1', role: 'worker', brief_seq: 1, last_read_seq: 2, killed: false },
-  }))
-  fs.writeFileSync(path.join(dir1, 'plan.json'), JSON.stringify({ goal: 'Preserve legacy history', current_wave: 1, waves: [], tracks: [] }))
-  fs.writeFileSync(path.join(dir1, 'board.jsonl'), [
-    JSON.stringify({ seq: 1, time: '2026-01-01 00:00:01', type: 'post', agent: 'coordinator', title: 'Brief @impl-1', kind: 'brief', mentions: ['impl-1'], text: '@impl-1 build feature' }),
-    JSON.stringify({ seq: 2, time: '2026-01-01 00:00:05', type: 'post', agent: 'impl-1', title: 'Feature complete', kind: 'report', mentions: ['coordinator'], text: '@coordinator all tests green' }),
-  ].join('\n') + '\n')
+async function test_swarm_concurrency_tool_coordinator_only_and_validation() {
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-conc-tool') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-conc', session: { header: { id: 'sess-conc', cwd: tempRoot } } }
 
-  // 1. Clicking Adjust slots (`updateSwarm`) on a legacy swarm must migrate first and keep ALL history!
-  const updated = store.updateSwarm('sw-legacy-click', { concurrency_limit: 8, concurrency_confirmed: true })
-  assert.equal(updated.title, 'Legacy Production Swarm')
-  assert.equal(updated.concurrency_limit, 8)
-  assert.equal(store.readBoard('sw-legacy-click').length, 2, 'Legacy board posts must NOT vanish after updateSwarm')
-  assert.equal(store.readPlan('sw-legacy-click').goal, 'Preserve legacy history')
-  assert.equal(store.readMembers('sw-legacy-click')['impl-1'].role, 'worker')
-  assert.equal(store.readMembers('sw-legacy-click')['impl-1'].last_read_seq, 2)
+  assert.equal(registeredTools.has('swarm_concurrency'), true, 'swarm_concurrency tool must be registered')
 
-  // 2. Self-healing: simulate an already-affected dir where `events.jsonl` only has bare `swarm.update` lines (no `swarm.init`)
-  const dir2 = store.dirOf('sw-legacy-damaged')
-  fs.mkdirSync(dir2, { recursive: true })
-  fs.copyFileSync(path.join(dir1, 'swarm.json'), path.join(dir2, 'swarm.json'))
-  fs.copyFileSync(path.join(dir1, 'members.json'), path.join(dir2, 'members.json'))
-  fs.copyFileSync(path.join(dir1, 'plan.json'), path.join(dir2, 'plan.json'))
-  fs.copyFileSync(path.join(dir1, 'board.jsonl'), path.join(dir2, 'board.jsonl'))
-  fs.writeFileSync(
-    path.join(dir2, 'events.jsonl'),
-    JSON.stringify({ offset: 1, ts_ms: Date.now(), time: '2026-11-24 01:49:14', type: 'swarm.update', actor: 'coordinator', payload: { concurrency_limit: 6, concurrency_confirmed: true } }) + '\n',
+  await registeredTools.get('swarm_init').execute({ title: 'AI Managed Concurrency', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-c1', role: 'worker', brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c' },
+    { agent: coordAgent },
   )
 
-  // Read-time self-heal immediately recovers full history + preserves the slot update (6)
-  assert.equal(store.readSwarm('sw-legacy-damaged').title, 'Legacy Production Swarm')
-  assert.equal(store.readSwarm('sw-legacy-damaged').concurrency_limit, 6)
-  assert.equal(store.readBoard('sw-legacy-damaged').length, 2)
-  assert.equal(store.readMembers('sw-legacy-damaged')['impl-1'].role, 'worker')
+  // 1. Coordinator scales slots up to 8 -> updates both ConcurrencyGate and events.jsonl SSOT
+  const okRes = await registeredTools.get('swarm_concurrency').execute(
+    { limit: 8, reason: 'Scale up for Wave 2 parallel verification' },
+    { agent: coordAgent },
+  )
+  assert.equal(okRes.ok, true)
+  assert.equal(okRes.previous_limit, 4)
+  assert.equal(okRes.limit, 8)
+  assert.equal(runtime.concurrencyGate.snapshot().configuredLimit, 8)
+  assert.equal(runtime.store.readSwarm('sess-conc').concurrency_limit, 8)
 
-  // Subsequent write permanently repairs `events.jsonl` on disk
-  store.updateSwarm('sw-legacy-damaged', { concurrency_limit: 12 })
-  const repairedRaw = store.readRawEvents('sw-legacy-damaged')
-  assert.equal(repairedRaw.some(e => e.type === 'swarm.init'), true, 'Repaired events.jsonl must include swarm.init')
-  assert.equal(store.readSwarm('sw-legacy-damaged').concurrency_limit, 12)
-  assert.equal(store.readBoard('sw-legacy-damaged').length, 2)
+  // 2. Invalid non-positive limit rejected
+  const badRes = await registeredTools.get('swarm_concurrency').execute({ limit: 0 }, { agent: coordAgent })
+  assert.equal(badRes.ok, false)
+  assert.match(badRes.text, /FORMAT_ERROR/)
+
+  // 3. Non-coordinator worker is rejected
+  const workerRes = await registeredTools.get('swarm_concurrency').execute(
+    { limit: 16 },
+    { agent: { id: 'sess-conc__impl-c1' } },
+  )
+  assert.equal(workerRes.ok, false)
+  assert.match(workerRes.text, /PERMISSION_ERROR/)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -2197,7 +2156,7 @@ try {
   await runTest('test_ssot_two_file_storage_no_duplicate_facts', test_ssot_two_file_storage_no_duplicate_facts)
   await runTest('test_client_flicker_free_polling_and_yellow_arrival_highlight', test_client_flicker_free_polling_and_yellow_arrival_highlight)
   await runTest('test_projector_auto_checkpoints_and_replays_from_second_newest', test_projector_auto_checkpoints_and_replays_from_second_newest)
-  await runTest('test_legacy_swarm_mutation_preserves_full_history_and_self_heals', test_legacy_swarm_mutation_preserves_full_history_and_self_heals)
+  await runTest('test_swarm_concurrency_tool_coordinator_only_and_validation', test_swarm_concurrency_tool_coordinator_only_and_validation)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

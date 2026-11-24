@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.6 (2026-11-23)
+
+- **Pure 2-File SSOT Cleanup (Zero Legacy Complexity)**:
+  - Removed all pre-`v0.3.4` legacy synthesis, fallback, and migration branches from `src/host/store.js` (`_synthesizeLegacyEvents`, `_ensureLegacyMigrated`, legacy path fallbacks). Every Swarm is now strictly 2 files: `events.jsonl` + `offsets.json`.
+- **AI-Managed Concurrency (`swarm_concurrency`) & Read-Only Browser UI**:
+  - Removed all out-of-band UI mutation buttons (`Adjust slots`, `Init (N slots)`) and the `/api/dsh-swarm/action` POST route so users never mutate Swarm state behind the AI's back; browser UI is now a pure read-only projection (`/api/dsh-swarm/state` GET only).
+  - Added coordinator-only AI tool `swarm_concurrency(limit, reason)` (restricted on child workers) so the Coordinator manages in-flight LLM slot limits directly with full visibility.
+
 ## 0.3.5 (2026-11-23)
 
 - **Fixed Legacy Swarm History Vanishing on Slot Adjustments (`Adjust slots` / `swarm.update`)**:

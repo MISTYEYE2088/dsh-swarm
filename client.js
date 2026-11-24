@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.5'
+    var VERSION = '0.3.6'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -797,37 +797,6 @@ window.__ModuleLoader__.load({
       return inFlightFetchPromise
     }
 
-    function postSwarmAction(payload) {
-      if (typeof fetch !== 'function') return Promise.resolve({ ok: false })
-      return fetch('/api/dsh-swarm/action', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(payload),
-      })
-        .then(function (res) { return res.json() })
-        .then(function (data) {
-          if (data && data.ok && data.snapshot) {
-            lastStateFingerprint = ''
-            updateUi(function (prev) {
-              var nextMap = Object.assign({}, prev.snapshotsBySession)
-              var key = data.resolvedSwarmId || payload.swarmId || payload.sessionId || prev.resolvedSwarmId || 'default'
-              nextMap[key] = data.snapshot
-              if (prev.activeSessionId) nextMap[prev.activeSessionId] = data.snapshot
-              return {
-                resolvedSwarmId: data.resolvedSwarmId || prev.resolvedSwarmId,
-                globalConcurrency: data.concurrency || data.snapshot.concurrency || prev.globalConcurrency,
-                snapshotsBySession: nextMap,
-              }
-            })
-          }
-          fetchSwarmState(payload.sessionId, payload.swarmId, true)
-          return data
-        })
-        .catch(function (err) {
-          return { ok: false, error: String(err) }
-        })
-    }
-
     function useSwarmPolling(sessionId, selectedSwarmId) {
       if (!React || typeof React.useEffect !== 'function') return
       React.useEffect(function () {
@@ -1067,69 +1036,10 @@ window.__ModuleLoader__.load({
           memberSummary
             ? React.createElement(
                 'div',
-                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginBottom: '6px', fontVariantNumeric: 'tabular-nums' } },
+                { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', fontVariantNumeric: 'tabular-nums' } },
                 'Members: ' + memberSummary.working + ' working · ' + memberSummary.waiting + ' waiting · ' + memberSummary.starting + ' starting' + (memberSummary.zombie > 0 ? ' · ' + memberSummary.zombie + ' zombie' : '') + (memberSummary.error > 0 ? ' · ' + memberSummary.error + ' error' : ''),
               )
             : null,
-          React.createElement(
-            'div',
-            { style: { display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' } },
-            React.createElement(
-              'span',
-              { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginRight: '4px' } },
-              'Adjust slots:',
-            ),
-            [2, 4, 6, 8, 12, 16].map(function (n) {
-              var isCurrent = conc.configuredLimit === n
-              return React.createElement(
-                'button',
-                {
-                  key: n,
-                  type: 'button',
-                  onClick: function () {
-                    postSwarmAction({ action: 'concurrency', swarmId: targetSwarmId, limit: n })
-                  },
-                  style: {
-                    padding: '2px 8px',
-                    borderRadius: '4px',
-                    border: isCurrent
-                      ? '1px solid var(--dsw-alias-state-business-primary)'
-                      : '0.5px solid var(--dsw-alias-border-l2)',
-                    background: isCurrent ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-3)',
-                    color: isCurrent ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
-                    fontSize: '11px',
-                    fontWeight: isCurrent ? 600 : 400,
-                    cursor: 'pointer',
-                  },
-                },
-                String(n),
-              )
-            }),
-            React.createElement(
-              'button',
-              {
-                type: 'button',
-                onClick: function () {
-                  postSwarmAction({
-                    action: 'concurrency',
-                    swarmId: targetSwarmId,
-                    limit: Math.max(1, (conc.configuredLimit || 4) + 2),
-                  })
-                },
-                style: {
-                  padding: '2px 7px',
-                  borderRadius: '4px',
-                  border: '0.5px solid var(--dsw-alias-border-l2)',
-                  background: 'var(--dsw-alias-bg-layer-3)',
-                  color: 'var(--dsw-alias-label-secondary)',
-                  fontSize: '11px',
-                  cursor: 'pointer',
-                },
-                title: 'Increase slot limit by 2',
-              },
-              '+2',
-            ),
-          ),
         ),
         plan
           ? React.createElement(
@@ -2366,39 +2276,7 @@ window.__ModuleLoader__.load({
                 React.createElement(
                   'div',
                   { style: { fontSize: '12px', color: 'var(--dsw-alias-label-secondary)' } },
-                  'Type /swarm <task> in the main composer to start, or initialize a blackboard directly below:',
-                ),
-                React.createElement(
-                  'div',
-                  { style: { display: 'flex', gap: '8px', flexWrap: 'wrap' } },
-                  [4, 6, 8].map(function (limit) {
-                    return React.createElement(
-                      'button',
-                      {
-                        key: limit,
-                        type: 'button',
-                        onClick: function () {
-                          postSwarmAction({
-                            action: 'init',
-                            sessionId: sessionId,
-                            swarmId: targetSwarmId,
-                            title: 'Swarm Task',
-                            concurrency_limit: limit,
-                          })
-                        },
-                        style: {
-                          padding: '5px 10px',
-                          borderRadius: '6px',
-                          border: '0.5px solid var(--dsw-alias-border-l2)',
-                          background: 'var(--dsw-alias-bg-layer-3)',
-                          color: 'var(--dsw-alias-label-primary)',
-                          fontSize: '12px',
-                          cursor: 'pointer',
-                        },
-                      },
-                      'Init (' + limit + ' slots)',
-                    )
-                  }),
+                  'Type /swarm <task> in the main composer to start a Swarm. Concurrency slots are managed directly by the coordinator via swarm_init and swarm_concurrency.',
                 ),
               )
             : ui.activeTab === 'overview'

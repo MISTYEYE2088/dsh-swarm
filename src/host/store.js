@@ -1,13 +1,11 @@
 // Two-file Single-Source-of-Truth (SSOT) Swarm store:
 //   1. `<rootDir>/<swarmId>/events.jsonl`  — Kafka-style append-only immutable log
 //      (SINGLE source of truth for ALL domain facts: swarm config, plan, members,
-//      spawns, kills, model switches, board posts, channel control frames, closure).
+//      spawns, kills, model switches, board posts, channel control frames, closure,
+//      plus periodic `state.checkpoint` snapshots).
 //   2. `<rootDir>/<swarmId>/offsets.json`  — Mutable per-member consumer offsets
 //      & ephemeral runtime telemetry ONLY (read/wait/nudge cursors, wake_mode,
 //      wake_kinds, turn/tool counts, last_error). ZERO domain facts duplicated here!
-//
-// Also seamlessly reads legacy pre-v0.3.4 directories (`swarm.json` / `board.jsonl`
-// / `members.json` / `plan.json`) by synthesizing an equivalent event stream.
 
 import fs from 'node:fs'
 import os from 'node:os'
@@ -301,11 +299,6 @@ export class SwarmStore {
       dir,
       eventsJsonl: path.join(dir, 'events.jsonl'),
       offsetsJson: path.join(dir, 'offsets.json'),
-      // Legacy pre-v0.3.4 paths (read-only fallback for old sessions on disk)
-      legacySwarmJson: path.join(dir, 'swarm.json'),
-      legacyBoardJsonl: path.join(dir, 'board.jsonl'),
-      legacyMembersJson: path.join(dir, 'members.json'),
-      legacyPlanJson: path.join(dir, 'plan.json'),
     }
   }
 
@@ -326,43 +319,14 @@ export class SwarmStore {
 
   exists(swarmId) {
     if (!swarmId) return false
-    const p = this.pathsOf(swarmId)
-    return fs.existsSync(p.eventsJsonl) || fs.existsSync(p.legacySwarmJson)
-  }
-
-  // #FUNC Ensure legacy pre-v0.3.4 swarms are losslessly migrated into `events.jsonl` before appending new events.
-  // #NOT  Never overwrites an already-valid `events.jsonl` that contains a `swarm.init` frame.
-  // #EDGE-IN Calling `updateSwarm` (e.g. clicking Adjust slots) on a legacy swarm preserves 100% of legacy board/member/plan history → test_legacy_swarm_mutation_preserves_full_history_and_self_heals
-  // #WHY  Appending a bare `swarm.update` into a brand-new `events.jsonl` without migrating `swarm.json`/`board.jsonl` first would shadow legacy history.
-  _ensureLegacyMigrated(swarmId) {
-    const paths = this.pathsOf(swarmId)
-    const raw = this.readRawEvents(swarmId)
-    if (!fs.existsSync(paths.legacySwarmJson)) return raw
-    if (raw.length > 0 && raw.some(e => e && e.type === 'swarm.init')) return raw
-
-    const merged = this.readEventLog(swarmId)
-    if (merged.length > 0) {
-      const payload = merged.map(ev => JSON.stringify(ev)).join('\n') + '\n'
-      const tempPath = `${paths.eventsJsonl}.${process.pid}.${Date.now()}.migrate.tmp`
-      fs.writeFileSync(tempPath, payload, 'utf8')
-      try {
-        fs.renameSync(tempPath, paths.eventsJsonl)
-      } catch {
-        fs.writeFileSync(paths.eventsJsonl, payload, 'utf8')
-        try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath) } catch {}
-      }
-      if (!fs.existsSync(paths.offsetsJson) && fs.existsSync(paths.legacyMembersJson)) {
-        this.writeOffsets(swarmId, this.readOffsets(swarmId))
-      }
-    }
-    return merged
+    return fs.existsSync(this.pathsOf(swarmId).eventsJsonl)
   }
 
   /** Append one immutable Kafka-style event to `events.jsonl` and emit a `state.checkpoint` every `checkpointInterval` domain events. */
   appendEvent(swarmId, { type, actor = 'coordinator', seq = null, ts_ms = Date.now(), time = null, payload = {} }) {
     const paths = this.pathsOf(swarmId)
     fs.mkdirSync(paths.dir, { recursive: true })
-    const existing = this._ensureLegacyMigrated(swarmId)
+    const existing = this.readEventLog(swarmId)
     const nextOffset = existing.length === 0 ? 1 : existing[existing.length - 1].offset + 1
     const eventTime = time || formatTime(new Date(ts_ms))
     const frame = {
@@ -399,26 +363,14 @@ export class SwarmStore {
     return frame
   }
 
-  /** Read raw events from `events.jsonl` without legacy synthesis. */
-  readRawEvents(swarmId) {
+  /** Read the ordered Kafka-style event log for `swarmId` from `events.jsonl`. */
+  readEventLog(swarmId) {
     return readJsonlSync(this.pathsOf(swarmId).eventsJsonl)
   }
 
-  /** Read consumer offsets / live telemetry from `offsets.json` (or fallback from legacy `members.json`). */
+  /** Read consumer offsets / live telemetry from `offsets.json`. */
   readOffsets(swarmId) {
-    const p = this.pathsOf(swarmId)
-    if (fs.existsSync(p.offsetsJson)) {
-      return readJsonSync(p.offsetsJson, {})
-    }
-    if (fs.existsSync(p.legacyMembersJson)) {
-      const legacy = readJsonSync(p.legacyMembersJson, {})
-      const extracted = {}
-      for (const [name, m] of Object.entries(legacy)) {
-        if (m && typeof m === 'object') extracted[name] = extractOffsetFields(m)
-      }
-      return extracted
-    }
-    return {}
+    return readJsonSync(this.pathsOf(swarmId).offsetsJson, {})
   }
 
   /** Persist consumer offsets / live telemetry ONLY to `offsets.json` (never domain facts). */
@@ -445,183 +397,6 @@ export class SwarmStore {
     return offsets
   }
 
-  /** Read the ordered Kafka-style event log for `swarmId` (auto-synthesizing & self-healing legacy pre-v0.3.4 dirs). */
-  readEventLog(swarmId) {
-    const raw = this.readRawEvents(swarmId)
-    const p = this.pathsOf(swarmId)
-    const hasLegacy = fs.existsSync(p.legacySwarmJson)
-    if (raw.length > 0 && (!hasLegacy || raw.some(e => e && e.type === 'swarm.init'))) {
-      return raw
-    }
-    if (!hasLegacy) return raw
-
-    const synthesized = this._synthesizeLegacyEvents(swarmId)
-    if (raw.length === 0) return synthesized
-
-    // Self-heal: merge any orphaned post-migration events (e.g. `swarm.update` appended before migration) after the legacy stream.
-    let nextOffset = synthesized.length + 1
-    for (const ev of raw) {
-      if (!ev || typeof ev !== 'object') continue
-      synthesized.push({ ...ev, offset: nextOffset++ })
-    }
-    return synthesized
-  }
-
-  /** Synthesize an ordered event stream from pre-v0.3.4 legacy files (`swarm.json`, `board.jsonl`, `members.json`, `plan.json`). */
-  _synthesizeLegacyEvents(swarmId) {
-    const p = this.pathsOf(swarmId)
-    if (!fs.existsSync(p.legacySwarmJson)) return []
-
-    const swarm = readJsonSync(p.legacySwarmJson, null)
-    const members = readJsonSync(p.legacyMembersJson, {})
-    const board = readJsonlSync(p.legacyBoardJsonl)
-    const plan = readJsonSync(p.legacyPlanJson, null)
-    const synthesized = []
-    let offset = 1
-
-    const initTs = swarm?.created_at ? Date.parse(swarm.created_at) : Date.now()
-    const baseTs = Number.isFinite(initTs) ? initTs : Date.now()
-    synthesized.push({
-      offset: offset++,
-      ts_ms: baseTs,
-      time: formatTime(new Date(baseTs)),
-      type: 'swarm.init',
-      actor: 'coordinator',
-      payload: {
-        swarm_id: swarm?.swarm_id ?? swarmId,
-        title: swarm?.title || 'Swarm',
-        generation: swarm?.generation ?? 1,
-        status: swarm?.status ?? 'ACTIVE',
-        project_root: swarm?.project_root ?? null,
-        concurrency_confirmed: swarm?.concurrency_confirmed ?? true,
-        concurrency_limit: swarm?.concurrency_limit ?? 4,
-        default_provider: swarm?.default_provider || 'inherit',
-        default_model: swarm?.default_model || 'inherit',
-        coordinator_model: swarm?.coordinator_model || 'inherit',
-        created_at: swarm?.created_at,
-      },
-    })
-
-    if (plan) {
-      synthesized.push({
-        offset: offset++,
-        ts_ms: baseTs + 1,
-        time: formatTime(new Date(baseTs + 1)),
-        type: 'plan.update',
-        actor: 'coordinator',
-        payload: plan,
-      })
-    }
-
-    const lastActiveSeq = new Map()
-    for (const rec of board) {
-      if (!rec || rec.type === 'control') continue
-      if (rec.agent) lastActiveSeq.set(rec.agent, rec.seq)
-      if (Array.isArray(rec.mentions)) {
-        for (const mName of rec.mentions) lastActiveSeq.set(mName, rec.seq)
-      }
-    }
-
-    const spawnedSet = new Set(['coordinator'])
-    const retiredAtSeq = new Map()
-    for (const [mName, m] of Object.entries(members)) {
-      if (!m || mName === 'coordinator' || (m.system_builtin && m.role === 'monitor')) continue
-      if (m.killed === true) {
-        const retSeq = (typeof m.killed_at_seq === 'number' && m.killed_at_seq > 0)
-          ? m.killed_at_seq
-          : (lastActiveSeq.get(mName) ?? m.brief_seq ?? 0)
-        if (!retiredAtSeq.has(retSeq)) retiredAtSeq.set(retSeq, [])
-        retiredAtSeq.get(retSeq).push({ name: mName, member: m })
-      }
-    }
-
-    for (const rec of board) {
-      if (!rec) continue
-      const recTs = typeof rec.created_ms === 'number'
-        ? rec.created_ms
-        : (rec.time ? Date.parse(String(rec.time).replace(' ', 'T') + 'Z') : Date.now())
-      const tsMs = Number.isFinite(recTs) ? recTs : Date.now()
-
-      if (rec.type === 'control') {
-        synthesized.push({
-          offset: offset++,
-          ts_ms: tsMs,
-          time: rec.time || formatTime(new Date(tsMs)),
-          type: 'board.control',
-          seq: rec.seq,
-          actor: rec.agent || 'coordinator',
-          payload: { ...rec },
-        })
-      } else {
-        if (rec.kind === 'brief' && Array.isArray(rec.mentions)) {
-          for (const mName of rec.mentions) {
-            const m = members[mName]
-            if (m && !spawnedSet.has(mName)) {
-              spawnedSet.add(mName)
-              synthesized.push({
-                offset: offset++,
-                ts_ms: Math.max(0, tsMs - 1),
-                time: rec.time || formatTime(new Date(tsMs)),
-                type: 'member.spawn',
-                seq: rec.seq,
-                actor: m.parent || 'coordinator',
-                payload: {
-                  name: mName,
-                  session_id: m.session_id,
-                  role: m.role || 'worker',
-                  can_block_merge: m.can_block_merge,
-                  group: m.group ?? null,
-                  parent: m.parent || 'coordinator',
-                  provider: m.applied_provider || 'inherit',
-                  model: m.applied_model || 'inherit',
-                  workspace_mode: m.workspace_mode || 'inherit',
-                  worktree_path: m.worktree_path ?? null,
-                  brief_seq: rec.seq,
-                  created_at: m.created_at,
-                },
-              })
-            }
-          }
-        }
-        synthesized.push({
-          offset: offset++,
-          ts_ms: tsMs,
-          time: rec.time || formatTime(new Date(tsMs)),
-          type: 'board.post',
-          seq: rec.seq,
-          actor: rec.agent || 'coordinator',
-          payload: {
-            ...rec,
-            title: rec.title || deriveFallbackTitle(rec.text, rec.kind || 'post'),
-          },
-        })
-      }
-
-      const retiringHere = retiredAtSeq.get(rec.seq)
-      if (retiringHere) {
-        for (const item of retiringHere) {
-          synthesized.push({
-            offset: offset++,
-            ts_ms: tsMs + 1,
-            time: rec.time || formatTime(new Date(tsMs)),
-            type: 'member.kill',
-            seq: rec.seq,
-            actor: 'coordinator',
-            payload: {
-              name: item.name,
-              released: false,
-              killed_at_seq: rec.seq,
-              handover_to: item.member.handover_to ?? null,
-              reason: item.member.kill_reason ?? null,
-            },
-          })
-        }
-      }
-    }
-
-    return synthesized
-  }
-
   /** Compute current state cleanly on demand via `SwarmStateProjector` (anchored on the second-newest checkpoint). */
   projectState(swarmId, { includeBoard = true } = {}) {
     const events = this.readEventLog(swarmId)
@@ -642,7 +417,7 @@ export class SwarmStore {
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.name === 'archive') continue
       const dir = path.join(this.baseDir, entry.name)
-      if (!fs.existsSync(path.join(dir, 'events.jsonl')) && !fs.existsSync(path.join(dir, 'swarm.json'))) continue
+      if (!fs.existsSync(path.join(dir, 'events.jsonl'))) continue
       try {
         const meta = this.readSwarm(entry.name)
         if (!meta) continue
@@ -1135,7 +910,7 @@ export class SwarmStore {
     const safeId = String(swarmId).replace(/[^a-zA-Z0-9_.-]/g, '_')
     const archiveDir = path.join(this.baseDir, 'archive', `${safeId}_gen${gen}_${stamp}_${reason}`)
     fs.mkdirSync(archiveDir, { recursive: true })
-    for (const fileName of ['events.jsonl', 'offsets.json', 'swarm.json', 'board.jsonl', 'members.json', 'plan.json']) {
+    for (const fileName of ['events.jsonl', 'offsets.json']) {
       const srcFile = path.join(srcPaths.dir, fileName)
       if (fs.existsSync(srcFile)) {
         fs.copyFileSync(srcFile, path.join(archiveDir, fileName))

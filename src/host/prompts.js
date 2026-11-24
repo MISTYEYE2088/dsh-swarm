@@ -73,7 +73,7 @@ Use a single \`ask_user_question\` call to clarify whichever of these 4 items ar
 4. **In-Flight LLM Slots & Model Preference** (only if unspecified): Clearly state that concurrency slots limit **in-flight LLM requests (NOT max member count)**; recommend inheriting the current session model (\`inherit\`) first and list discovered registered models.
 
 ### Step 2: Initialize Blackboard & Plan (\`swarm_init\` + \`swarm_plan\`)
-- Call \`swarm_init\` with \`title\`, \`concurrency_limit\`, and \`default_model\`. If the actual project lives inside a subdirectory Git repository (reported by \`swarm_init\` preflight), pass \`project_root\` so members can use true \`workspace="share"\` isolation!
+- Call \`swarm_init\` with \`title\`, \`concurrency_limit\`, and \`default_model\`. Use \`swarm_concurrency(limit, reason)\` whenever you need to scale in-flight LLM slots up or down mid-flight. If the actual project lives inside a subdirectory Git repository (reported by \`swarm_init\` preflight), pass \`project_root\` so members can use true \`workspace="share"\` isolation!
 - Write a concise \`REQUIREMENTS.md\` if needed (goals + A1..An + non-goals only, no signatures) and call \`swarm_plan\`.
 
 ### Step 3: Spawn Members with 3-Part Briefs (\`swarm_add\`)

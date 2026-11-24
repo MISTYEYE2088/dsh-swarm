@@ -21,7 +21,7 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.5'
+export const PLUGIN_VERSION = '0.3.6'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
@@ -81,31 +81,6 @@ function mergeSettings(raw) {
   return merged
 }
 
-/** Read and parse a JSON HTTP request body (up to 128 KB). */
-function readJsonBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = []
-    let total = 0
-    req.on('data', (chunk) => {
-      total += chunk.length
-      if (total > 131_072) {
-        reject(new Error('Payload too large'))
-        return
-      }
-      chunks.push(chunk)
-    })
-    req.on('end', () => {
-      try {
-        const raw = Buffer.concat(chunks).toString('utf8').trim()
-        resolve(raw ? JSON.parse(raw) : {})
-      } catch (err) {
-        reject(err)
-      }
-    })
-    req.on('error', reject)
-  })
-}
-
 /** Write a JSON HTTP response with status code. */
 function sendJson(res, statusCode, payload) {
   const body = JSON.stringify(payload)
@@ -115,7 +90,7 @@ function sendJson(res, statusCode, payload) {
   res.end(body)
 }
 
-/** Build the `/api/dsh-swarm/state` and `/api/dsh-swarm/action` route definitions for `webServer`. */
+/** Build the read-only `/api/dsh-swarm/state` route for `webServer` (all Swarm mutations go through AI tools). */
 export function createSwarmWebRoutes(runtime) {
   const { store, concurrencyGate } = runtime
   return [
@@ -141,116 +116,6 @@ export function createSwarmWebRoutes(runtime) {
             concurrency: concurrencyGate.snapshot(),
             snapshot,
           })
-        } catch (err) {
-          sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
-        }
-      },
-    },
-    {
-      kind: 'exact',
-      path: '/api/dsh-swarm/action',
-      async handler(req, res) {
-        if (req.method !== 'POST') {
-          sendJson(res, 405, { ok: false, error: 'Method Not Allowed' })
-          return
-        }
-        try {
-          const body = await readJsonBody(req)
-          const action = String(body.action ?? '').trim()
-          const targetSwarmId = (body.swarmId && store.exists(body.swarmId))
-            ? String(body.swarmId)
-            : (store.resolveSwarmId(body.sessionId || body.swarmId) || String(body.swarmId || body.sessionId || 'default-swarm'))
-
-          if (action === 'init') {
-            const limit = Math.max(1, Math.floor(Number(body.concurrency_limit) || runtime.settings.defaultConcurrency))
-            const title = String(body.title || 'Swarm Task').trim().slice(0, 120) || 'Swarm Task'
-            await store.withLock(targetSwarmId, async () => {
-              store.initSwarm(targetSwarmId, {
-                title,
-                concurrency_limit: limit,
-                concurrency_confirmed: true,
-              })
-            })
-            concurrencyGate.setLimit(limit)
-            runtime.ensureMonitorDaemon(targetSwarmId)
-            runtime.notifyProjectionChanged(targetSwarmId)
-            sendJson(res, 200, {
-              ok: true,
-              resolvedSwarmId: targetSwarmId,
-              snapshot: buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime }),
-            })
-            return
-          }
-
-          if (action === 'concurrency') {
-            const limit = Math.floor(Number(body.limit))
-            if (!Number.isInteger(limit) || limit < 1) {
-              sendJson(res, 400, { ok: false, error: 'Concurrency slot limit must be a positive integer >= 1' })
-              return
-            }
-            concurrencyGate.setLimit(limit)
-            if (store.exists(targetSwarmId)) {
-              await store.withLock(targetSwarmId, async () => {
-                store.updateSwarm(targetSwarmId, {
-                  concurrency_limit: limit,
-                  concurrency_confirmed: true,
-                })
-              })
-              runtime.notifyProjectionChanged(targetSwarmId)
-            }
-            sendJson(res, 200, {
-              ok: true,
-              resolvedSwarmId: targetSwarmId,
-              concurrency: concurrencyGate.snapshot(),
-              snapshot: store.exists(targetSwarmId)
-                ? buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime })
-                : null,
-            })
-            return
-          }
-
-          if (action === 'post') {
-            const text = String(body.text ?? '').trim()
-            if (!text) {
-              sendJson(res, 400, { ok: false, error: 'Message body cannot be empty' })
-              return
-            }
-            const explicitTitle = typeof body.title === 'string' && body.title.trim()
-              ? body.title.trim().slice(0, 100)
-              : deriveFallbackTitle(text, 'Operator note')
-            const result = await store.withLock(targetSwarmId, async () => {
-              if (!store.exists(targetSwarmId)) {
-                store.initSwarm(targetSwarmId, {
-                  title: 'Swarm Task',
-                  concurrency_limit: runtime.settings.defaultConcurrency,
-                  concurrency_confirmed: true,
-                })
-              }
-              const postRecord = store.appendBoardRecord(targetSwarmId, {
-                type: 'post',
-                agent: String(body.agent || 'coordinator'),
-                actor_kind: 'HUMAN',
-                title: explicitTitle,
-                channel: String(body.channel || 'main'),
-                kind: String(body.kind || 'decision'),
-                mentions: Array.isArray(body.mentions) ? body.mentions : undefined,
-                text,
-              })
-              const wakeRes = await runtime.dispatchPostWakeups(targetSwarmId, postRecord)
-              runtime.notifyBoardActivity(targetSwarmId, postRecord)
-              runtime.notifyProjectionChanged(targetSwarmId)
-              return { postRecord, woken: wakeRes.woken }
-            })
-            sendJson(res, 200, {
-              ok: true,
-              post: result.postRecord,
-              woken: result.woken,
-              snapshot: buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime }),
-            })
-            return
-          }
-
-          sendJson(res, 400, { ok: false, error: `Unknown action "${action}"` })
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
         }
@@ -673,7 +538,7 @@ export function applyWith(ctx, config, deps = {}) {
           const toolsOnChild = agentCtx?.tools ?? agentCtx?.get?.('tools')
           if (toolsOnChild && typeof toolsOnChild.restrict === 'function') {
             toolsOnChild.restrict({
-              deny: ['subagent', 'subagent_fork', 'workflow', 'swarm_init', 'swarm_add', 'swarm_kill'],
+              deny: ['subagent', 'subagent_fork', 'workflow', 'swarm_init', 'swarm_add', 'swarm_kill', 'swarm_concurrency'],
             })
           }
         } catch {}

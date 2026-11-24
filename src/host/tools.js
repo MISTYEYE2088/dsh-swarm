@@ -290,7 +290,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.5', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.6', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -1013,7 +1013,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.5', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.6', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1294,6 +1294,59 @@ export function createSwarmTools(runtime) {
     },
   })
 
+  const swarmConcurrencyTool = makeTool({
+    name: 'swarm_concurrency',
+    description: 'Adjust the Swarm in-flight LLM concurrency slot limit (`limit >= 1`, coordinator-only). Caps simultaneous in-flight LLM streams (NOT max member count) and records the change in `events.jsonl`.',
+    parameters: {
+      properties: {
+        limit: { type: 'integer', minimum: 1, description: 'New maximum concurrent in-flight LLM streams (positive integer >= 1).' },
+        reason: { type: 'string', description: 'Optional concise reason for adjusting concurrency slots (e.g. Wave 2 scale-up or rate-limit tuning).' },
+      },
+      required: ['limit'],
+    },
+    async execute(args, exec) {
+      const { swarmId, callerName } = runtime.resolveCaller(exec.agent)
+      if (callerName !== 'coordinator') {
+        return {
+          ok: false,
+          text: `[PERMISSION_ERROR: swarm_concurrency] Only @coordinator may adjust LLM concurrency slots (caller: @${callerName}).`,
+        }
+      }
+      if (!store.exists(swarmId)) {
+        return {
+          ok: false,
+          text: '[STATE_ERROR: swarm_concurrency] Swarm is not initialized yet. Call `swarm_init` first.',
+        }
+      }
+      const limit = Number(args?.limit)
+      if (!Number.isInteger(limit) || limit < 1) {
+        return {
+          ok: false,
+          text: '[FORMAT_ERROR: swarm_concurrency] `limit` must be a positive integer >= 1.',
+        }
+      }
+      const reason = typeof args?.reason === 'string' && args.reason.trim() ? args.reason.trim() : null
+      return await store.withLock(swarmId, async () => {
+        const previousLimit = store.readSwarm(swarmId)?.concurrency_limit ?? concurrencyGate.snapshot().configuredLimit
+        concurrencyGate.setLimit(limit)
+        store.updateSwarm(swarmId, {
+          concurrency_limit: limit,
+          concurrency_confirmed: true,
+        })
+        runtime.notifyProjectionChanged(swarmId)
+        const snap = concurrencyGate.snapshot()
+        const reasonText = reason ? ` (reason: ${reason})` : ''
+        return {
+          ok: true,
+          previous_limit: previousLimit,
+          limit,
+          concurrency: snap,
+          text: `[swarm_concurrency OK] Updated in-flight LLM concurrency slots from ${previousLimit} to ${limit}${reasonText}. Live slots: ${snap.active}/${snap.effectiveLimit} active, ${snap.queued} queued.`,
+        }
+      })
+    },
+  })
+
   return [
     swarmInitTool,
     swarmPlanTool,
@@ -1303,6 +1356,7 @@ export function createSwarmTools(runtime) {
     swarmWaitTool,
     swarmStatusTool,
     swarmModelTool,
+    swarmConcurrencyTool,
     swarmLandTool,
     swarmKillTool,
   ]
@@ -1322,9 +1376,9 @@ export function createSwarmCommand(runtime) {
   return {
     definitionId: 'dsh-swarm',
     name: 'swarm',
-    description: 'Start or inspect a multi-agent blackboard Swarm (/swarm <task>, /swarm status, /swarm concurrency <N>)',
+    description: 'Start or inspect a multi-agent blackboard Swarm (/swarm <task>, /swarm status)',
     input: {
-      hint: '[<task> | status | board | concurrency <N>]',
+      hint: '[<task> | status | board]',
       attachments: true,
     },
     async handler(invocation) {
@@ -1343,20 +1397,6 @@ export function createSwarmCommand(runtime) {
           kind: 'success',
           text: `Swarm "${snap.swarm.title}" (${snap.swarm.status}) | Members: ${ms.totalActive} (${ms.working} working / ${ms.waiting} waiting / ${ms.zombie} zombie) | LLM Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} | Board: #${snap.headSeq}`,
         }
-      }
-
-      const concMatch = /^concurrency\s+(\d+)$/i.exec(raw)
-      if (concMatch) {
-        const limit = Number(concMatch[1])
-        if (!Number.isInteger(limit) || limit < 1) {
-          return { kind: 'error', text: 'LLM concurrency slot limit must be a positive integer >= 1.' }
-        }
-        concurrencyGate.setLimit(limit)
-        if (store.exists(swarmId)) {
-          store.updateSwarm(swarmId, { concurrency_limit: limit, concurrency_confirmed: true })
-          runtime.notifyProjectionChanged(swarmId)
-        }
-        return { kind: 'success', text: `[dsh-swarm] Updated in-flight LLM concurrency slots to ${limit}.` }
       }
 
       const discovered = typeof runtime.discoverAvailableModels === 'function'
