@@ -21,7 +21,7 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.4'
+export const PLUGIN_VERSION = '0.3.5'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
@@ -200,6 +200,7 @@ export function createSwarmWebRoutes(runtime) {
             }
             sendJson(res, 200, {
               ok: true,
+              resolvedSwarmId: targetSwarmId,
               concurrency: concurrencyGate.snapshot(),
               snapshot: store.exists(targetSwarmId)
                 ? buildSwarmProjectionSnapshot({ store, swarmId: targetSwarmId, runtime })

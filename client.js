@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.4'
+    var VERSION = '0.3.5'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -2223,7 +2223,7 @@ window.__ModuleLoader__.load({
             { style: { display: 'flex', alignItems: 'center', gap: '4px' } },
             [
               { id: 'board', label: 'Board' },
-              { id: 'overview', label: 'Overview' },
+              { id: 'overview', label: 'Control' },
               { id: 'graph', label: 'Round Table' },
             ].map(function (tab) {
               var active = ui.activeTab === tab.id
@@ -2592,7 +2592,7 @@ window.__ModuleLoader__.load({
             })
           },
           openDrawer: function (tab) {
-            if (tab) updateUi({ activeTab: tab })
+            if (tab) updateUi({ activeTab: tab === 'control' ? 'overview' : tab })
             toggleSwarmRightbar()
           },
           closeDrawer: function () {

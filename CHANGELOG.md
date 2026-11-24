@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.5 (2026-11-23)
+
+- **Fixed Legacy Swarm History Vanishing on Slot Adjustments (`Adjust slots` / `swarm.update`)**:
+  - Root cause: clicking `Adjust slots` on a pre-`v0.3.4` legacy swarm (which only had `swarm.json` / `board.jsonl` / `members.json` / `plan.json` and no `events.jsonl`) appended a bare `swarm.update` line into a brand-new `events.jsonl`; `readEventLog()` then saw non-empty `events.jsonl` and stopped reading the legacy files.
+  - Added lossless write-time migration (`SwarmStore._ensureLegacyMigrated`) before appending any event to a legacy swarm directory, plus automatic read-time self-healing in `readEventLog()` so any already-affected legacy directory immediately recovers 100% of its history without losing slot updates.
+- **UI Clarity**:
+  - Renamed the middle sidebar tab from `Overview` to `Control` (`Board` | `Control` | `Round Table`) to accurately reflect its runtime control & operational contents (Merge Gate, LLM In-Flight Slots, Watchdog, Plan, Roster, Progress Reel).
+
 ## 0.3.4 (2026-11-23)
 
 - **True Single-Source-of-Truth (SSOT) Two-File Storage + Stateless Projector & Auto-Checkpoints**:

@@ -330,11 +330,39 @@ export class SwarmStore {
     return fs.existsSync(p.eventsJsonl) || fs.existsSync(p.legacySwarmJson)
   }
 
+  // #FUNC Ensure legacy pre-v0.3.4 swarms are losslessly migrated into `events.jsonl` before appending new events.
+  // #NOT  Never overwrites an already-valid `events.jsonl` that contains a `swarm.init` frame.
+  // #EDGE-IN Calling `updateSwarm` (e.g. clicking Adjust slots) on a legacy swarm preserves 100% of legacy board/member/plan history → test_legacy_swarm_mutation_preserves_full_history_and_self_heals
+  // #WHY  Appending a bare `swarm.update` into a brand-new `events.jsonl` without migrating `swarm.json`/`board.jsonl` first would shadow legacy history.
+  _ensureLegacyMigrated(swarmId) {
+    const paths = this.pathsOf(swarmId)
+    const raw = this.readRawEvents(swarmId)
+    if (!fs.existsSync(paths.legacySwarmJson)) return raw
+    if (raw.length > 0 && raw.some(e => e && e.type === 'swarm.init')) return raw
+
+    const merged = this.readEventLog(swarmId)
+    if (merged.length > 0) {
+      const payload = merged.map(ev => JSON.stringify(ev)).join('\n') + '\n'
+      const tempPath = `${paths.eventsJsonl}.${process.pid}.${Date.now()}.migrate.tmp`
+      fs.writeFileSync(tempPath, payload, 'utf8')
+      try {
+        fs.renameSync(tempPath, paths.eventsJsonl)
+      } catch {
+        fs.writeFileSync(paths.eventsJsonl, payload, 'utf8')
+        try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath) } catch {}
+      }
+      if (!fs.existsSync(paths.offsetsJson) && fs.existsSync(paths.legacyMembersJson)) {
+        this.writeOffsets(swarmId, this.readOffsets(swarmId))
+      }
+    }
+    return merged
+  }
+
   /** Append one immutable Kafka-style event to `events.jsonl` and emit a `state.checkpoint` every `checkpointInterval` domain events. */
   appendEvent(swarmId, { type, actor = 'coordinator', seq = null, ts_ms = Date.now(), time = null, payload = {} }) {
     const paths = this.pathsOf(swarmId)
     fs.mkdirSync(paths.dir, { recursive: true })
-    const existing = this.readRawEvents(swarmId)
+    const existing = this._ensureLegacyMigrated(swarmId)
     const nextOffset = existing.length === 0 ? 1 : existing[existing.length - 1].offset + 1
     const eventTime = time || formatTime(new Date(ts_ms))
     const frame = {
@@ -417,10 +445,30 @@ export class SwarmStore {
     return offsets
   }
 
-  /** Read the ordered Kafka-style event log for `swarmId` (auto-synthesizing for legacy pre-v0.3.4 dirs). */
+  /** Read the ordered Kafka-style event log for `swarmId` (auto-synthesizing & self-healing legacy pre-v0.3.4 dirs). */
   readEventLog(swarmId) {
     const raw = this.readRawEvents(swarmId)
-    if (raw.length > 0) return raw
+    const p = this.pathsOf(swarmId)
+    const hasLegacy = fs.existsSync(p.legacySwarmJson)
+    if (raw.length > 0 && (!hasLegacy || raw.some(e => e && e.type === 'swarm.init'))) {
+      return raw
+    }
+    if (!hasLegacy) return raw
+
+    const synthesized = this._synthesizeLegacyEvents(swarmId)
+    if (raw.length === 0) return synthesized
+
+    // Self-heal: merge any orphaned post-migration events (e.g. `swarm.update` appended before migration) after the legacy stream.
+    let nextOffset = synthesized.length + 1
+    for (const ev of raw) {
+      if (!ev || typeof ev !== 'object') continue
+      synthesized.push({ ...ev, offset: nextOffset++ })
+    }
+    return synthesized
+  }
+
+  /** Synthesize an ordered event stream from pre-v0.3.4 legacy files (`swarm.json`, `board.jsonl`, `members.json`, `plan.json`). */
+  _synthesizeLegacyEvents(swarmId) {
     const p = this.pathsOf(swarmId)
     if (!fs.existsSync(p.legacySwarmJson)) return []
 
