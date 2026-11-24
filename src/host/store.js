@@ -10,6 +10,7 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { getRoleSpec } from './prompts.js'
 import {
   CHECKPOINT_INTERVAL,
   DOMAIN_MEMBER_FIELDS,
@@ -768,7 +769,7 @@ export class SwarmStore {
     const role = spec.role ?? 'worker'
     const canBlockMerge = spec.can_block_merge !== undefined
       ? Boolean(spec.can_block_merge)
-      : (role === 'verifier' || role === 'architect')
+      : getRoleSpec(role).canBlockMerge
 
     const briefTitle = typeof spec.title === 'string' && spec.title.trim()
       ? spec.title.trim().slice(0, 100)
@@ -843,9 +844,7 @@ export class SwarmStore {
       if (!rec || rec.type === 'control') continue
       const author = members[rec.agent]
       if (!author || author.killed) continue
-      const canBlock = author.can_block_merge === true
-        || author.role === 'verifier'
-        || author.role === 'architect'
+      const canBlock = author.can_block_merge === true || getRoleSpec(author.role).canBlockMerge
       if (!canBlock) continue
 
       const text = String(rec.text ?? '')

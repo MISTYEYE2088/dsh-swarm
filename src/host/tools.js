@@ -24,6 +24,7 @@ import {
   validateSwarmPlan,
 } from './validators.js'
 import { buildSwarmSystemMessage } from './stop-hook.js'
+import { getRoleSpec, getSpawnableRoles } from './prompts.js'
 import { runGit, createIsolatedWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
 
 const TEXT_OUTPUT_SCHEMA = Object.freeze({
@@ -164,7 +165,7 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       name,
       session_id: m.session_id,
       role: m.role,
-      can_block_merge: m.can_block_merge === true || m.role === 'verifier' || m.role === 'architect',
+      can_block_merge: m.can_block_merge === true || getRoleSpec(m.role).canBlockMerge,
       group: m.group ?? null,
       parent: m.parent ?? null,
       phase: m.last_error ? 'ERROR' : m.phase,
@@ -298,7 +299,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.9', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.10', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -425,7 +426,7 @@ export function createSwarmTools(runtime) {
     parameters: {
       properties: {
         name: { type: 'string', description: 'Lowercase member name (a-z, 0-9, -), e.g. "arch-lead", "impl-engine", "qa-gate", "spec-lore".' },
-        role: { type: 'string', enum: ['worker', 'architect', 'verifier', 'lore_master'], description: 'Role preset: "worker" (implementer), "architect" (architecture + structure gate), "verifier" (independent black-box QA + reject gate), or "lore_master" (read-only domain/spec librarian).' },
+        role: { type: 'string', enum: getSpawnableRoles(), description: `Role preset (${getSpawnableRoles().join(' | ')}).` },
         can_block_merge: { type: 'boolean', description: 'Whether this member\'s `verdict:"reject"` blocks `swarm_land` and `[done]` (default: true for architect/verifier, false for worker/lore_master).' },
         workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], description: 'Workspace mode: defaults to "share" for role="worker" when Git is available (isolated worktree with dirty sync), or "inherit" for read-only roles / non-Git dirs.' },
         brief: { type: 'string', description: 'Public brief MUST include literal [OWNERSHIP], [FORBIDDEN], and [DONE_CRITERIA] sections.' },
@@ -460,9 +461,9 @@ export function createSwarmTools(runtime) {
         const effectiveProvider = resolvedRoute.provider || spec.provider || 'inherit'
         const effectiveModel = resolvedRoute.model || spec.model || 'inherit'
 
-        // Tier-B guardrail: default code-writing workers to isolated `workspace="share"` when Git worktree is available.
+        // Tier-B guardrail: default roles with `autoShareInGit` (e.g. code-writing workers) to isolated `workspace="share"` when Git worktree is available.
         let effectiveWorkspace = spec.workspace
-        if (spec.role === 'worker' && !spec.workspaceExplicit) {
+        if (getRoleSpec(spec.role).autoShareInGit && !spec.workspaceExplicit) {
           const gitProbe = await runGit(['rev-parse', '--show-toplevel'], { cwd: mainCwd, timeoutMs: 3_000 })
           if (gitProbe.ok && gitProbe.stdout.trim().length > 0) {
             effectiveWorkspace = 'share'
@@ -1053,7 +1054,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.9', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.10', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,

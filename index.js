@@ -18,17 +18,24 @@ import { SwarmStore, defaultSwarmRoot, formatTime } from './src/host/store.js'
 import { ConcurrencyGate, PRIORITY, isConcurrencyFailure } from './src/host/concurrency-gate.js'
 import { handleTurnStopping, statusOf, buildSwarmSystemMessage } from './src/host/stop-hook.js'
 import { SwarmMonitorDaemon } from './src/host/monitor.js'
-import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
+import {
+  renderRolePrompt,
+  COORDINATOR_SOP_PROMPT,
+  registerRole,
+  unregisterRole,
+  getRoleSpec,
+  getSpawnableRoles,
+} from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.9'
+export const PLUGIN_VERSION = '0.3.10'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.9'
+    if (!fs.existsSync(headFile)) return 'release-0.3.10'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -50,6 +57,10 @@ export {
   statusOf,
   SwarmMonitorDaemon,
   renderRolePrompt,
+  registerRole,
+  unregisterRole,
+  getRoleSpec,
+  getSpawnableRoles,
   createSwarmTools,
   buildSwarmProjectionSnapshot,
 }
@@ -137,6 +148,14 @@ export function applyWith(ctx, config, deps = {}) {
   if (settings.enabled !== true) {
     log('disabled by config')
     return null
+  }
+
+  if (config?.roles && typeof config.roles === 'object') {
+    for (const [roleName, roleSpec] of Object.entries(config.roles)) {
+      if (roleSpec && typeof roleSpec === 'object') {
+        registerRole(roleName, roleSpec)
+      }
+    }
   }
 
   const swarmRoot = settings.swarmDir || deps.swarmDir || defaultSwarmRoot()
@@ -1091,19 +1110,19 @@ export function applyWith(ctx, config, deps = {}) {
   if (typeof disposeSessionEvent === 'function') disposers.push(disposeSessionEvent)
 
   // 2. Hook `llm/stream` waterfall for polite concurrency gating
+  const PRIORITY_BY_TIER = {
+    coordinator: PRIORITY.COORDINATOR,
+    high: PRIORITY.VERIFIER,
+    worker: PRIORITY.WORKER,
+    low: PRIORITY.MONITOR,
+  }
   const disposeLlmStream = ctx.on('llm/stream', function (options, next) {
     if (typeof next !== 'function') return undefined
     const initiator = ctx.get?.('agents')?.initiator?.()
     const agentId = initiator?.id ?? options?.agentId ?? 'main'
     const mapped = agentMembership.get(agentId)
     const role = mapped?.role ?? 'coordinator'
-    const priority = role === 'coordinator'
-      ? PRIORITY.COORDINATOR
-      : (role === 'verifier' || role === 'architect' || role === 'lore_master')
-        ? PRIORITY.VERIFIER
-        : role === 'monitor'
-          ? PRIORITY.MONITOR
-          : PRIORITY.WORKER
+    const priority = PRIORITY_BY_TIER[getRoleSpec(role).priorityTier] ?? PRIORITY.WORKER
     return concurrencyGate.wrapStream(options, next, {
       agentId,
       memberName: mapped?.memberName ?? 'coordinator',

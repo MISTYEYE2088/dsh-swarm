@@ -11,10 +11,11 @@ import {
   VALID_VERDICTS,
   extractMentionsFromText,
 } from './store.js'
+import { getRoleSpec, getSpawnableRoles } from './prompts.js'
 
 export const MEMBER_NAME_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 export const RESERVED_NAMES = new Set(['all', 'main', 'coordinator', 'system', 'user', 'monitor'])
-export const VALID_ROLES = Object.freeze(['worker', 'architect', 'verifier', 'lore_master'])
+export const VALID_ROLES = Object.freeze(getSpawnableRoles())
 export const REQUIRED_BRIEF_TAGS = ['[OWNERSHIP]', '[FORBIDDEN]', '[DONE_CRITERIA]']
 export const MAX_POST_CHARS = 4_000
 export const MIN_POST_CHARS = 6
@@ -179,10 +180,11 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   }
 
   const role = args.role ?? 'worker'
+  const allowedRoles = getSpawnableRoles()
   if (role === 'monitor') {
     return formatError(
       'swarm_add',
-      'Do not spawn role="monitor". The built-in Watchdog runs automatically as a deterministic 0-token background service (30s zombie/error probes). Use "worker", "architect", "verifier", or "lore_master".',
+      `Do not spawn role="monitor". The built-in Watchdog runs automatically (0-token). Allowed roles: ${allowedRoles.map(r => `"${r}"`).join(' | ')}.`,
       {
         name: args.name && args.name !== 'monitor' ? args.name : 'qa-gate',
         role: 'verifier',
@@ -191,8 +193,8 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       },
     )
   }
-  if (!VALID_ROLES.includes(role)) {
-    return formatError('swarm_add', `Invalid role "${role}". Allowed roles: ${VALID_ROLES.map(r => `"${r}"`).join(' | ')}.`, {
+  if (!allowedRoles.includes(role)) {
+    return formatError('swarm_add', `Invalid role "${role}". Allowed roles: ${allowedRoles.map(r => `"${r}"`).join(' | ')}.`, {
       name: args.name || 'impl-core',
       role: 'worker',
       workspace: 'inherit',
@@ -308,7 +310,7 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
 
   const canBlockMerge = args.can_block_merge !== undefined
     ? Boolean(args.can_block_merge)
-    : (role === 'verifier' || role === 'architect')
+    : getRoleSpec(role).canBlockMerge
 
   return {
     ok: true,
@@ -524,7 +526,7 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     && !isDonePost
   ) {
     const defaultTarget = callerRole === 'worker'
-      ? (activeNames.find(n => existingMembers[n]?.role === 'verifier' || existingMembers[n]?.role === 'architect') ?? 'coordinator')
+      ? (activeNames.find(n => getRoleSpec(existingMembers[n]?.role).canBlockMerge) ?? 'coordinator')
       : 'coordinator'
     return formatError(
       'post_board',

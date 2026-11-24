@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.10 (2026-11-24)
+
+- **Parameterized Single-Source-of-Truth Role Registry (`ROLE_REGISTRY` / `registerRole`)**:
+  - Replaced all hardcoded `role === '...'` branches across `stop-hook.js`, `validators.js`, `projector.js`, `store.js`, `tools.js`, and `index.js` with a single declarative role table in `src/host/prompts.js` (`registerRole`, `getRoleSpec`, `getSpawnableRoles`).
+  - Every non-coordinator role automatically inherits Stop-Hook unparked protection (`requireParkOnStop: true` by default), merge-gate defaults (`canBlockMerge`), auto-worktree defaults (`autoShareInGit`), concurrency priority (`priorityTier`), and custom prompts—and custom roles can also be declared via `config.roles` in `cordis.patch.yml` with zero code changes.
+
 ## 0.3.9 (2026-11-23)
 
 - **Compact Wire Format & Token Optimization (~60–75% Smaller Recurring Injections)**:

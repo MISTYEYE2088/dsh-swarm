@@ -84,17 +84,105 @@ You are **Lore Master \`@{{MEMBER_NAME}}\`** (role: \`lore_master\`, read-only d
 4. **Read-Only**: Never edit production code, configs, or tests. Keep a running mental index of consulted sections across turns to answer follow-ups rapidly.
 5. **Board & Parking**: Reply directly to the asking member with a meaningful \`title\`, cite \`#seq\`, and end every turn with \`swarm_wait({"since": <latestReadSeq>, "mentions_only": true})\`.`
 
+const ROLE_REGISTRY = new Map()
+
+// #FUNC Register a declarative Swarm role preset (prompt + behavioral capabilities) in the single `ROLE_REGISTRY` table.
+// #NOT  Never requires updating hardcoded `role === '...'` branches in stop-hook, validators, projector, tools, or concurrency priority.
+// #EDGE-IN Registering a custom role like `nic_auditor` automatically unlocks `swarm_add`, Stop-Hook unparked protection, and merge-gate flags → test_parameterized_role_registry_auto_covers_stop_hook_and_gates
+// #WHY  Centralizing `ROLE_REGISTRY` ensures adding any new role is a single declarative registration with zero duplicated role checks.
+export function registerRole(name, spec = {}) {
+  const roleName = String(name ?? '').trim().toLowerCase()
+  if (!roleName) throw new Error('Role name cannot be empty')
+  const entry = Object.freeze({
+    name: roleName,
+    spawnable: spec.spawnable !== false,
+    canBlockMerge: Boolean(spec.canBlockMerge),
+    autoShareInGit: Boolean(spec.autoShareInGit),
+    priorityTier: spec.priorityTier || 'worker', // 'coordinator' | 'high' | 'worker' | 'low'
+    requireParkOnStop: spec.requireParkOnStop !== undefined
+      ? Boolean(spec.requireParkOnStop)
+      : roleName !== 'coordinator',
+    prompt: typeof spec.prompt === 'string' && spec.prompt.length > 0 ? spec.prompt : WORKER_SOP_PROMPT,
+  })
+  ROLE_REGISTRY.set(roleName, entry)
+  return entry
+}
+
+/** Remove a custom registered role (used by tests or dynamic plugin disposal). */
+export function unregisterRole(name) {
+  return ROLE_REGISTRY.delete(String(name ?? '').trim().toLowerCase())
+}
+
+/** Resolve declarative capabilities and prompt for `role`, defaulting safely so all non-coordinator roles inherit Stop-Hook protection. */
+export function getRoleSpec(role) {
+  const key = String(role ?? 'worker').trim().toLowerCase()
+  const found = ROLE_REGISTRY.get(key)
+  if (found) return found
+  return Object.freeze({
+    name: key || 'worker',
+    spawnable: false,
+    canBlockMerge: false,
+    autoShareInGit: false,
+    priorityTier: key === 'monitor' ? 'low' : 'worker',
+    requireParkOnStop: key !== 'coordinator' && key !== 'monitor',
+    prompt: WORKER_SOP_PROMPT,
+  })
+}
+
+/** Return all currently spawnable role names from `ROLE_REGISTRY`. */
+export function getSpawnableRoles() {
+  const names = []
+  for (const entry of ROLE_REGISTRY.values()) {
+    if (entry.spawnable) names.push(entry.name)
+  }
+  return names
+}
+
+// Built-in declarative role presets (single source of truth)
+registerRole('coordinator', {
+  spawnable: false,
+  canBlockMerge: false,
+  autoShareInGit: false,
+  priorityTier: 'coordinator',
+  requireParkOnStop: false,
+  prompt: COORDINATOR_SOP_PROMPT,
+})
+registerRole('worker', {
+  spawnable: true,
+  canBlockMerge: false,
+  autoShareInGit: true,
+  priorityTier: 'worker',
+  requireParkOnStop: true,
+  prompt: WORKER_SOP_PROMPT,
+})
+registerRole('architect', {
+  spawnable: true,
+  canBlockMerge: true,
+  autoShareInGit: false,
+  priorityTier: 'high',
+  requireParkOnStop: true,
+  prompt: ARCHITECT_SOP_PROMPT,
+})
+registerRole('verifier', {
+  spawnable: true,
+  canBlockMerge: true,
+  autoShareInGit: false,
+  priorityTier: 'high',
+  requireParkOnStop: true,
+  prompt: VERIFIER_SOP_PROMPT,
+})
+registerRole('lore_master', {
+  spawnable: true,
+  canBlockMerge: false,
+  autoShareInGit: false,
+  priorityTier: 'high',
+  requireParkOnStop: true,
+  prompt: LORE_MASTER_SOP_PROMPT,
+})
+
 /** Render a role prompt template with member-specific variables. */
 export function renderRolePrompt(role, vars = {}) {
-  const template = role === 'coordinator'
-    ? COORDINATOR_SOP_PROMPT
-    : role === 'architect'
-      ? ARCHITECT_SOP_PROMPT
-      : role === 'verifier'
-        ? VERIFIER_SOP_PROMPT
-        : role === 'lore_master'
-          ? LORE_MASTER_SOP_PROMPT
-          : WORKER_SOP_PROMPT
+  const template = getRoleSpec(role).prompt
 
   return template
     .replaceAll('{{MEMBER_NAME}}', String(vars.memberName ?? 'worker'))

@@ -13,6 +13,8 @@
 //       2. A natural sliding window (~50..100 raw events) of fresh recent history;
 //       3. Strictly bounded replay work regardless of total event log length.
 
+import { getRoleSpec } from './prompts.js'
+
 export const CHECKPOINT_INTERVAL = 50
 export const CHECKPOINT_RECENT_EDGES_LIMIT = 64
 
@@ -285,7 +287,7 @@ export class SwarmStateProjector {
         name: p.name,
         session_id: p.session_id ?? `${acc.swarm?.swarm_id ?? 'swarm'}__${p.name}`,
         role,
-        can_block_merge: p.can_block_merge !== undefined ? Boolean(p.can_block_merge) : (role === 'verifier' || role === 'architect'),
+        can_block_merge: p.can_block_merge !== undefined ? Boolean(p.can_block_merge) : getRoleSpec(role).canBlockMerge,
         group: p.group ?? null,
         parent: p.parent ?? 'coordinator',
         desired_state: 'RUNNING',

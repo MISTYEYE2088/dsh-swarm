@@ -13,6 +13,7 @@
 //    and `zombie` from healthy `waiting`.
 
 import { randomUUID } from 'node:crypto'
+import { getRoleSpec } from './prompts.js'
 
 export const DEFAULT_STARTUP_GRACE_MS = 60_000
 
@@ -78,9 +79,9 @@ export function handleTurnStopping({
     }
   }
 
-  // Case 2: Safeguard — worker, architect, verifier, or lore_master finished without calling `swarm_wait`.
+  // Case 2: Safeguard — any role with `requireParkOnStop` (all non-coordinator roles by default) finished without `swarm_wait`.
   if (
-    (member.role === 'worker' || member.role === 'architect' || member.role === 'verifier' || member.role === 'lore_master')
+    getRoleSpec(member.role).requireParkOnStop
     && turnState
     && turnState.calledSwarmWait !== true
     && (turnState.unparkedBlockCount ?? 0) < maxUnparkedBlocks

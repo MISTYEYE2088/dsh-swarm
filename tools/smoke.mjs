@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.9/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.10/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.9/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.10/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2280,6 +2280,62 @@ async function test_lore_master_role_and_tier_b_guardrails() {
   await registeredTools.get('swarm_kill').execute({ name: 'impl-tx', force: true }, { agent: coordAgent })
 }
 
+async function test_parameterized_role_registry_auto_covers_stop_hook_and_gates() {
+  const { registerRole, unregisterRole, getSpawnableRoles, getRoleSpec, renderRolePrompt } = await import('../src/host/prompts.js')
+  try {
+    registerRole('nic_auditor', {
+      prompt: '# [SWARM: NIC AUDITOR (@{{MEMBER_NAME}})]\nCheck PCIe DMA rings.',
+      canBlockMerge: true,
+      priorityTier: 'high',
+    })
+
+    // 1. Dynamically appears in spawnable roles and passes validateSwarmAdd without touching validators.js
+    assert.equal(getSpawnableRoles().includes('nic_auditor'), true)
+    assert.equal(getRoleSpec('nic_auditor').requireParkOnStop, true)
+    const val = validateSwarmAdd(
+      {
+        name: 'dma-audit',
+        role: 'nic_auditor',
+        brief: '[OWNERSHIP]\nDMA rings\n[FORBIDDEN]\nEdits\n[DONE_CRITERIA]\nAudit report',
+      },
+      { swarm_id: 'sw-role', status: 'ACTIVE', concurrency_confirmed: true, concurrency_limit: 4 },
+      {},
+      'coordinator',
+    )
+    assert.equal(val.ok, true)
+    assert.equal(val.value.can_block_merge, true)
+
+    // 2. Custom prompt renders directly from registry
+    const rendered = renderRolePrompt('nic_auditor', { memberName: 'dma-audit' })
+    assert.match(rendered, /NIC AUDITOR \(@dma-audit\)/)
+
+    // 3. Stop-Hook unparked protection covers custom role automatically with zero hardcoded checks
+    const store = new SwarmStore(path.join(tempRoot, 'role-registry-stop'))
+    store.initSwarm('sw-role', { title: 'Role Registry', concurrency_confirmed: true })
+    store.registerMemberWithBrief('sw-role', {
+      name: 'dma-audit',
+      session_id: 'sw-role__dma-audit',
+      role: 'nic_auditor',
+      brief: '[OWNERSHIP] dma\n[FORBIDDEN] src\n[DONE_CRITERIA] audit',
+    })
+    assert.equal(store.readMembers('sw-role')['dma-audit'].can_block_merge, true)
+
+    const steered = []
+    const stopRes = handleTurnStopping({
+      store,
+      swarmId: 'sw-role',
+      memberName: 'dma-audit',
+      agent: { steer(msg) { steered.push(msg) } },
+      turnState: { calledSwarmWait: false, unparkedBlockCount: 0 },
+    })
+    assert.equal(stopRes.blocked, true)
+    assert.equal(stopRes.reason, 'missing_swarm_wait')
+    assert.equal(steered.length, 1)
+  } finally {
+    unregisterRole('nic_auditor')
+  }
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -2356,6 +2412,7 @@ try {
   await runTest('test_swarm_concurrency_tool_coordinator_only_and_validation', test_swarm_concurrency_tool_coordinator_only_and_validation)
   await runTest('test_scoped_lazy_tool_unlock_on_swarm_init', test_scoped_lazy_tool_unlock_on_swarm_init)
   await runTest('test_lore_master_role_and_tier_b_guardrails', test_lore_master_role_and_tier_b_guardrails)
+  await runTest('test_parameterized_role_registry_auto_covers_stop_hook_and_gates', test_parameterized_role_registry_auto_covers_stop_hook_and_gates)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })
