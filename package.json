@@ -1,7 +1,7 @@
 {
   "name": "dsh-swarm",
   "version": "0.3.7",
-  "description": "DeepSeek Harness out-of-tree Swarm plugin: 3-file append-only blackboard (board.jsonl, members.json, swarm.json + plan.json), zero-token swarm_wait with Stop-Hook race lock, polite 4-6 concurrency gate, and strict format guardrails for glm5.3 / deepseek4.1f.",
+  "description": "Out-of-tree Multi-Agent Swarm (/swarm) plugin for DeepSeek Harness (dsh): 2-file SSOT event-sourced blackboard (events.jsonl + offsets.json) with 50-event checkpoints, scoped lazy tool unlocking, zero-token swarm_wait + Stop-Hook race lock, Git worktree isolation, and live Board / Control / Round Table UI.",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -32,7 +32,7 @@
   ],
   "scripts": {
     "test": "node tools/smoke.mjs",
-    "test:boot": "node tools/boot-check.mjs /mnt/c/portable_software/dsh/deepseek-harness/vendor/cordis",
+    "test:boot": "node tools/boot-check.mjs",
     "verify:install": "node tools/verify-install.mjs"
   },
   "engines": {

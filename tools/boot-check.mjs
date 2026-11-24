@@ -13,8 +13,8 @@ import os from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
-const DEFAULT_CORDIS_DIR = '/mnt/c/portable_software/dsh/deepseek-harness/vendor/cordis'
-const specifier = process.argv[2] ?? (fs.existsSync(DEFAULT_CORDIS_DIR) ? DEFAULT_CORDIS_DIR : '@deepseek-ai/cordis')
+const SIBLING_CORDIS_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', '..', 'deepseek-harness', 'vendor', 'cordis')
+const specifier = process.argv[2] ?? process.env.DSH_CORDIS_PATH ?? (fs.existsSync(SIBLING_CORDIS_DIR) ? SIBLING_CORDIS_DIR : '@deepseek-ai/cordis')
 const cordisSpec = /^[a-zA-Z]:[\\/]/.test(specifier) || specifier.startsWith('/') || specifier.startsWith('.')
   ? pathToFileURL(specifier.endsWith('.js') ? specifier : specifier.replace(/[\\/]+$/, '') + '/lib/index.js').href
   : specifier

@@ -1,54 +1,106 @@
 # dsh-swarm
 
-[English](README.md) · [中文](README.zh.md) · [Architecture Spec](SPEC.md)
+[English](README.md) · [中文](README.zh.md) · [Changelog](CHANGELOG.md)
 
-Out-of-tree **Swarm Mode (`/swarm`)** plugin for **DeepSeek Harness (`dsh`)** — built around a three-file plain-text blackboard (`swarm.json`, `board.jsonl`, `members.json`) plus a static `plan.json` overview, zero-token `swarm_wait` with a Stop-Hook race lock, isolated Git worktrees with dirty-tree sync, and a polite 1–6 concurrency gate tailored for self-hosted internal models (`glm5.3` / `deepseek4.1f`).
+Out-of-tree **Multi-Agent Swarm (`/swarm`)** plugin for **DeepSeek Harness (`dsh`)** — featuring a **2-file Single-Source-of-Truth event-sourced blackboard** (`events.jsonl` + `offsets.json`) with automatic 50-event checkpoints, **per-agent lazy tool unlocking** (only `swarm_init` loaded on normal chats), **zero-token `swarm_wait`** with a Stop-Hook race lock, **isolated Git worktrees**, **built-in Watchdog & Merge Gate**, and a live right-sidebar **Board / Control / Round Table** UI.
 
-## Install (Remote or Local)
+---
 
-Pick either remote GitHub installation (no local clone or build step required) or local path installation, then restart `dsh web`:
+## Install from GitHub (Zero Build Step)
 
-```powershell
-# 1) Remote install directly from GitHub (zero build step, works out of the box)
+Install directly from GitHub into your DSH `web` profile, then restart `dsh web` and hard-refresh the browser (`Ctrl+Shift+R`):
+
+```bash
+# If you installed `dsh` globally:
+dsh plugin --profile web add https://github.com/MISTYEYE2088/dsh-swarm
+
+# If you run DSH from a source checkout (deepseek-harness monorepo):
 pnpm dsh plugin --profile web add https://github.com/MISTYEYE2088/dsh-swarm
-
-# 2) Or install from a local checkout
-pnpm dsh plugin --profile web add C:\portable_software\dsh\dsh-swarm
-
-# 3) Verify profile composition without starting the server
-pnpm dsh --profile web --dump-config | Select-String 'dsh-swarm'
 ```
 
-## Compatibility
+Verify the profile loaded `dsh-swarm` before starting:
 
-Declared and verified against DeepSeek Harness:
+```bash
+dsh --profile web --dump-config | grep dsh-swarm
+# PowerShell: pnpm dsh --profile web --dump-config | Select-String 'dsh-swarm'
+```
 
-`0.2.0-rc.2` (matches `package.json` → `dsh.compatibility.dshReleases`)
+### Updating or Uninstalling
 
-- **Zero build step & no `prepare` lifecycle script**: `index.js` (Host ESM) and `client.js` (Browser classic-script combo) ship ready to load, so `dsh plugin add https://github.com/MISTYEYE2088/dsh-swarm` is never blocked by pnpm 10+ `allowBuilds`.
-- **Zero `peerDependencies`**: imports only `node:` built-ins on the Host and platform seed modules in the Browser, so DSH version upgrades never require manual `dsh plugin allow-version` exemptions.
-- **No `Config` export**: avoids the Cordis `resolveConfig` plain-object startup crash; row configuration is merged safely inside `apply()`.
+```bash
+# Update to latest GitHub commit
+dsh plugin --profile web remove dsh-swarm
+dsh plugin --profile web add https://github.com/MISTYEYE2088/dsh-swarm
+
+# Uninstall completely
+dsh plugin --profile web remove dsh-swarm
+```
+
+*(Restart `dsh web` after installing, updating, or removing the plugin.)*
+
+---
+
+## Quick Start
+
+1. **Normal chats stay clean**: By default, only a single entry tool (`swarm_init`) is visible on your main session—zero prompt bloat from the rest of the Swarm toolset.
+2. **Start a Swarm**: Type `/swarm <your task>` in the composer (or ask the model to call `swarm_init`):
+   ```text
+   /swarm Refactor the auth middleware, add unit tests, and run an independent verification pass
+   ```
+   - Calling `swarm_init` dynamically unlocks the remaining **10 Swarm tools** strictly on that session (`agent.ctx.tools`).
+   - All agent transcripts live in DSH's native `~/.dsh/sessions/`; blackboard events live in `~/.dsh/swarm/<sessionId>/`.
+3. **Open the Swarm Right Sidebar**: Click the **Swarm** badge in the top-right header (or switch to the **Swarm** tab in the right sidebar):
+   - **Board**: Newest-first message stream, collapsed by default to meaningful titles with an expand/collapse toggle right of the timestamp, clickable `#seq` floor jumps, and a smooth 3.2s yellow arrival highlight (`NEW`) with flicker-free polling.
+   - **Control**: Read-only live dashboard showing Merge Gate `[REJECT]` blockers, LLM In-Flight Slots (`active/limit · queued`), Watchdog status, active Plan/Tracks, Roster with `Open Session` links, and Screenshot Progress Reel.
+   - **Round Table**: Interactive SVG communication topology where the latest round's arrows glow bright yellow and older steps progressively darken and fade out, `@all` broadcasts point to the center table, and a Kafka offset/timestamp scrubber replays exact historical active seats across waves.
+
+### When to Use (and Skip) Swarm
+- **Great fit**: Independent parallel tracks with disjoint write scopes, cross-module debugging, architecture/spec + implementation split, or high-stakes edits needing an independent `verifier` with real test samples.
+- **Skip Swarm**: Single-file quick edits or tightly sequential tasks where orchestration overhead exceeds a single agent.
+
+---
+
+## Tool Surface (Scoped Lazy Loading)
+
+| Tool | Scope / Role | Purpose |
+| --- | --- | --- |
+| `swarm_init` | **Global entry tool** (Coordinator) | Initialize Swarm, probe Git worktree / subdirectory repos, and dynamically unlock the other 10 tools for this session |
+| `swarm_plan` | Coordinator (unlocked after init) | Publish/update Wave & Track plan (≤ 64 KB) |
+| `swarm_add` | Coordinator (unlocked after init) | Atomically spawn a `worker`, `architect`, or `verifier` (with optional `share`/`branch` Git worktree isolation) |
+| `swarm_concurrency` | Coordinator (unlocked after init) | Adjust in-flight LLM request slots dynamically (`limit >= 1`) |
+| `swarm_land` | Coordinator (unlocked after init) | `diff` or `apply` a member's isolated worktree back to main workspace (enforces `[REJECT]` merge gate) |
+| `swarm_kill` | Coordinator (unlocked after init) | Retire a member and clean up worktree (releases name if 0 turns & 0 posts, otherwise tombstones to preserve history) |
+| `post_board` | Coordinator + Workers | Post titled message with explicit `@mentions`, `kind`, optional `verdict` (`approve`/`reject`/`override`), `supersedes`, `escalate`, `silent` |
+| `read_board` | Coordinator + Workers | Read board posts with `since`, `channel`, `mentions_only`, `kinds`, `include_superseded`, `limit` |
+| `swarm_wait` | Coordinator + Workers | Park at 0 idle token cost (`exec.concludeTurn()`) until matching board activity arrives; Stop-Hook prevents missed-message races |
+| `swarm_status` | Coordinator + Workers | Inspect live member liveness (`working`/`waiting`/`starting`/`zombie`/`error`), turn/tool counts, slots, Watchdog, and merge gate |
+| `swarm_model` | Coordinator + Workers | Hot-swap a member's `provider/model` in place while preserving conversation history |
+
+---
 
 ## Key Architecture
 
-| Mechanism | Implementation |
-| --- | --- |
-| **Phase-0 Concurrency Confirmation** | Blocks `swarm_add` until the Coordinator calls `ask_user_question` to confirm the concurrency budget (`2 / 3 / 4 / 6`) and model mix (`glm5.3` / `deepseek4.1f`), protecting shared internal GPU clusters. |
-| **Polite Concurrency Gate (`ConcurrencyGate`)** | Wraps DSH `llm/stream` waterfall with 4 priority tiers (`P0 Coordinator > P1 Verifier > P2 Worker [fair round-robin] > P3 Monitor`), `200ms` inter-request pacing, `AbortSignal` queue cleanup, and HTTP 429 AIMD dynamic backoff. |
-| **3-File Blackboard + `plan.json`** | Stored under `<DSH_HOME>/swarm/<sessionId>/`: `swarm.json`, `board.jsonl` (append-only posts + event-sourced `#channel` control frames via `replayChannelsAt`), `members.json` (5 floor cursors: `last_read_seq`, `wait_since`, `last_nudged_seq`, `last_park_blocked_seq`, `last_post_seq`; `desired_model`/`applied_model`; permanent tombstone lock on `killed` names), and static `plan.json` (≤ 64 KB, replacing the token-burning narrator). |
-| **Zero-Token Idle & Stop-Hook Race Lock** | `swarm_wait` invokes `exec.concludeTurn()` to end the turn immediately at 0 idle token cost. Hooks `agent/turn-stopping` to block termination if new relevant posts arrived on `board.jsonl` during the closing window (`last_park_blocked_seq`) or if a worker forgot to call `swarm_wait`. |
-| **Git Worktree + Dirty Overlay Sync** | `workspace: "share"` creates a detached git worktree and copies uncommitted staged, unstaged, and untracked files from the main workspace into a baseline snapshot so `swarm_land` computes pure worker incremental diffs and blocks `swarm_kill` if unmerged edits remain. |
-| **Strict Format Guardrails for `glm5.3` / `deepseek4.1f`** | Enforces `[OWNERSHIP]`, `[FORBIDDEN]`, and `[DONE_CRITERIA]` brief sections, mandatory `@mentions` on worker reports, bans `@#main` broadcast storms, and returns self-healing JSON templates on any format violation. |
+- **2-File Single Source of Truth (`events.jsonl` + `offsets.json`)**:
+  - `events.jsonl`: Append-only immutable event log storing **all domain facts** (`swarm.init`, `swarm.update`, `plan.update`, `member.spawn`, `member.kill`, `member.model_switch`, `board.post`, `board.control`, `swarm.done`).
+  - `offsets.json`: Mutable per-member **consumer cursors & runtime telemetry ONLY** (`last_read_seq`, `wait_since`, `wake_mode`, `wake_kinds`, `turn_count`, `tool_call_count`, `last_error`). Zero overlapping domain facts.
+- **Stateless Projector + 50-Event Auto-Checkpoints (`src/host/projector.js`)**: Every 50 domain events, a compact `state.checkpoint` frame is appended to `events.jsonl`. `SwarmStateProjector` automatically anchors on the **second-newest** valid checkpoint, keeping replay strictly $O(1)$-bounded even on multi-thousand-event swarms while surviving a torn newest checkpoint.
+- **Polite Concurrency Gate (`ConcurrencyGate`)**: Wraps DSH `llm/stream` with priority tiers (`Coordinator > Verifier/Architect > Worker round-robin`), pacing, `AbortSignal` cleanup, and HTTP 429 AIMD backoff. Works with any model configured in DSH (`inherit` or `provider/model`).
+- **Built-in Deterministic Watchdog & Merge Gate**: Zero-token host timer detects zombies (`0 turns` past threshold) even while peers are active; `[REJECT]` verdicts from `verifier`/`architect` block `swarm_land` and `[done]` until resolved or explicitly overridden.
+- **100% English Runtime & UI**: Enforced by automated smoke tests so multilingual models never drift output languages.
 
-## Verification
+---
+
+## Compatibility & Verification
+
+Verified against DeepSeek Harness **`0.2.0-rc.2`** (zero build step, zero `prepare` scripts, zero `peerDependencies`, no `Config` export):
 
 ```bash
 node --check index.js && node --check client.js
-npm run test:boot      # Mounts in a real @deepseek-ai/cordis Context + sibling session/event dispatch
-npm test               # 30 end-to-end smoke & guardrail scenarios
+npm test               # 51 end-to-end smoke, SSOT, checkpoint, scoped-tool, and UI tests
 npm run verify:install # Tarball pack + isolated clean install gate
+npm run test:boot      # Real @deepseek-ai/cordis mount check (set DSH_CORDIS_PATH if needed)
 ```
 
 ## License
 
-[MIT](LICENSE).
+[MIT](LICENSE)

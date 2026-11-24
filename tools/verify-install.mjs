@@ -65,8 +65,12 @@ try {
     'utf8',
   )
 
+  const cleanEnv = Object.fromEntries(
+    Object.entries(process.env).filter(([k]) => !k.toLowerCase().startsWith('npm_')),
+  )
   const installRes = spawnSync('npm', ['install', '--no-audit', '--no-fund', tarballPath], {
     cwd: consumerDir,
+    env: cleanEnv,
     shell: false,
     encoding: 'utf8',
   })
@@ -76,7 +80,7 @@ try {
   pass('installed packed tarball into isolated scratch consumer with zero external network deps')
 
   const installedPkgDir = path.join(consumerDir, 'node_modules', manifest.name)
-  for (const requiredFile of ['index.js', 'client.js', 'cordis.patch.yml', 'LICENSE', 'src/host/store.js', 'src/host/tools.js']) {
+  for (const requiredFile of ['index.js', 'client.js', 'cordis.patch.yml', 'LICENSE', 'src/host/projector.js', 'src/host/store.js', 'src/host/tools.js']) {
     if (!fs.existsSync(path.join(installedPkgDir, requiredFile))) {
       fail('missing required file in packed artifact: ' + requiredFile)
     }
