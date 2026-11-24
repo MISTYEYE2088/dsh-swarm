@@ -66,7 +66,7 @@ dsh plugin --profile web remove dsh-swarm
 | --- | --- | --- |
 | `swarm_init` | **Global entry tool** (Coordinator) | Initialize Swarm, probe Git worktree / subdirectory repos, and dynamically unlock the other 10 tools for this session |
 | `swarm_plan` | Coordinator (unlocked after init) | Publish/update Wave & Track plan (≤ 64 KB) |
-| `swarm_add` | Coordinator (unlocked after init) | Atomically spawn a `worker`, `architect`, or `verifier` (with optional `share`/`branch` Git worktree isolation) |
+| `swarm_add` | Coordinator (unlocked after init) | Atomically spawn a `worker`, `architect`, `verifier`, or `lore_master` (defaults `worker` to isolated `share` Git worktree when available) |
 | `swarm_concurrency` | Coordinator (unlocked after init) | Adjust in-flight LLM request slots dynamically (`limit >= 1`) |
 | `swarm_land` | Coordinator (unlocked after init) | `diff` or `apply` a member's isolated worktree back to main workspace (enforces `[REJECT]` merge gate) |
 | `swarm_kill` | Coordinator (unlocked after init) | Retire a member and clean up worktree (releases name if 0 turns & 0 posts, otherwise tombstones to preserve history) |

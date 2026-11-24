@@ -298,7 +298,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.7', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.8', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -421,13 +421,13 @@ export function createSwarmTools(runtime) {
 
   const swarmAddTool = makeTool({
     name: 'swarm_add',
-    description: 'Atomically spawn one named Swarm member (or a numbered group <name>-1..n) with role preset ("worker" | "architect" | "verifier") and a 3-part brief ([OWNERSHIP], [FORBIDDEN], [DONE_CRITERIA]). Rolls back cleanly on spawn failure so zero zombies remain.',
+    description: 'Atomically spawn one named Swarm member (or a numbered group <name>-1..n) with role preset ("worker" | "architect" | "verifier" | "lore_master") and a 3-part brief ([OWNERSHIP], [FORBIDDEN], [DONE_CRITERIA]). Defaults code-writing workers to isolated `workspace="share"` when Git is available. Rolls back cleanly on spawn failure so zero zombies remain.',
     parameters: {
       properties: {
-        name: { type: 'string', description: 'Lowercase member name (a-z, 0-9, -), e.g. "arch-lead", "impl-engine", "qa-gate".' },
-        role: { type: 'string', enum: ['worker', 'architect', 'verifier'], description: 'Role preset: "worker" (implementer), "architect" (architecture owner + review gate), or "verifier" (independent adversarial QA + reject gate).' },
-        can_block_merge: { type: 'boolean', description: 'Whether this member\'s `[REJECT]` / `verdict:"reject"` blocks `swarm_land` and `[done]` (default: true for architect/verifier, false for worker).' },
-        workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], description: 'inherit (shared cwd), share (isolated git worktree with dirty sync), or branch.' },
+        name: { type: 'string', description: 'Lowercase member name (a-z, 0-9, -), e.g. "arch-lead", "impl-engine", "qa-gate", "spec-lore".' },
+        role: { type: 'string', enum: ['worker', 'architect', 'verifier', 'lore_master'], description: 'Role preset: "worker" (implementer), "architect" (architecture + structure gate), "verifier" (independent black-box QA + reject gate), or "lore_master" (read-only domain/spec librarian).' },
+        can_block_merge: { type: 'boolean', description: 'Whether this member\'s `verdict:"reject"` blocks `swarm_land` and `[done]` (default: true for architect/verifier, false for worker/lore_master).' },
+        workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], description: 'Workspace mode: defaults to "share" for role="worker" when Git is available (isolated worktree with dirty sync), or "inherit" for read-only roles / non-Git dirs.' },
         brief: { type: 'string', description: 'Public brief MUST include literal [OWNERSHIP], [FORBIDDEN], and [DONE_CRITERIA] sections.' },
         provider: { type: 'string', description: 'Optional provider override.' },
         model: { type: 'string', description: 'Optional model override (or "inherit").' },
@@ -460,6 +460,15 @@ export function createSwarmTools(runtime) {
         const effectiveProvider = resolvedRoute.provider || spec.provider || 'inherit'
         const effectiveModel = resolvedRoute.model || spec.model || 'inherit'
 
+        // Tier-B guardrail: default code-writing workers to isolated `workspace="share"` when Git worktree is available.
+        let effectiveWorkspace = spec.workspace
+        if (spec.role === 'worker' && !spec.workspaceExplicit) {
+          const gitProbe = await runGit(['rev-parse', '--show-toplevel'], { cwd: mainCwd, timeoutMs: 3_000 })
+          if (gitProbe.ok && gitProbe.stdout.trim().length > 0) {
+            effectiveWorkspace = 'share'
+          }
+        }
+
         for (let i = 0; i < spec.targetNames.length; i += 1) {
           const memberName = spec.targetNames[i]
           const sliceTask = spec.tasks && spec.tasks[i] ? `\n[SHARD_TASK]\n${spec.tasks[i]}` : ''
@@ -471,13 +480,13 @@ export function createSwarmTools(runtime) {
             base_commit: null,
             baseline_commit: null,
           }
-          if (spec.workspace === 'share' || spec.workspace === 'branch') {
+          if (effectiveWorkspace === 'share' || effectiveWorkspace === 'branch') {
             const wtRes = await createIsolatedWorktree({
               mainCwd,
               worktreesRoot: runtime.worktreesRoot,
               swarmId,
               memberName,
-              mode: spec.workspace,
+              mode: effectiveWorkspace,
             })
             if (!wtRes.ok) {
               return { ok: false, text: `[WORKTREE_ERROR: swarm_add] Failed to provision isolated worktree for @${memberName}: ${wtRes.error}` }
@@ -756,7 +765,21 @@ export function createSwarmTools(runtime) {
         })
 
         let archivePath = null
+        let releaseHygiene = null
         if (isDonePost) {
+          const swarmMeta = store.readSwarm(swarmId)
+          if (swarmMeta?.project_root) {
+            const st = await runGit(['status', '--porcelain'], { cwd: swarmMeta.project_root, timeoutMs: 3_000 })
+            if (st.ok && st.stdout.trim().length > 0) {
+              const dirtyLines = st.stdout.split(/\r?\n/).map(l => l.trim()).filter(Boolean)
+              const hasScratch = dirtyLines.some(l => /(?:^|\s|\/)(?:scratch|mutants|tmp)(?:\/|$)/i.test(l))
+              releaseHygiene = {
+                dirty_count: dirtyLines.length,
+                has_scratch_artifacts: hasScratch,
+                sample: dirtyLines.slice(0, 8),
+              }
+            }
+          }
           store.appendEvent(swarmId, {
             type: 'swarm.done',
             actor: callerName,
@@ -801,6 +824,9 @@ export function createSwarmTools(runtime) {
         const archiveNote = archivePath
           ? `\n[SWARM_ARCHIVED] Archived blackboard artifacts to: ${archivePath}`
           : ''
+        const hygieneNote = releaseHygiene
+          ? `\n[RELEASE_HYGIENE_WARN] ${releaseHygiene.dirty_count} uncommitted/untracked path(s) remain in project_root${releaseHygiene.has_scratch_artifacts ? ' (includes scratch/mutants/tmp artifacts!)' : ''}: ${releaseHygiene.sample.join(', ')}. Inspect \`git status\` and clean temporary files before sharing.`
+          : ''
         const fp = typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null
         const fpNote = (archivePath && fp) ? `\n[RUNTIME] dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})` : ''
 
@@ -814,7 +840,8 @@ export function createSwarmTools(runtime) {
           unreachable: unreachableTargets,
           ignored_prose_mentions: val.ignored_prose_mentions,
           ...(archivePath ? { archive_path: archivePath } : {}),
-          text: `[post_board OK] Posted #${postRecord.seq} "${postRecord.title}" (channel=#${postRecord.channel}, kind=${postRecord.kind}; ${notes.join('; ')}). Your last_read_seq is now ${postRecord.seq}.${archiveNote}${fpNote}${!archivePath ? ` If your turn is done, call swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) to park.` : ''}`,
+          ...(releaseHygiene ? { release_hygiene: releaseHygiene } : {}),
+          text: `[post_board OK] Posted #${postRecord.seq} "${postRecord.title}" (channel=#${postRecord.channel}, kind=${postRecord.kind}; ${notes.join('; ')}). Your last_read_seq is now ${postRecord.seq}.${hygieneNote}${archiveNote}${fpNote}${!archivePath ? ` If your turn is done, call swarm_wait({"since": ${postRecord.seq}, "mentions_only": true}) to park.` : ''}`,
         }
       })
     },
@@ -1023,7 +1050,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.7', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.8', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1041,6 +1068,7 @@ export function createSwarmTools(runtime) {
         ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role}): ${r.title}`).join(', ')}`
         : 'Active Merge-Gate Rejections: none'
 
+      const HIGH_TOOL_CALL_THRESHOLD = 80
       const lines = [
         `Runtime: dsh-swarm v${fp.version} (commit=${fp.commit}, loaded=${fp.loaded_at})`,
         `Swarm: "${snap.swarm.title}" (id=${swarmId}, gen=${snap.swarm.generation ?? 1}, status=${snap.swarm.status}, head=#${snap.headSeq}${snap.swarm.project_root ? ', project_root=' + snap.swarm.project_root : ''})`,
@@ -1050,9 +1078,12 @@ export function createSwarmTools(runtime) {
         rejLine,
         `Channels: ${snap.channels.map(c => '#' + c).join(', ')}`,
         'Roster:',
-        ...snap.members.map(m => (
-          `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '| ' + m.stepSummary : ''}`
-        )),
+        ...snap.members.map(m => {
+          const budgetWarn = !m.killed && m.tool_call_count >= HIGH_TOOL_CALL_THRESHOLD
+            ? ` [BUDGET_WARN: ${m.tool_call_count} tool calls — inspect for rework/wheel-reinvention]`
+            : ''
+          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} route=${m.applied_provider || 'inherit'}/${m.applied_model}${m.desired_model !== m.applied_model ? '->' + m.desired_model : ''} workspace=${m.workspace_mode} telemetry(turns=${m.turn_count}, tools=${m.tool_call_count}${m.last_tool_call_at ? ', last_tool=' + m.last_tool_name + '@' + m.last_tool_call_at : ''}${m.queue_position > 0 ? ', queue=#' + m.queue_position : ''}${m.last_error ? ', ERROR=' + m.last_error.code + ':' + m.last_error.message : ''}) cursors(read=#${m.last_read_seq}, wait=#${m.wait_since}, post=#${m.last_post_seq}, nudged=#${m.last_nudged_seq}, blocked=#${m.last_park_blocked_seq}) ${m.stepSummary ? '| ' + m.stepSummary : ''}${budgetWarn}`
+        }),
       ]
       return {
         ok: true,

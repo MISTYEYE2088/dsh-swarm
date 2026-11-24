@@ -21,14 +21,14 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.7'
+export const PLUGIN_VERSION = '0.3.8'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.7'
+    if (!fs.existsSync(headFile)) return 'release-0.3.8'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -1098,7 +1098,7 @@ export function applyWith(ctx, config, deps = {}) {
     const role = mapped?.role ?? 'coordinator'
     const priority = role === 'coordinator'
       ? PRIORITY.COORDINATOR
-      : (role === 'verifier' || role === 'architect')
+      : (role === 'verifier' || role === 'architect' || role === 'lore_master')
         ? PRIORITY.VERIFIER
         : role === 'monitor'
           ? PRIORITY.MONITOR

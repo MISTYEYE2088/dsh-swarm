@@ -66,7 +66,7 @@ dsh plugin --profile web remove dsh-swarm
 | --- | --- | --- |
 | `swarm_init` | **全局常驻入口**（Coordinator） | 初始化 Swarm、探测 Git 仓库/子目录仓库，并动态解锁当前会话的其余 10 个 Swarm 工具 |
 | `swarm_plan` | Coordinator（init 后解锁） | 发布/更新 Wave 与 Track 计划（≤ 64 KB） |
-| `swarm_add` | Coordinator（init 后解锁） | 原子创建 `worker` / `architect` / `verifier`（支持 `share`/`branch` Git worktree 隔离） |
+| `swarm_add` | Coordinator（init 后解锁） | 原子创建 `worker` / `architect` / `verifier` / `lore_master`（Git 可用时 `worker` 默认自动启用 `share` 隔离 worktree） |
 | `swarm_concurrency` | Coordinator（init 后解锁） | 动态调整在途 LLM 并发请求槽位上限（`limit >= 1`） |
 | `swarm_land` | Coordinator（init 后解锁） | 对隔离 worktree 执行 `diff` 或 `apply` 合入主工作区（受 `[REJECT]` 门禁保护） |
 | `swarm_kill` | Coordinator（init 后解锁） | 退役成员并清理 worktree（未开工时释放名字复用，已发言则墓碑化保留历史） |

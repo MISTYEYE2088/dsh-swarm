@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.8 (2026-11-23)
+
+- **New Role Preset: `lore_master` (Read-Only Domain & Spec Oracle)**:
+  - Dedicated read-only librarian role for massive hardware/NIC specs, register maps, internal protocols, and large codebases so implementers, architect, and verifier ask `@lore_master` for exact `file:line`/register citations instead of burning context scanning doc trees. Runs at `PRIORITY.VERIFIER` to unblock waiting workers fast (`can_block_merge: false`, `workspace: "inherit"`).
+- **Lean Role-Scoped SOP Prompts (`src/host/prompts.js`)**:
+  - Cut prompt length by ~45%, removed attribution meta-history and cross-role leakage, and added crisp operational guardrails: real interface stubs first (<=2 doc rounds), ban same-repo defensive glue, Architect structural-debt review, Verifier clean-room entrypoint audit + zero-hook black-box user journey + `/tmp`-only mutation tests.
+- **Tier-B Zero-New-State Runtime Guardrails**:
+  - `swarm_add`: defaults `role="worker"` to isolated `workspace="share"` automatically when Git worktree is available (while honoring explicit `workspace="inherit"` and keeping read-only roles on `"inherit"`).
+  - `post_board(kind="done")`: runs `git status --porcelain` on `project_root` and emits `[RELEASE_HYGIENE_WARN]` when dirty files or `scratch/`/`mutants/` artifacts remain.
+  - `swarm_status`: flags active members with `>= 80` tool calls via `[BUDGET_WARN]` using existing `tool_call_count` telemetry.
+
 ## 0.3.7 (2026-11-23)
 
 - **Scoped Lazy Tool Unlocking (DSH Native `agent.ctx.tools`)**:

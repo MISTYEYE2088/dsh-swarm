@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.7/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.8/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.7/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.8/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2188,6 +2188,98 @@ async function test_scoped_lazy_tool_unlock_on_swarm_init() {
   assert.equal(resumedA.ctx.tools.visibleNames().length, 11)
 }
 
+async function test_lore_master_role_and_tier_b_guardrails() {
+  const { renderRolePrompt, COORDINATOR_SOP_PROMPT } = await import('../src/host/prompts.js')
+  assert.equal(COORDINATOR_SOP_PROMPT.includes('2026-11-23'), false, 'Prompt must not contain attribution meta-history')
+  const lorePrompt = renderRolePrompt('lore_master', { memberName: 'nic-lore', cwd: '/repo', briefSeq: 1, brief: 'NIC spec oracle' })
+  assert.match(lorePrompt, /LORE MASTER/)
+  assert.match(lorePrompt, /Exact Citations Only/)
+
+  // Create a clean real git repo to test Tier-B guardrails end-to-end
+  const gitDir = path.join(tempRoot, 'tier-b-repo')
+  fs.mkdirSync(gitDir, { recursive: true })
+  await runGit(['init'], { cwd: gitDir })
+  await runGit(['config', 'user.email', 'test@example.com'], { cwd: gitDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: gitDir })
+  fs.writeFileSync(path.join(gitDir, 'README.md'), '# NIC Driver\n', 'utf8')
+  await runGit(['add', '.'], { cwd: gitDir })
+  await runGit(['commit', '-m', 'init'], { cwd: gitDir })
+
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-tier-b') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-tier-b', session: { header: { id: 'sess-tier-b', cwd: gitDir } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'NIC Driver Tier-B Test', concurrency_limit: 4 }, { agent: coordAgent })
+
+  // 1. `lore_master` spawns cleanly on inherit with can_block_merge=false
+  const loreAdd = await registeredTools.get('swarm_add').execute(
+    {
+      name: 'nic-lore',
+      role: 'lore_master',
+      brief: '[OWNERSHIP]\nRead-only NIC spec lookup\n[FORBIDDEN]\nEditing code\n[DONE_CRITERIA]\nAnswer register queries with exact citations',
+    },
+    { agent: coordAgent },
+  )
+  assert.equal(loreAdd.ok, true)
+  const loreMember = runtime.store.readMembers('sess-tier-b')['nic-lore']
+  assert.equal(loreMember.role, 'lore_master')
+  assert.equal(loreMember.can_block_merge, false)
+  assert.equal(loreMember.workspace_mode, 'inherit')
+
+  // 2. Worker with omitted `workspace` inside a Git repo defaults automatically to `workspace="share"`!
+  const workerAutoShare = await registeredTools.get('swarm_add').execute(
+    {
+      name: 'impl-tx',
+      role: 'worker',
+      brief: '[OWNERSHIP]\nsrc/tx/\n[FORBIDDEN]\nsrc/rx/\n[DONE_CRITERIA]\nTX ring passes smoke tests',
+    },
+    { agent: coordAgent },
+  )
+  assert.equal(workerAutoShare.ok, true)
+  assert.equal(runtime.store.readMembers('sess-tier-b')['impl-tx'].workspace_mode, 'share')
+
+  // 3. Explicit `workspace="inherit"` on a worker is still respected
+  const workerExplicitInherit = await registeredTools.get('swarm_add').execute(
+    {
+      name: 'impl-doc',
+      role: 'worker',
+      workspace: 'inherit',
+      brief: '[OWNERSHIP]\ndocs/\n[FORBIDDEN]\nsrc/\n[DONE_CRITERIA]\nDocs updated',
+    },
+    { agent: coordAgent },
+  )
+  assert.equal(workerExplicitInherit.ok, true)
+  assert.equal(runtime.store.readMembers('sess-tier-b')['impl-doc'].workspace_mode, 'inherit')
+
+  // 4. `swarm_status` flags high tool call counts (>= 80) with [BUDGET_WARN]
+  runtime.store.flushOffsets('sess-tier-b', { 'impl-tx': { tool_call_count: 85 } })
+  const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })
+  assert.equal(statusRes.ok, true)
+  assert.match(statusRes.text, /BUDGET_WARN: 85 tool calls/)
+
+  // 5. `post_board(kind="done")` warns when leftover scratch/ files exist in project_root
+  fs.mkdirSync(path.join(gitDir, 'scratch'), { recursive: true })
+  fs.writeFileSync(path.join(gitDir, 'scratch', 'junk.log'), 'temp', 'utf8')
+  const doneRes = await registeredTools.get('post_board').execute(
+    { title: 'Close NIC Swarm with leftover scratch', kind: 'done', mentions: ['coordinator'], text: '[done] Finished work' },
+    { agent: coordAgent },
+  )
+  assert.equal(doneRes.ok, true)
+  assert.equal(doneRes.release_hygiene.has_scratch_artifacts, true)
+  assert.match(doneRes.text, /RELEASE_HYGIENE_WARN/)
+
+  // Clean up worktree
+  await registeredTools.get('swarm_kill').execute({ name: 'impl-tx', force: true }, { agent: coordAgent })
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -2263,6 +2355,7 @@ try {
   await runTest('test_projector_auto_checkpoints_and_replays_from_second_newest', test_projector_auto_checkpoints_and_replays_from_second_newest)
   await runTest('test_swarm_concurrency_tool_coordinator_only_and_validation', test_swarm_concurrency_tool_coordinator_only_and_validation)
   await runTest('test_scoped_lazy_tool_unlock_on_swarm_init', test_scoped_lazy_tool_unlock_on_swarm_init)
+  await runTest('test_lore_master_role_and_tier_b_guardrails', test_lore_master_role_and_tier_b_guardrails)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

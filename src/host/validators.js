@@ -14,7 +14,7 @@ import {
 
 export const MEMBER_NAME_REGEX = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 export const RESERVED_NAMES = new Set(['all', 'main', 'coordinator', 'system', 'user', 'monitor'])
-export const VALID_ROLES = Object.freeze(['worker', 'architect', 'verifier'])
+export const VALID_ROLES = Object.freeze(['worker', 'architect', 'verifier', 'lore_master'])
 export const REQUIRED_BRIEF_TAGS = ['[OWNERSHIP]', '[FORBIDDEN]', '[DONE_CRITERIA]']
 export const MAX_POST_CHARS = 4_000
 export const MIN_POST_CHARS = 6
@@ -182,7 +182,7 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   if (role === 'monitor') {
     return formatError(
       'swarm_add',
-      'Do not spawn role="monitor". The built-in Watchdog runs automatically as a deterministic 0-token background service (30s zombie/error probes). Use "worker", "architect", or "verifier".',
+      'Do not spawn role="monitor". The built-in Watchdog runs automatically as a deterministic 0-token background service (30s zombie/error probes). Use "worker", "architect", "verifier", or "lore_master".',
       {
         name: args.name && args.name !== 'monitor' ? args.name : 'qa-gate',
         role: 'verifier',
@@ -192,7 +192,7 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
     )
   }
   if (!VALID_ROLES.includes(role)) {
-    return formatError('swarm_add', `Invalid role "${role}". Allowed roles: "worker" | "architect" | "verifier".`, {
+    return formatError('swarm_add', `Invalid role "${role}". Allowed roles: ${VALID_ROLES.map(r => `"${r}"`).join(' | ')}.`, {
       name: args.name || 'impl-core',
       role: 'worker',
       workspace: 'inherit',
@@ -249,7 +249,8 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
     }
   }
 
-  const workspace = args.workspace ?? 'inherit'
+  const workspaceExplicit = args.workspace !== undefined && args.workspace !== null && args.workspace !== ''
+  const workspace = workspaceExplicit ? args.workspace : 'inherit'
   if (!['inherit', 'share', 'branch'].includes(workspace)) {
     return formatError('swarm_add', `Invalid workspace "${workspace}". Allowed: "inherit" | "share" | "branch".`, {
       name: rawName,
@@ -318,6 +319,7 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       role,
       can_block_merge: canBlockMerge,
       workspace,
+      workspaceExplicit,
       brief,
       provider: args.provider ?? swarmMeta.default_provider ?? 'inherit',
       model: args.model ?? swarmMeta.default_model ?? 'inherit',
