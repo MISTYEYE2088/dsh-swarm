@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.7 (2026-11-23)
+
+- **Scoped Lazy Tool Unlocking (DSH Native `agent.ctx.tools`)**:
+  - Only `swarm_init` is registered globally at plugin startup; normal non-Swarm sessions no longer pay the prompt token overhead of the other 10 Swarm tool schemas.
+  - Calling `swarm_init` (or `/swarm`, or resuming an initialized Swarm session via `agent/created`) dynamically registers the remaining 10 Swarm tools strictly on that coordinator's `agent.ctx.tools` scope (DSH emits `tools/change` and exposes them immediately on the next step, without leaking to unrelated sessions).
+  - Child worker sessions deny global `swarm_init` and receive ONLY the 5 worker-usable tools (`post_board`, `read_board`, `swarm_wait`, `swarm_status`, `swarm_model`) on their own scope.
+
 ## 0.3.6 (2026-11-23)
 
 - **Pure 2-File SSOT Cleanup (Zero Legacy Complexity)**:

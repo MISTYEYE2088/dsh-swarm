@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.6/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.7/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.6/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.7/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2050,9 +2050,11 @@ async function test_swarm_concurrency_tool_coordinator_only_and_validation() {
   const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-conc-tool') }, { log: () => {}, warn: () => {} })
   const coordAgent = { id: 'sess-conc', session: { header: { id: 'sess-conc', cwd: tempRoot } } }
 
-  assert.equal(registeredTools.has('swarm_concurrency'), true, 'swarm_concurrency tool must be registered')
+  assert.equal(registeredTools.has('swarm_init'), true, 'Only swarm_init must be registered globally at startup')
+  assert.equal(registeredTools.has('swarm_concurrency'), false, 'swarm_concurrency must stay hidden before swarm_init')
 
   await registeredTools.get('swarm_init').execute({ title: 'AI Managed Concurrency', concurrency_limit: 4 }, { agent: coordAgent })
+  assert.equal(registeredTools.has('swarm_concurrency'), true, 'swarm_concurrency must unlock after swarm_init')
   await registeredTools.get('swarm_add').execute(
     { name: 'impl-c1', role: 'worker', brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c' },
     { agent: coordAgent },
@@ -2081,6 +2083,109 @@ async function test_swarm_concurrency_tool_coordinator_only_and_validation() {
   )
   assert.equal(workerRes.ok, false)
   assert.match(workerRes.text, /PERMISSION_ERROR/)
+}
+
+async function test_scoped_lazy_tool_unlock_on_swarm_init() {
+  const globalTools = new Map()
+  const listeners = new Map()
+  const fakeCtx = {
+    on(evt, fn) { listeners.set(evt, fn); return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') {
+        return {
+          register(t) { globalTools.set(t.name, t); return () => { globalTools.delete(t.name) } },
+          get(n) { return globalTools.get(n) },
+        }
+      }
+      return undefined
+    },
+  }
+
+  function makeScopedAgent(id) {
+    const localTools = new Map()
+    const denied = new Set()
+    const toolsSvc = {
+      register(t) { localTools.set(t.name, t); return () => { localTools.delete(t.name) } },
+      restrict(filter) {
+        for (const n of filter.deny ?? []) denied.add(n)
+        return () => {}
+      },
+      get(n) { return localTools.get(n) ?? (denied.has(n) ? undefined : globalTools.get(n)) },
+      visibleNames() {
+        const names = new Set()
+        for (const n of globalTools.keys()) if (!denied.has(n)) names.add(n)
+        for (const n of localTools.keys()) names.add(n)
+        return [...names].sort()
+      },
+    }
+    return {
+      id,
+      session: { header: { id, cwd: tempRoot } },
+      ctx: {
+        tools: toolsSvc,
+        get(name) { return name === 'tools' ? toolsSvc : undefined },
+      },
+    }
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-lazy-tools') }, { log: () => {}, warn: () => {} })
+
+  // 1. At mount time, ONLY `swarm_init` is registered globally!
+  assert.deepEqual([...globalTools.keys()], ['swarm_init'])
+
+  const agentA = makeScopedAgent('sess-lazy-a')
+  const agentB = makeScopedAgent('sess-lazy-b')
+  assert.deepEqual(agentA.ctx.tools.visibleNames(), ['swarm_init'])
+  assert.deepEqual(agentB.ctx.tools.visibleNames(), ['swarm_init'])
+
+  // 2. Agent A calls `swarm_init` -> unlocks all 10 Swarm tools ONLY on Agent A's scope!
+  const initRes = await globalTools.get('swarm_init').execute(
+    { title: 'Lazy Scoped Swarm', concurrency_limit: 4 },
+    { agent: agentA },
+  )
+  assert.equal(initRes.ok, true)
+  assert.deepEqual([...globalTools.keys()], ['swarm_init'], 'Global layer must remain clean with ONLY swarm_init')
+  assert.deepEqual(agentA.ctx.tools.visibleNames(), [
+    'post_board',
+    'read_board',
+    'swarm_add',
+    'swarm_concurrency',
+    'swarm_init',
+    'swarm_kill',
+    'swarm_land',
+    'swarm_model',
+    'swarm_plan',
+    'swarm_status',
+    'swarm_wait',
+  ])
+  // Unrelated Agent B STILL sees ONLY `swarm_init`!
+  assert.deepEqual(agentB.ctx.tools.visibleNames(), ['swarm_init'])
+
+  // 3. Child worker setup denies `swarm_init` and mounts ONLY the 5 worker tools
+  const childW1 = makeScopedAgent('sess-lazy-a__w1')
+  const setup = runtime.buildChildSetup({
+    memberName: 'w1',
+    member: { role: 'worker' },
+    rolePrompt: 'worker sop',
+    resolvedRoute: {},
+    rootAgent: agentA,
+    isCreate: true,
+  })
+  setup(childW1.ctx, childW1)
+  assert.deepEqual(childW1.ctx.tools.visibleNames(), [
+    'post_board',
+    'read_board',
+    'swarm_model',
+    'swarm_status',
+    'swarm_wait',
+  ])
+
+  // 4. Resuming Agent A after restart via `agent/created` automatically re-enables its 10 coordinator tools!
+  const resumedA = makeScopedAgent('sess-lazy-a')
+  assert.deepEqual(resumedA.ctx.tools.visibleNames(), ['swarm_init'])
+  listeners.get('agent/created')({ agent: resumedA, source: 'resume' })
+  assert.equal(resumedA.ctx.tools.visibleNames().length, 11)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -2157,6 +2262,7 @@ try {
   await runTest('test_client_flicker_free_polling_and_yellow_arrival_highlight', test_client_flicker_free_polling_and_yellow_arrival_highlight)
   await runTest('test_projector_auto_checkpoints_and_replays_from_second_newest', test_projector_auto_checkpoints_and_replays_from_second_newest)
   await runTest('test_swarm_concurrency_tool_coordinator_only_and_validation', test_swarm_concurrency_tool_coordinator_only_and_validation)
+  await runTest('test_scoped_lazy_tool_unlock_on_swarm_init', test_scoped_lazy_tool_unlock_on_swarm_init)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

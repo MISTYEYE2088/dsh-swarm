@@ -14,21 +14,21 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-import { SwarmStore, defaultSwarmRoot, formatTime, deriveFallbackTitle } from './src/host/store.js'
+import { SwarmStore, defaultSwarmRoot, formatTime } from './src/host/store.js'
 import { ConcurrencyGate, PRIORITY, isConcurrencyFailure } from './src/host/concurrency-gate.js'
 import { handleTurnStopping, statusOf, buildSwarmSystemMessage } from './src/host/stop-hook.js'
 import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import { renderRolePrompt, COORDINATOR_SOP_PROMPT } from './src/host/prompts.js'
-import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot } from './src/host/tools.js'
+import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.6'
+export const PLUGIN_VERSION = '0.3.7'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.4'
+    if (!fs.existsSync(headFile)) return 'release-0.3.7'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -492,6 +492,39 @@ export function applyWith(ctx, config, deps = {}) {
       }
     },
 
+    // #FUNC Dynamically register scoped Swarm tools on an individual agent's `agent.ctx.tools` after `swarm_init` or worker spawn.
+    // #NOT  Never registers non-entry tools onto the global tool layer when a scoped `agent.ctx` is available, and never double-registers on the same scope.
+    // #EDGE-IN Calling `swarm_init` unlocks all 10 Swarm tools on that agent's scope while unrelated sessions keep seeing only `swarm_init` → test_scoped_lazy_tool_unlock_on_swarm_init
+    // #WHY  Keeping only `swarm_init` in the global layer saves 10 tool schemas on non-Swarm sessions while `agent.ctx.tools` emits `tools/change` for instant activation.
+    enableSwarmToolsOnAgent(agent, role = 'coordinator', explicitCtx = null) {
+      const targetCtx = explicitCtx ?? agent?.ctx ?? null
+      const svc = targetCtx
+        ? (targetCtx.tools ?? targetCtx.get?.('tools'))
+        : (typeof ctx.get === 'function' ? ctx.get('tools') : null)
+      if (!svc || typeof svc.register !== 'function') return []
+      if (enabledToolServices.has(svc)) return []
+      enabledToolServices.add(svc)
+
+      const workerSet = new Set(WORKER_SWARM_TOOL_NAMES)
+      const toolsToMount = role === 'coordinator'
+        ? allSwarmTools.filter(t => t.name !== 'swarm_init')
+        : allSwarmTools.filter(t => workerSet.has(t.name))
+
+      const registeredDisposers = []
+      for (const tool of toolsToMount) {
+        try {
+          const disp = svc.register(tool)
+          if (typeof disp === 'function') {
+            disposers.push(disp)
+            registeredDisposers.push(disp)
+          }
+        } catch (err) {
+          warn(`scoped tool register(${tool.name}) skipped: ${String(err)}`)
+        }
+      }
+      return registeredDisposers
+    },
+
     buildChildSetup({ memberName, member, rolePrompt, resolvedRoute, rootAgent, isCreate }) {
       const permPreset = rootAgent?.ctx?.get?.('permissionPresets')?.current?.(rootAgent?.session)
       const sandboxMode = rootAgent?.ctx?.get?.('sandboxPolicy')?.overrideOf?.(rootAgent?.session)
@@ -537,10 +570,15 @@ export function applyWith(ctx, config, deps = {}) {
         try {
           const toolsOnChild = agentCtx?.tools ?? agentCtx?.get?.('tools')
           if (toolsOnChild && typeof toolsOnChild.restrict === 'function') {
-            toolsOnChild.restrict({
-              deny: ['subagent', 'subagent_fork', 'workflow', 'swarm_init', 'swarm_add', 'swarm_kill', 'swarm_concurrency'],
-            })
+            const denyCandidates = ['subagent', 'subagent_fork', 'workflow', 'swarm_init']
+            const denyList = typeof toolsOnChild.get === 'function'
+              ? denyCandidates.filter(name => toolsOnChild.get(name, childAgent) !== undefined)
+              : denyCandidates
+            if (denyList.length > 0) {
+              toolsOnChild.restrict({ deny: denyList })
+            }
           }
+          runtime.enableSwarmToolsOnAgent(childAgent, 'worker', agentCtx)
         } catch {}
 
         const sp = agentCtx?.systemPrompt ?? agentCtx?.get?.('systemPrompt')
@@ -1106,13 +1144,19 @@ export function applyWith(ctx, config, deps = {}) {
   })
   if (typeof disposeTurnStopping === 'function') disposers.push(disposeTurnStopping)
 
-  // 5. Register model tools via `ctx.inject(['tools'], ...)`
+  // 5. Register ONLY `swarm_init` globally via `ctx.inject(['tools'], ...)`.
+  //    The remaining 10 Swarm tools are registered dynamically onto `agent.ctx.tools`
+  //    when `swarm_init` runs (or when an existing Swarm session is resumed via `agent/created`).
+  const allSwarmTools = createSwarmTools(runtime)
+  const entryTools = allSwarmTools.filter(t => t.name === 'swarm_init')
+  const enabledToolServices = new WeakSet()
+
   let toolsRegistered = false
   function mountToolsOn(svc) {
     if (toolsRegistered || !svc || typeof svc.register !== 'function') return []
     toolsRegistered = true
     const list = []
-    for (const tool of createSwarmTools(runtime)) {
+    for (const tool of entryTools) {
       const disp = svc.register(tool)
       if (typeof disp === 'function') {
         disposers.push(disp)
@@ -1135,6 +1179,24 @@ export function applyWith(ctx, config, deps = {}) {
   if (!toolsRegistered && typeof ctx.get === 'function') {
     mountToolsOn(ctx.get('tools'))
   }
+
+  // Re-expose scoped Swarm tools automatically when an existing Swarm session is resumed
+  const disposeAgentCreated = ctx.on('agent/created', (payload) => {
+    const agent = payload?.agent
+    if (!agent || typeof agent.id !== 'string') return
+    if (store.exists(agent.id)) {
+      runtime.activateCoordinatorMode(agent)
+      runtime.enableSwarmToolsOnAgent(agent, 'coordinator')
+      return
+    }
+    if (agent.id.includes('__')) {
+      const prefix = agent.id.split('__')[0]
+      if (prefix && store.exists(prefix)) {
+        runtime.enableSwarmToolsOnAgent(agent, 'worker')
+      }
+    }
+  })
+  if (typeof disposeAgentCreated === 'function') disposers.push(disposeAgentCreated)
 
   // 6. Register `/swarm` human command via `ctx.inject(['commands'], ...)`
   let commandRegistered = false

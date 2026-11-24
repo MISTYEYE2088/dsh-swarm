@@ -233,12 +233,20 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
 // #NOT  Never throws raw unhandled exceptions for malformed model inputs; never returns non-lossless JSON payloads or Chinese strings.
 // #EDGE-IN Calling `swarm_wait` with valid `since` invokes `exec.concludeTurn()` to end the turn at 0 idle token cost → test_swarm_wait_concludes_turn
 // #WHY  `concludeTurn` is the native DSH `ToolRunContext` hook that stops `agent-loop` from issuing another LLM request after `swarm_wait` returns `DONE`.
+export const WORKER_SWARM_TOOL_NAMES = Object.freeze([
+  'post_board',
+  'read_board',
+  'swarm_wait',
+  'swarm_status',
+  'swarm_model',
+])
+
 export function createSwarmTools(runtime) {
   const { store, concurrencyGate } = runtime
 
   const swarmInitTool = makeTool({
     name: 'swarm_init',
-    description: 'Initialize or update the Swarm blackboard (swarm.json, board.jsonl, members.json). Supports optional `project_root` pointing to a subdirectory Git repo so `workspace="share"|"branch"` worktree isolation works even when session cwd is not a git root.',
+    description: 'Initialize or update the Swarm blackboard (`events.jsonl` + `offsets.json`) and dynamically unlock the remaining Swarm tools (`swarm_plan`, `swarm_add`, `swarm_concurrency`, `post_board`, `read_board`, `swarm_wait`, `swarm_status`, `swarm_model`, `swarm_land`, `swarm_kill`) for this session. Supports optional `project_root` pointing to a subdirectory Git repo for `workspace="share"|"branch"` worktree isolation.',
     parameters: {
       properties: {
         title: { type: 'string', description: 'Short descriptive title for this Swarm.' },
@@ -290,7 +298,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.6', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.7', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -317,6 +325,8 @@ export function createSwarmTools(runtime) {
           } catch {}
         }
         concurrencyGate.setLimit(swarm.concurrency_limit)
+        runtime.activateCoordinatorMode?.(exec.agent)
+        runtime.enableSwarmToolsOnAgent?.(exec.agent, 'coordinator')
         runtime.ensureMonitorDaemon(swarmId)
         runtime.notifyProjectionChanged(swarmId)
 
@@ -351,7 +361,7 @@ export function createSwarmTools(runtime) {
 
   const swarmPlanTool = makeTool({
     name: 'swarm_plan',
-    description: 'Write or update the static plan.json (goal, waves, tracks) for the deterministic Swarm Overview UI. Max 64 KB.',
+    description: 'Write or update the structured Swarm plan (goal, waves, tracks) stored in `events.jsonl` and shown in the Control tab. Max 64 KB.',
     parameters: {
       properties: {
         goal: { type: 'string', description: 'Overarching goal of the swarm.' },
@@ -1013,7 +1023,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.6', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.7', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1424,6 +1434,7 @@ export function createSwarmCommand(runtime) {
         }
       })
       runtime.activateCoordinatorMode(agent)
+      runtime.enableSwarmToolsOnAgent?.(agent, 'coordinator')
       runtime.notifyProjectionChanged(swarmId)
 
       const kickoffPrompt = [
