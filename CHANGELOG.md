@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.13 (2026-11-24)
+
+- **Watchdog 10-Minute Sliding Window for `unparked_idle` + Coordinator Apology/Idle Loop Breaker**:
+  - Kept the 1st `unparked_idle` detection identical (direct `[Watchdog Auto-Resume]` whip to the worker), and replaced immediate next-30s escalation with a 10-minute sliding window (`UNPARKED_IDLE_WINDOW_MS = 600_000`): if a single session slips into `unparked_idle` `>= 2` times within 10 minutes (even with incremented turn count), Watchdog posts a board alert mentioning both `@member` (requiring an explanation on the board) and `@coordinator` (to decide next action), with duplicate suppression for the window.
+  - Updated `COORDINATOR_SOP_PROMPT` to explicitly kill & respawn a fresh session when a member falls into an apology loop or repeated `unparked_idle` churn (asking for brief handover notes first if it holds valuable partial findings), and added direct `git status`/`git diff` + user-provided-path anchor discipline across Coordinator and Worker prompts.
+- **2D `VERIFIER_REVIEW_RULES` (`V1..V5`) + Automatic `user`-Side Wakeup Anchor**:
+  - Added `VERIFIER_REVIEW_RULES` as a 2D `[[title, detail], ...]` array on `ROLE_REGISTRY.verifier.reviewRules` (`V1:clean-room-entrypoints`, `V2:log-keyword-scan`, `V3:zero-hook-journey`, `V4:no-circular-evidence`, `V5:tmp-mutations`), driving both `VERIFIER_SOP_PROMPT` (`{{REVIEW_RULES}}`) and dynamic `user`-turn wakeup anchors in `dispatchPostWakeups` with zero duplicated code.
+- **Role-Level Heterogeneous Model Parameterization (`defaultModel` / `preferredModelKeywords`)**:
+  - Added `defaultProvider`, `defaultModel`, and case-insensitive `preferredModelKeywords` to `ROLE_REGISTRY` / `registerRole` (configurable via `config.roles.<role>`), defaulting `architect` and `verifier` to `['glm', 'auto']`.
+  - `resolveModelRoute()` now matches discovered DSH routes case-insensitively (preferring routes distinct from the parent session for heterogeneous auditing, e.g. GLM-5.3 named `auto`), always honoring explicit caller overrides and degrading seamlessly to `inherit` when no matching route exists.
+- **`swarm_kill` Running-Member Safety Brake + Handover ("Last Words") Prompt**:
+  - `swarm_kill` now blocks terminating a currently `working` or `queued` member unless `force: true` is passed, displaying its live `stepSummary` and prompting the coordinator to request a brief handover summary ("last words") via `post_board` if its partial findings are meaningful.
+
 ## 0.3.12 (2026-11-24)
 
 - **Asymmetric Reviewer-Only `[BLIND_AUDIT_ALERT]` (Zero Sender Leak)**:

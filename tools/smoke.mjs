@@ -39,7 +39,7 @@ import {
 } from '../src/host/worktree.js'
 import { detectSwarmStall, SwarmMonitorDaemon } from '../src/host/monitor.js'
 import { toLosslessJson } from '../src/host/tools.js'
-import { applyWith } from '../index.js'
+import { applyWith, PLUGIN_VERSION } from '../index.js'
 
 const CLIENT_PATH = fileURLToPath(new URL('../client.js', import.meta.url))
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-swarm-smoke-'))
@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.12/)
+  assert.ok(initRes.text.includes(`dsh-swarm v${PLUGIN_VERSION}`))
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.12/)
+  assert.ok(statusRes.text.includes(`Runtime: dsh-swarm v${PLUGIN_VERSION}`))
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2513,7 +2513,7 @@ async function test_blind_audit_alert_two_round_escalation_and_unparked_idle_whi
   })
   assert.equal(slackerLiveness.status, 'unparked_idle', 'Worker that stopped without swarm_wait must be flagged unparked_idle, NOT waiting')
 
-  // Watchdog healthTick whips slacker directly on 1st strike (even while peers are working!), escalates to @coordinator on 2nd strike!
+  // Watchdog healthTick: 1st hit whips slacker directly; 2nd hit within 10m (even after turn_count changes!) posts board alert to @member + @coordinator; 3rd hit within 10m is suppressed; >10m resets cleanly!
   const autoNudges = []
   const escalatedAlerts = []
   const wd = new SwarmMonitorDaemon({
@@ -2523,17 +2523,166 @@ async function test_blind_audit_alert_two_round_escalation_and_unparked_idle_whi
     onAutoNudge: async (memberName, prompt) => { autoNudges.push({ memberName, prompt }); return true },
     onPostStall: async (alert) => { escalatedAlerts.push(alert) },
   })
-  const tick1 = await wd.healthTick()
+  const t0 = 1_000_000
+  const tick1 = await wd.healthTick(t0)
   assert.equal(tick1.action, 'auto_nudged_unparked_idle')
   assert.equal(autoNudges.length, 1)
   assert.equal(autoNudges[0].memberName, 'impl-1')
   assert.match(autoNudges[0].prompt, /Watchdog Auto-Resume/)
 
-  const tick2 = await wd.healthTick()
+  // Simulate worker arguing with watchdog (turn_count increments 3 -> 4) and dropping unparked again 2 min later!
+  runtime.store.flushOffsets('sw-whip', { 'impl-1': { turn_count: 4, wake_mode: 'working' } })
+  const tick2 = await wd.healthTick(t0 + 120_000)
   assert.equal(tick2.action, 'health_alert')
   assert.equal(escalatedAlerts.length, 1)
   assert.equal(escalatedAlerts[0].target, 'coordinator')
-  assert.match(escalatedAlerts[0].text, /unparked_idle/)
+  assert.deepEqual(escalatedAlerts[0].targets, ['coordinator', 'impl-1'])
+  assert.match(escalatedAlerts[0].text, /unparked_idle >=2 times within 10m/)
+  assert.match(escalatedAlerts[0].text, /explanation/)
+
+  // 30s later inside the same 10m window -> suppressed without spamming the board
+  const tick3 = await wd.healthTick(t0 + 150_000)
+  assert.equal(tick3.action, 'suppressed_duplicate')
+  assert.equal(escalatedAlerts.length, 1)
+
+  // >10m later -> sliding window resets cleanly to 1st-hit direct whip
+  const tick4 = await wd.healthTick(t0 + 800_000)
+  assert.equal(tick4.action, 'auto_nudged_unparked_idle')
+  assert.equal(autoNudges.length, 2)
+}
+
+async function test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake() {
+  const { VERIFIER_REVIEW_RULES, COORDINATOR_SOP_PROMPT, renderRolePrompt } = await import('../src/host/prompts.js')
+
+  // 1. VERIFIER_REVIEW_RULES is a 2D [[title, detail], ...] array (V1..V5) rendered into VERIFIER_SOP_PROMPT
+  assert.equal(Array.isArray(VERIFIER_REVIEW_RULES), true)
+  assert.equal(VERIFIER_REVIEW_RULES.length, 5)
+  const qaPrompt = renderRolePrompt('verifier', { memberName: 'qa-1', cwd: '/repo', briefSeq: 1, brief: 'black-box QA' })
+  for (const [title, detail] of VERIFIER_REVIEW_RULES) {
+    assert.ok(title.startsWith('V') && detail.length > 10)
+    assert.ok(qaPrompt.includes(title), `Verifier prompt must expand ${title}`)
+  }
+  assert.match(COORDINATOR_SOP_PROMPT, /apology loop/)
+  assert.match(COORDINATOR_SOP_PROMPT, /fresh replacement session/)
+
+  // 2. Role-level case-insensitive keyword matching (`glm`, `auto`) + Verifier user-side wakeup anchor + running-member kill brake
+  const registeredTools = new Map()
+  const steeredByAgent = new Map()
+  const fakeAgents = new Map()
+  let availableProviders = [
+    { id: 'corp', models: [{ id: 'deepseek-r1', name: 'DeepSeek R1' }, { id: 'Auto', name: 'GLM-5.3 Auto' }] },
+  ]
+
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') {
+        return {
+          get(id) { return fakeAgents.get(id) },
+          async create(opts) {
+            const sid = opts.sessionId
+            steeredByAgent.set(sid, [])
+            const child = {
+              id: sid,
+              status: 'idle',
+              options: opts.agentOptions,
+              session: { header: { id: sid, cwd: tempRoot }, append() {} },
+              steer(m) { steeredByAgent.get(sid).push(m) },
+            }
+            fakeAgents.set(sid, child)
+            return { agent: child, async dispose() { child.status = 'disposed' } }
+          },
+        }
+      }
+      if (name === 'llm') {
+        return {
+          listProviders() { return availableProviders.map(p => ({ id: p.id })) },
+          async listModels(pid) { return availableProviders.find(p => p.id === pid)?.models ?? [] },
+        }
+      }
+      return undefined
+    },
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-v0313') }, { log: () => {}, warn: () => {} })
+  const coordAgent = {
+    id: 'sess-v0313',
+    options: { provider: 'corp', model: 'deepseek-r1' },
+    session: { header: { id: 'sess-v0313', cwd: tempRoot }, append() {} },
+  }
+  fakeAgents.set(coordAgent.id, coordAgent)
+
+  await registeredTools.get('swarm_init').execute({ title: 'v0.3.13 Guardrails Test', concurrency_limit: 4 }, { agent: coordAgent })
+
+  // 2a. Verifier & Architect auto-select `corp/Auto` (case-insensitive `auto`), while Worker inherits `corp/deepseek-r1`
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-auto', role: 'verifier', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nverify' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'arch-auto', role: 'architect', brief: '[OWNERSHIP]\narch\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nreview' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-live', role: 'worker', brief: '[OWNERSHIP]\nsrc\n[FORBIDDEN]\nqa\n[DONE_CRITERIA]\ncode' },
+    { agent: coordAgent },
+  )
+  // Explicit model override always beats role preferredModelKeywords
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-explicit', role: 'verifier', model: 'deepseek-r1', brief: '[OWNERSHIP]\nqa2\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nverify' },
+    { agent: coordAgent },
+  )
+
+  const mAfter = runtime.store.readMembers('sess-v0313')
+  assert.equal(mAfter['qa-auto'].applied_model, 'Auto', 'Verifier must auto-match case-insensitive `auto` route')
+  assert.equal(mAfter['arch-auto'].applied_model, 'Auto', 'Architect must auto-match case-insensitive `auto` route')
+  assert.equal(mAfter['impl-live'].applied_model, 'deepseek-r1', 'Worker must stay on parent DeepSeek route')
+  assert.equal(mAfter['qa-explicit'].applied_model, 'deepseek-r1', 'Explicit model override must win over preferredModelKeywords')
+
+  // 2b. Keyword priority: `glm` takes precedence over `auto` when both exist; single-model setup degrades cleanly to parent
+  availableProviders = [
+    { id: 'corp', models: [{ id: 'deepseek-r1', name: 'DeepSeek R1' }, { id: 'auto', name: 'Auto' }] },
+    { id: 'zhipu', models: [{ id: 'GLM-5.3', name: 'GLM 5.3' }] },
+  ]
+  const glmRoute = await runtime.resolveModelRoute({ requestedModel: 'inherit', role: 'verifier', rootAgent: coordAgent })
+  assert.equal(glmRoute.provider, 'zhipu')
+  assert.equal(glmRoute.model, 'GLM-5.3')
+
+  availableProviders = [
+    { id: 'corp', models: [{ id: 'deepseek-r1', name: 'DeepSeek R1' }] },
+  ]
+  const fallbackRoute = await runtime.resolveModelRoute({ requestedModel: 'inherit', role: 'verifier', rootAgent: coordAgent })
+  assert.equal(fallbackRoute.provider, 'corp')
+  assert.equal(fallbackRoute.model, 'deepseek-r1')
+
+  // 3. Verifier receives automatic user-side V1..V5 anchor on board wakeup
+  steeredByAgent.get('sess-v0313__qa-auto').length = 0
+  await registeredTools.get('post_board').execute(
+    { title: 'Implementation ready for black-box QA', kind: 'report', mentions: ['qa-auto'], text: '@qa-auto ready to test' },
+    { agent: fakeAgents.get('sess-v0313__impl-live') },
+  )
+  const qaWakeups = steeredByAgent.get('sess-v0313__qa-auto')
+  assert.equal(qaWakeups.length, 1)
+  assert.match(qaWakeups[0].content[0].text, /V1:clean-room-entrypoints \| V2:log-keyword-scan \| V3:zero-hook-journey \| V4:no-circular-evidence \| V5:tmp-mutations/)
+
+  // 4. `swarm_kill` blocks killing a currently `working` member without `force: true` and suggests handover ("last words")
+  const liveImpl = fakeAgents.get('sess-v0313__impl-live')
+  liveImpl.status = 'running'
+  const blockedKill = await registeredTools.get('swarm_kill').execute({ name: 'impl-live' }, { agent: coordAgent })
+  assert.equal(blockedKill.ok, false)
+  assert.equal(blockedKill.blocked_running, true)
+  assert.equal(blockedKill.status, 'working')
+  assert.match(blockedKill.text, /KILL_BLOCKED/)
+  assert.match(blockedKill.text, /last words/)
+  assert.match(blockedKill.text, /handover summary/)
+  assert.equal(runtime.store.readMembers('sess-v0313')['impl-live'].killed, false, 'Blocked kill must leave member alive')
+
+  // Passing `force: true` overrides the running brake and cleanly retires the member
+  const forcedKill = await registeredTools.get('swarm_kill').execute({ name: 'impl-live', force: true }, { agent: coordAgent })
+  assert.equal(forcedKill.ok, true)
+  assert.equal(runtime.store.readMembers('sess-v0313')['impl-live'].killed, true)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -2615,6 +2764,7 @@ try {
   await runTest('test_parameterized_role_registry_auto_covers_stop_hook_and_gates', test_parameterized_role_registry_auto_covers_stop_hook_and_gates)
   await runTest('test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup', test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup)
   await runTest('test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip', test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip)
+  await runTest('test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake', test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

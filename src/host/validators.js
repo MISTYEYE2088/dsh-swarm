@@ -311,6 +311,8 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
   const canBlockMerge = args.can_block_merge !== undefined
     ? Boolean(args.can_block_merge)
     : getRoleSpec(role).canBlockMerge
+  const providerExplicit = typeof args.provider === 'string' && args.provider.trim().length > 0 && args.provider.trim() !== 'inherit'
+  const modelExplicit = typeof args.model === 'string' && args.model.trim().length > 0 && args.model.trim() !== 'inherit'
 
   return {
     ok: true,
@@ -323,8 +325,10 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       workspace,
       workspaceExplicit,
       brief,
-      provider: args.provider ?? swarmMeta.default_provider ?? 'inherit',
-      model: args.model ?? swarmMeta.default_model ?? 'inherit',
+      provider: providerExplicit ? args.provider.trim() : (swarmMeta.default_provider ?? 'inherit'),
+      model: modelExplicit ? args.model.trim() : (swarmMeta.default_model ?? 'inherit'),
+      providerExplicit,
+      modelExplicit,
       fork: args.fork ? String(args.fork).trim() : null,
       tasks: Array.isArray(args.tasks) ? args.tasks.map(String) : null,
       parent: callerName,

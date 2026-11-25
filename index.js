@@ -22,6 +22,7 @@ import {
   renderRolePrompt,
   COORDINATOR_SOP_PROMPT,
   ARCHITECT_REVIEW_RULES,
+  VERIFIER_REVIEW_RULES,
   registerRole,
   unregisterRole,
   getRoleSpec,
@@ -31,14 +32,14 @@ import {
 } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.12'
+export const PLUGIN_VERSION = '0.3.13'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.12'
+    if (!fs.existsSync(headFile)) return 'release-0.3.13'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -46,7 +47,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.3.4'
+    return 'release-0.3.13'
   }
 }
 
@@ -61,6 +62,7 @@ export {
   SwarmMonitorDaemon,
   renderRolePrompt,
   ARCHITECT_REVIEW_RULES,
+  VERIFIER_REVIEW_RULES,
   registerRole,
   unregisterRole,
   getRoleSpec,
@@ -415,7 +417,11 @@ export function applyWith(ctx, config, deps = {}) {
       return { parentRoute, routes }
     },
 
-    async resolveModelRoute({ requestedProvider, requestedModel, rootAgent, swarmMeta } = {}) {
+    // #FUNC Resolve the real DSH provider/model route for a Swarm member, honoring explicit overrides first and role-level `defaultModel`/`preferredModelKeywords` (case-insensitive) before inheriting `swarmMeta` or `parentRoute`.
+    // #NOT  Never overrides an explicit caller `requestedModel` with role defaults, and never invents an unregistered provider/model when no keyword-matching route exists.
+    // #EDGE-IN When DSH exposes a route named `Auto` alongside a DeepSeek parent, `verifier`/`architect` auto-select `Auto` via `preferredModelKeywords` (`['glm', 'auto']`) while `worker` inherits DeepSeek → test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake
+    // #WHY  Checking `preferredModelKeywords` against discovered `routes` (preferring routes distinct from `parentRoute`) enables zero-config heterogeneous model auditing while degrading cleanly to `inherit` on single-model setups.
+    async resolveModelRoute({ requestedProvider, requestedModel, role, rootAgent, swarmMeta } = {}) {
       const { parentRoute, routes } = await runtime.discoverAvailableModels(rootAgent)
       let rawProvider = typeof requestedProvider === 'string' ? requestedProvider.trim() : ''
       let rawModel = typeof requestedModel === 'string' ? requestedModel.trim() : ''
@@ -431,6 +437,38 @@ export function applyWith(ctx, config, deps = {}) {
       }
 
       const isInherit = (val) => !val || val === 'inherit' || val === 'default' || val === 'current' || val === 'internal'
+      const roleSpec = role ? getRoleSpec(role) : null
+      if (isInherit(rawModel) && roleSpec) {
+        if (roleSpec.defaultModel && !isInherit(roleSpec.defaultModel)) {
+          const dm = roleSpec.defaultModel.trim()
+          if (dm.includes('/')) {
+            const slashIdx = dm.indexOf('/')
+            rawProvider = dm.slice(0, slashIdx).trim()
+            rawModel = dm.slice(slashIdx + 1).trim()
+          } else {
+            rawModel = dm
+            if (isInherit(rawProvider) && roleSpec.defaultProvider && !isInherit(roleSpec.defaultProvider)) {
+              rawProvider = roleSpec.defaultProvider.trim()
+            }
+          }
+        } else if (Array.isArray(roleSpec.preferredModelKeywords) && roleSpec.preferredModelKeywords.length > 0 && routes.length > 0) {
+          const keywords = roleSpec.preferredModelKeywords
+          const findByKeywords = (candidates) => {
+            for (const kw of keywords) {
+              const hit = candidates.find(r => `${r.provider}/${r.model} ${r.name || ''}`.toLowerCase().includes(kw))
+              if (hit) return hit
+            }
+            return null
+          }
+          const distinctRoutes = routes.filter(r => r.provider !== parentRoute.provider || r.model !== parentRoute.model)
+          const matchedRoute = findByKeywords(distinctRoutes) ?? findByKeywords(routes)
+          if (matchedRoute) {
+            rawProvider = matchedRoute.provider
+            rawModel = matchedRoute.model
+          }
+        }
+      }
+
       if (isInherit(rawModel)) {
         const fallbackModel = !isInherit(swarmMeta?.default_model)
           ? swarmMeta.default_model
@@ -724,6 +762,7 @@ export function applyWith(ctx, config, deps = {}) {
       const resolvedRoute = await runtime.resolveModelRoute({
         requestedProvider: member.applied_provider,
         requestedModel: member.applied_model,
+        role: member.role,
         rootAgent,
         swarmMeta,
       })
@@ -969,15 +1008,16 @@ export function applyWith(ctx, config, deps = {}) {
           )
           return true
         },
-        onPostStall: async ({ target, title, text, kind, refs, escalate }) => {
+        onPostStall: async ({ target, targets, title, text, kind, refs, escalate }) => {
           await store.withLock(swarmId, async () => {
             if (!store.exists(swarmId)) return
+            const mentionList = Array.isArray(targets) && targets.length > 0 ? targets : [target]
             const postRecord = store.appendBoardRecord(swarmId, {
               type: 'post',
               agent: 'monitor',
               channel: 'main',
               title: title || `Watchdog alert for @${target}`,
-              mentions: [target],
+              mentions: mentionList,
               skip_prose_mention_extraction: true,
               refs,
               kind,

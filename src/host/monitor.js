@@ -16,6 +16,7 @@ import { statusOf, DEFAULT_STARTUP_GRACE_MS } from './stop-hook.js'
 
 export const MAX_NUDGES_PER_STALL = 3
 export const AUTO_SLEEP_QUIET_TICKS = 5
+export const UNPARKED_IDLE_WINDOW_MS = 10 * 60 * 1000
 
 /**
  * Inspect per-member crash / zombie conditions independently of whether sibling
@@ -61,11 +62,12 @@ export function detectMemberHealthIssues({
         kind: 'member_unparked_idle',
         memberName: name,
         target: 'coordinator',
+        targets: ['coordinator', name],
         seq: member.last_post_seq || member.brief_seq || 0,
         signature: `member_unparked_idle:${name}:${member.turn_count ?? 0}:${member.last_post_seq ?? 0}`,
-        title: `Watchdog alert: @${name} stopped mid-task without parking`,
+        title: `Watchdog alert: @${name} unparked_idle repeatedly (explanation required)`,
         nudgePrompt: `[Watchdog Auto-Resume] @${name} stopped mid-task without calling swarm_wait (turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}). Execute your pending step now, post results to the board, and call swarm_wait(since=${member.last_read_seq ?? 0}).`,
-        prompt: `@coordinator [WATCHDOG_ALERT] Member @${name} is unparked_idle (stopped mid-task without calling swarm_wait and ignored auto-resume; turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}). Inspect via swarm_status and redirect, hot-swap, or kill.`,
+        prompt: `@${name} @coordinator [WATCHDOG_ALERT] Member @${name} hit unparked_idle >=2 times within 10m (turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}). @${name}: post a concise explanation of your status/blocker on the board now. @coordinator: decide next action (redirect, swarm_model, or swarm_kill + spawn a fresh session).`,
       })
       continue
     }
@@ -260,6 +262,7 @@ export class SwarmMonitorDaemon {
     intervalMs = 120_000,
     healthIntervalMs = 30_000,
     startupTimeoutMs = DEFAULT_STARTUP_GRACE_MS,
+    unparkedIdleWindowMs = UNPARKED_IDLE_WINDOW_MS,
     onPostStall,
     onAutoNudge,
     getMemberLiveness,
@@ -269,12 +272,15 @@ export class SwarmMonitorDaemon {
     this.intervalMs = intervalMs
     this.healthIntervalMs = healthIntervalMs
     this.startupTimeoutMs = startupTimeoutMs
+    this.unparkedIdleWindowMs = unparkedIdleWindowMs
     this.onPostStall = onPostStall
     this.onAutoNudge = onAutoNudge
     this.getMemberLiveness = getMemberLiveness
 
     this.nudgeCounts = new Map()
     this.autoNudgedZombies = new Set()
+    this.unparkedIdleHits = new Map()
+    this.unparkedIdleEscalatedAt = new Map()
     this.quietTicks = 0
     this.alertsPosted = 0
     this.lastCheckAt = null
@@ -339,7 +345,10 @@ export class SwarmMonitorDaemon {
     }
   }
 
-  /** Fast deterministic per-member health check (runs every 30s even while other members are busy). */
+  // #FUNC Run one fast per-member health inspection, auto-resuming single `unparked_idle` slips and escalating to board explanation + `@coordinator` when a member slips >=2 times within `UNPARKED_IDLE_WINDOW_MS` (10m).
+  // #NOT  Never spams repeated 30s board alerts during the same 10-minute window after escalating an `unparked_idle` member.
+  // #EDGE-IN Two `unparked_idle` hits by the same member within 10 minutes post a board alert requiring `@member` explanation and `@coordinator` decision, while a hit after >10 minutes resets cleanly to a direct auto-resume whip → test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip
+  // #WHY  Tracking per-member `unparkedIdleHits` across `UNPARKED_IDLE_WINDOW_MS` catches models that argue with a 30s auto-resume whip and drop unparked again with an incremented turn count.
   async healthTick(nowMs = Date.now()) {
     if (this.sleeping) return { action: 'sleeping' }
     this.lastCheckAt = new Date(nowMs).toISOString()
@@ -353,8 +362,67 @@ export class SwarmMonitorDaemon {
     if (issues.length === 0) return { action: 'healthy' }
 
     const first = issues[0]
+    if (first.kind === 'member_unparked_idle') {
+      const lastEscAt = this.unparkedIdleEscalatedAt.get(first.memberName)
+      if (lastEscAt !== undefined && (nowMs - lastEscAt) <= this.unparkedIdleWindowMs) {
+        return {
+          action: 'suppressed_duplicate',
+          kind: first.kind,
+          memberName: first.memberName,
+          signature: first.signature,
+        }
+      }
+
+      const recentHits = (this.unparkedIdleHits.get(first.memberName) ?? [])
+        .filter(ts => (nowMs - ts) <= this.unparkedIdleWindowMs)
+      recentHits.push(nowMs)
+      this.unparkedIdleHits.set(first.memberName, recentHits)
+
+      if (recentHits.length === 1 && typeof this.onAutoNudge === 'function') {
+        const nudged = await this.onAutoNudge(first.memberName, first.nudgePrompt ?? null)
+        if (nudged) {
+          return {
+            action: 'auto_nudged_unparked_idle',
+            memberName: first.memberName,
+            signature: first.signature,
+            hitsInWindow: 1,
+          }
+        }
+      }
+
+      this.unparkedIdleEscalatedAt.set(first.memberName, nowMs)
+      this.unparkedIdleHits.delete(first.memberName)
+
+      if (typeof this.onPostStall === 'function') {
+        this.alertsPosted += 1
+        await this.onPostStall({
+          target: first.target,
+          targets: first.targets ?? [first.target, first.memberName],
+          title: first.title,
+          text: first.prompt,
+          kind: 'alert',
+          escalate: true,
+          refs: first.seq > 0 ? [first.seq] : [],
+          signature: first.signature,
+          attempt: recentHits.length,
+        })
+        this.lastSeenHeadSeq = this.store.headSeq(this.swarmId)
+      }
+
+      return {
+        action: 'health_alert',
+        kind: first.kind,
+        memberName: first.memberName,
+        target: first.target,
+        targets: first.targets ?? [first.target, first.memberName],
+        signature: first.signature,
+        hitsInWindow: recentHits.length,
+        attempt: recentHits.length,
+      }
+    }
+
     if (
-      (first.kind === 'member_zombie' || first.kind === 'member_unparked_idle')
+      first.kind === 'member_zombie'
       && !this.autoNudgedZombies.has(first.signature)
       && typeof this.onAutoNudge === 'function'
     ) {
@@ -362,7 +430,7 @@ export class SwarmMonitorDaemon {
       const nudged = await this.onAutoNudge(first.memberName, first.nudgePrompt ?? null)
       if (nudged) {
         return {
-          action: first.kind === 'member_unparked_idle' ? 'auto_nudged_unparked_idle' : 'auto_nudged_zombie',
+          action: 'auto_nudged_zombie',
           memberName: first.memberName,
           signature: first.signature,
         }
@@ -379,6 +447,7 @@ export class SwarmMonitorDaemon {
       this.alertsPosted += 1
       await this.onPostStall({
         target: first.target,
+        targets: first.targets,
         title: first.title,
         text: first.prompt,
         kind: 'alert',

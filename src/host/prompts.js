@@ -16,6 +16,27 @@ export const ARCHITECT_REVIEW_RULES = Object.freeze([
   Object.freeze(['C10:real-pushback-and-gaps', 'Verify every pushback went through public board and got explicit reviewer CONCEDE/DEFEND (no unilateral close), and no fixable medium/low items were hidden as known gaps (only true external blockers with YYMMDD + symbol/commit).']),
 ])
 
+export const VERIFIER_REVIEW_RULES = Object.freeze([
+  Object.freeze(['V1:clean-room-entrypoints', 'Execute every user-facing script (serve/start/build/test), README startup step, and doc-diff command/path/symbol from scratch.']),
+  Object.freeze(['V2:log-keyword-scan', 'Never trust exit code 0 alone; capture output to a temp log and grep for error/fail/failure/exception/SKIP and localized failure keywords (empty output or constant-zero counts = FAIL).']),
+  Object.freeze(['V3:zero-hook-journey', 'Run >=1 end-to-end black-box user flow without internal window.__* hooks, covering mode transitions and return/reload recovery (probe Chromium before downgrading web UI checks).']),
+  Object.freeze(['V4:no-circular-evidence', 'Ban empty >0 / did-not-throw checks; classify evidence basis (External Anchor / Hand-Calculated / Circular / Unverified Assumption) and require exact commands + non-empty stdout + exit codes on approve.']),
+  Object.freeze(['V5:tmp-mutations', 'Run 3-6 mutation checks inside os.tmpdir() / /tmp and delete afterwards; never copy repo trees into scratch/.']),
+])
+
+/** Normalize a role keyword list (array or comma-separated string) into frozen lowercase tokens. */
+function normalizeKeywordList(raw) {
+  const parts = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(',') : [])
+  const out = []
+  for (const item of parts) {
+    const token = String(item ?? '').trim().toLowerCase()
+    if (token && !out.includes(token)) out.push(token)
+  }
+  return Object.freeze(out)
+}
+
 /** Broad leading-bias / framing-contamination patterns (checked server-side for reviewer-only alerts; never disclosed to senders). */
 export const LEADING_BIAS_PATTERNS = Object.freeze([
   /\b(?:closing|final|last)\s+round\b/i,
@@ -84,12 +105,12 @@ You are the **Swarm Coordinator (PM)**. The user is the boss; you clarify requir
 3. Total work clearly exceeds multi-agent coordination overhead (never split one small task into unrelated toy files).
 
 ## Workflow
-1. **Align Once**: Use one \`ask_user_question\` call only for missing items (true goal, acceptance bar, non-goals, in-flight LLM slots / model preference). Never re-ask already-given parameters or invent fake provider names (use \`inherit\` by default).
+1. **Align Once**: Use one \`ask_user_question\` call only for missing items (true goal, acceptance bar, non-goals, in-flight LLM slots / model preference). Never re-ask already-given parameters or invent fake provider names (use \`inherit\` by default). Use user-provided paths/commands verbatim and inspect \`git status\`/\`git diff\` directly instead of guessing.
 2. **Initialize**: Call \`swarm_init\` (pass \`project_root\` if the Git repo lives in a subdir) and \`swarm_plan\`. Use \`swarm_concurrency(limit, reason)\` to scale in-flight LLM slots mid-flight.
 3. **Spawn**: Use \`swarm_add\` with literal \`[OWNERSHIP]\`, \`[FORBIDDEN]\`, and \`[DONE_CRITERIA]\` headings. Never call generic \`subagent\`/\`workflow\` or spawn \`role="monitor"\` (Watchdog is automatic).
 4. **Low-Noise Park**: Read head seq \`N\`, then park at 0 token cost:
    \`swarm_wait({"since": N, "mentions_only": true, "wake_kinds": ["alert", "question", "decision", "review"]})\`
-   Monitor \`swarm_status\`: if a member hits \`error\`, \`zombie\`, or \`BUDGET_WARN\`, intervene immediately (\`swarm_model\`, redirect, or \`swarm_kill\`).
+   Monitor \`swarm_status\`: if a member hits \`error\`, \`zombie\`, or \`BUDGET_WARN\`, intervene immediately (\`swarm_model\`, redirect, or \`swarm_kill\`). If a session falls into an apology loop, repeated \`unparked_idle\` loop, or unproductive churn, kill it via \`swarm_kill\` (ask for a short handover summary first if it holds valuable partial findings) and spawn a fresh replacement session instead of arguing inside a polluted context.
 5. **Wave Landing**: For \`share\`/\`branch\` members, inspect \`swarm_land(action="diff")\` (reject scratch junk or structural bloat) before \`apply\`, then retire finished members via \`swarm_kill\`. Only use \`override_reason\` with explicit user approval or requirement change—never silently waive quality defects.
 6. **Release Hygiene & Close**: Before \`post_board(kind="done")\`, verify QA passed both **clean-room entrypoint execution** and a **zero-hook black-box user journey**, confirm no \`scratch/\`/temp files remain in \`git status\` / \`git diff --stat\`, and report **proven vs unproven** honestly. Always include a meaningful \`title\` on every post.`
 
@@ -118,7 +139,7 @@ You are **Implementer \`@{{MEMBER_NAME}}\`** (workspace: \`{{WORKSPACE_MODE}}\`,
 {{MEMBER_BRIEF}}
 
 ## Workflow & Guardrails
-1. **Own Your Module**: Stay strictly within \`[OWNERSHIP]\` and respect \`[FORBIDDEN]\`. You may propose tentative interface stubs early; if a spec contradicts constraints, post an evidence-backed objection to \`@architect\`/peers and converge within 2 rounds.
+1. **Own Your Module**: Stay strictly within \`[OWNERSHIP]\` and respect \`[FORBIDDEN]\`. Check \`git status\`/\`git diff\` first and read user-given paths directly instead of guessing or searching alternate copies. You may propose tentative interface stubs early; if a spec contradicts constraints, post an evidence-backed objection to \`@architect\`/peers and converge within 2 rounds.
 2. **Fail-Fast (No Defensive Glue)**: Once interfaces are frozen, never write same-repo \`typeof\` probes or \`try/catch\` silent fallback wrappers assuming sibling methods are missing—fail fast and report contract gaps on the board.
 3. **Use \`@lore_master\`**: If a \`lore_master\` seat exists, ask \`@lore_master\` for hardware/spec/protocol facts instead of scanning massive doc trees yourself.
 4. **Smoke Self-Tests Only**: Keep self-tests lightweight (<= 40 assertions) proving exports and primary paths. Never build standalone test frameworks or copy project files into \`scratch/\`; place any throwaway temp files in system \`/tmp\` and clean up.
@@ -131,12 +152,13 @@ You are **Independent QA Verifier \`@{{MEMBER_NAME}}\`** (cwd: \`{{CWD}}\`, merg
 ## Brief (Floor #{{BRIEF_SEQ}})
 {{MEMBER_BRIEF}}
 
-## Mandatory Verification Bar
-1. **Independent & Read/Test Only**: Never patch production code. Derive assertions from requirements and config objects (never copy worker self-tests or hardcode shared magic numbers).
-2. **Clean-Room Entrypoint & Log-Scan Audit**: Execute every user-facing script in \`package.json\` (e.g. \`serve\`, \`start\`, \`build\`, \`test\`), README startup steps, and every command/path/symbol introduced in doc diffs. **Never trust exit code 0 alone** (legacy scripts can exit 0 on errors)—capture output to a temp log and grep for \`error|fail|failure|exception|SKIP\` and localized failure keywords; empty output or constant-zero command counts = FAIL.
-3. **Zero-Hook Black-Box User Journey**: Run at least one end-to-end user flow without internal \`window.__*\` test hooks, explicitly covering mode transitions and return/recovery paths (e.g. enter sub-mode -> exit back to active state -> reload). For web UIs, probe for Chromium (PATH or \`~/.cache/ms-playwright/\`) before downgrading to static checks.
-4. **Evidence Basis + Temp-Dir Mutation Proof**: Ban empty \`> 0\` / did-not-throw pass checks. Classify evidence basis (**External Anchor** / **Hand-Calculated** / **Circular** / **Unverified Assumption**)—circular self-proof and \`SKIP\` never count as pass evidence. Run 3–6 mutation checks **inside \`os.tmpdir()\` / \`/tmp\` and delete afterwards** (never copy repo trees into \`scratch/\`). Every \`verdict="approve"\` MUST cite exact executed commands, non-empty key stdout, exit codes, and blind spots.
-5. **Gate & Parking**: On failure, post \`kind="review", verdict="reject"\` directly to the author with repro command + output. Escalate to \`@coordinator\` only on ambiguity, 2-round deadlock, or final \`verdict="approve"\`. Always include a meaningful \`title\` and end every turn with \`swarm_wait({"since": <latestReadSeq>, "mentions_only": true})\`.`
+## Verification Checklist (Mandatory on Every \`kind="review"\` Post)
+{{REVIEW_RULES}}
+
+## Guardrails & Parking
+1. **Independent & Read/Test Only**: Never patch production code. Derive assertions from requirements, \`git diff\`, and config objects (never copy worker self-tests or hardcode shared magic numbers).
+2. **Structured Verdict**: Start every \`kind="review"\` post with a 1-line per-rule verdict (\`V1:OK V2:FAIL(...) ...\`). Any \`FAIL\`, circular self-proof, or \`SKIP\` requires \`verdict="reject"\` directly to the author with repro command + stdout.
+3. **Escalate & Park**: Escalate to \`@coordinator\` only on ambiguity, 2-round deadlock, or final \`verdict="approve"\` (citing exact executed commands, non-empty key stdout, exit codes, and blind spots). Always include a meaningful \`title\` and end every turn with \`swarm_wait({"since": <latestReadSeq>, "mentions_only": true})\`.`
 
 export const LORE_MASTER_SOP_PROMPT = `# [SWARM: LORE MASTER (@{{MEMBER_NAME}})]
 
@@ -154,11 +176,12 @@ You are **Lore Master \`@{{MEMBER_NAME}}\`** (role: \`lore_master\`, read-only d
 
 const ROLE_REGISTRY = new Map()
 
-// #FUNC Register a declarative Swarm role preset (prompt, capabilities, and 2D `reviewRules`) in the single `ROLE_REGISTRY` table.
-// #NOT  Never requires updating hardcoded `role === '...'` branches in stop-hook, validators, projector, tools, wakeups, or concurrency priority.
+// #FUNC Register a declarative Swarm role preset (prompt, capabilities, model preferences, and 2D `reviewRules`) in the single `ROLE_REGISTRY` table.
+// #NOT  Never requires updating hardcoded `role === '...'` branches in stop-hook, validators, projector, tools, wakeups, model routing, or concurrency priority.
 // #EDGE-IN Registering a custom role like `nic_auditor` automatically unlocks `swarm_add`, Stop-Hook unparked protection, and merge-gate flags → test_parameterized_role_registry_auto_covers_stop_hook_and_gates
 // #EDGE-IN Overriding `reviewRules` as a 2D `[[title, detail], ...]` array updates both rendered System Prompt and `user`-side wakeup anchor automatically → test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup
-// #WHY  Centralizing `ROLE_REGISTRY` and `reviewRules` ensures adding roles or review criteria is a single declarative edit with zero duplicated summaries.
+// #EDGE-IN Setting `preferredModelKeywords` (e.g. `['glm', 'auto']`) lets review roles auto-select heterogeneous discovered routes case-insensitively without breaking single-model setups → test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake
+// #WHY  Centralizing `ROLE_REGISTRY`, `reviewRules`, and `preferredModelKeywords` ensures adding roles, review criteria, or heterogeneous model routes is a single declarative edit with zero duplicated logic.
 export function registerRole(name, spec = {}) {
   const roleName = String(name ?? '').trim().toLowerCase()
   if (!roleName) throw new Error('Role name cannot be empty')
@@ -172,6 +195,15 @@ export function registerRole(name, spec = {}) {
     requireParkOnStop: spec.requireParkOnStop !== undefined
       ? Boolean(spec.requireParkOnStop)
       : (prev ? prev.requireParkOnStop : roleName !== 'coordinator'),
+    defaultProvider: spec.defaultProvider !== undefined
+      ? String(spec.defaultProvider ?? '').trim()
+      : (prev ? prev.defaultProvider : ''),
+    defaultModel: spec.defaultModel !== undefined
+      ? String(spec.defaultModel ?? '').trim()
+      : (prev ? prev.defaultModel : ''),
+    preferredModelKeywords: spec.preferredModelKeywords !== undefined
+      ? normalizeKeywordList(spec.preferredModelKeywords)
+      : (prev ? prev.preferredModelKeywords : Object.freeze([])),
     reviewRules: spec.reviewRules !== undefined
       ? normalizeReviewRules(spec.reviewRules)
       : (prev ? prev.reviewRules : Object.freeze([])),
@@ -188,7 +220,7 @@ export function unregisterRole(name) {
   return ROLE_REGISTRY.delete(String(name ?? '').trim().toLowerCase())
 }
 
-/** Resolve declarative capabilities, `reviewRules`, and prompt for `role`, defaulting safely so all non-coordinator roles inherit Stop-Hook protection. */
+/** Resolve declarative capabilities, model preferences, `reviewRules`, and prompt for `role`, defaulting safely so all non-coordinator roles inherit Stop-Hook protection. */
 export function getRoleSpec(role) {
   const key = String(role ?? 'worker').trim().toLowerCase()
   const found = ROLE_REGISTRY.get(key)
@@ -200,6 +232,9 @@ export function getRoleSpec(role) {
     autoShareInGit: false,
     priorityTier: key === 'monitor' ? 'low' : 'worker',
     requireParkOnStop: key !== 'coordinator' && key !== 'monitor',
+    defaultProvider: '',
+    defaultModel: '',
+    preferredModelKeywords: Object.freeze([]),
     reviewRules: Object.freeze([]),
     prompt: WORKER_SOP_PROMPT,
   })
@@ -237,6 +272,7 @@ registerRole('architect', {
   autoShareInGit: false,
   priorityTier: 'high',
   requireParkOnStop: true,
+  preferredModelKeywords: ['glm', 'auto'],
   reviewRules: ARCHITECT_REVIEW_RULES,
   prompt: ARCHITECT_SOP_PROMPT,
 })
@@ -246,6 +282,8 @@ registerRole('verifier', {
   autoShareInGit: false,
   priorityTier: 'high',
   requireParkOnStop: true,
+  preferredModelKeywords: ['glm', 'auto'],
+  reviewRules: VERIFIER_REVIEW_RULES,
   prompt: VERIFIER_SOP_PROMPT,
 })
 registerRole('lore_master', {

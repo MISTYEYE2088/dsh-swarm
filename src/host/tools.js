@@ -301,7 +301,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.12', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.13', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -454,8 +454,9 @@ export function createSwarmTools(runtime) {
 
         const resolvedRoute = typeof runtime.resolveModelRoute === 'function'
           ? await runtime.resolveModelRoute({
-              requestedProvider: spec.provider,
-              requestedModel: spec.model,
+              requestedProvider: spec.providerExplicit ? spec.provider : 'inherit',
+              requestedModel: spec.modelExplicit ? spec.model : 'inherit',
+              role: spec.role,
               rootAgent,
               swarmMeta,
             })
@@ -1065,7 +1066,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.12', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.13', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1242,11 +1243,11 @@ export function createSwarmTools(runtime) {
 
   const swarmKillTool = makeTool({
     name: 'swarm_kill',
-    description: 'Retire a Swarm member and delete its isolated worktree. If the member never started (`turn_count === 0 && last_post_seq === 0`), its name is cleanly released for reuse; otherwise the name stays tombstoned for audit history. Optional `handover_to` records responsibility handover.',
+    description: 'Retire a Swarm member and delete its isolated worktree. Blocks retiring a currently `working` or `queued` member unless `force: true` is passed (prompting to ask for handover notes / last words if valuable). If the member never started (`turn_count === 0 && last_post_seq === 0`), its name is cleanly released for reuse; otherwise the name stays tombstoned for audit history. Optional `handover_to` records responsibility handover.',
     parameters: {
       properties: {
         name: { type: 'string', description: 'Member name to retire.' },
-        force: { type: 'boolean', description: 'Set true only to discard unmerged worktree edits intentionally.' },
+        force: { type: 'boolean', description: 'Set true to force-kill a running/queued member or discard unmerged worktree edits intentionally.' },
         handover_to: { type: 'string', description: 'Optional member name taking over responsibility.' },
         reason: { type: 'string', description: 'Optional retirement/handover reason.' },
       },
@@ -1272,6 +1273,19 @@ export function createSwarmTools(runtime) {
           return {
             ok: false,
             text: `[PERMISSION_ERROR: swarm_kill] @${callerName} may only retire members it spawned; @${targetName} was spawned by @${rawTarget.parent}.`,
+          }
+        }
+
+        const liveness = typeof runtime.getMemberLiveness === 'function'
+          ? runtime.getMemberLiveness(swarmId, targetName, rawTarget)
+          : { status: 'unknown', stepSummary: null }
+        if ((liveness.status === 'working' || liveness.status === 'queued') && args.force !== true) {
+          const stepNote = liveness.stepSummary ? ` (${liveness.stepSummary})` : ''
+          return {
+            ok: false,
+            blocked_running: true,
+            status: liveness.status,
+            text: `[KILL_BLOCKED: swarm_kill] @${targetName} is currently ${liveness.status}${stepNote}. If its in-progress findings or context ("last words") are meaningful, message @${targetName} via post_board to post a brief handover summary before killing; otherwise re-call swarm_kill({"name": "${targetName}", "force": true}) to terminate immediately.`,
           }
         }
 
