@@ -2685,6 +2685,321 @@ async function test_verifier_review_rules_heterogeneous_model_keywords_and_kill_
   assert.equal(runtime.store.readMembers('sess-v0313')['impl-live'].killed, true)
 }
 
+async function test_log_export_normal_conversation_with_subagents_and_usage() {
+  const { createSwarmWebRoutes } = await import('../index.js')
+  const storedSessions = new Map([
+    [
+      'normal-chat-1',
+      {
+        header: { id: 'normal-chat-1', version: 4, createdAt: 1732500000000, cwd: '/repo/demo', isSeeded: false },
+        events: [
+          { type: 'request/context', seq: 0, time: 1732500001000, data: { provider: 'corp', model: 'deepseek-r1', contextWindow: 128000 } },
+          { type: 'turn/start', seq: 1, time: 1732500001100, data: { turn: 1 } },
+          {
+            type: 'user/message',
+            seq: 2,
+            time: 1732500001200,
+            data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Diagnose why my grep check returns 0.' }] },
+          },
+          { type: 'step/start', seq: 3, time: 1732500001300, data: { turn: 1, step: 1 } },
+          {
+            type: 'assistant/message',
+            seq: 4,
+            time: 1732500002000,
+            data: {
+              turn: 1,
+              step: 1,
+              usage: { inputTokens: 42000, outputTokens: 1200 },
+              stream: [{ type: 'chunk', chunk: { type: 'text-delta', text: 'RAW_STREAM_NOISE_SHOULD_BE_STRIPPED' } }],
+              message: {
+                id: 'a1',
+                role: 'assistant',
+                source: { kind: 'model', provider: 'corp', model: 'deepseek-r1' },
+                content: [
+                  { type: 'reasoning', text: 'SECRET_CHAIN_OF_THOUGHT_CHECK' },
+                  { type: 'text', text: 'Inspecting the script now.' },
+                  { type: 'tool-call', id: 'tc-1', name: 'bash', arguments: '{"cmd":"cat run_llt.sh"}' },
+                ],
+              },
+            },
+          },
+          { type: 'tool/call', seq: 5, time: 1732500002100, data: { turn: 1, step: 1, callId: 'tc-1', name: 'bash', arguments: '{"cmd":"cat run_llt.sh"}' } },
+          {
+            type: 'tool/result',
+            seq: 6,
+            time: 1732500002200,
+            data: {
+              turn: 1,
+              step: 1,
+              error: { name: 'ToolError', code: 'EXIT_1', reason: 'script failed' },
+              message: { id: 'tr1', role: 'tool', toolCallId: 'tc-1', isError: true, content: [{ type: 'text', text: 'ERROR_LINE_' + 'x'.repeat(200) }] },
+            },
+          },
+          { type: 'turn/end', seq: 7, time: 1732500002500, data: { turn: 1, reason: { kind: 'completed' } } },
+        ],
+      },
+    ],
+    [
+      'subagent-child-1',
+      {
+        header: { id: 'subagent-child-1', version: 4, createdAt: 1732500003000, cwd: '/repo/demo', parentSession: 'normal-chat-1', origin: 'subagent', delegationDepth: 1, isSeeded: false },
+        events: [
+          { type: 'subagent/descriptor', seq: 0, time: 1732500003000, data: { label: 'Red Team Auditor' } },
+          { type: 'turn/start', seq: 1, time: 1732500003100, data: { turn: 1 } },
+          {
+            type: 'assistant/message',
+            seq: 2,
+            time: 1732500003500,
+            data: {
+              turn: 1,
+              step: 1,
+              stream: [],
+              message: {
+                id: 'a2',
+                role: 'assistant',
+                source: { kind: 'model', provider: 'corp', model: 'Auto' },
+                content: [{ type: 'text', text: 'Found fake grep command returning constant 0.' }],
+              },
+            },
+          },
+          { type: 'turn/end', seq: 3, time: 1732500003600, data: { turn: 1, reason: { kind: 'completed' } } },
+        ],
+      },
+    ],
+  ])
+
+  let flushCalls = 0
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'sessions') {
+        return {
+          get(id) { return storedSessions.has(id) ? { id, header: storedSessions.get(id).header } : undefined },
+          async flush() { flushCalls += 1 },
+        }
+      }
+      if (name === 'sessionPersistence') {
+        return {
+          async open(id) {
+            const rec = storedSessions.get(id)
+            if (!rec) {
+              const err = new Error('not found')
+              err.name = 'SessionPersistenceNotFoundError'
+              throw err
+            }
+            return {
+              header: rec.header,
+              async read() { return { events: rec.events } },
+              async close() {},
+            }
+          },
+        }
+      }
+      if (name === 'sessionQuery') {
+        return {
+          async traceSession(id) {
+            if (id === 'normal-chat-1') {
+              return {
+                session: { header: storedSessions.get('normal-chat-1').header },
+                descendants: [{ session: { header: storedSessions.get('subagent-child-1').header }, descendants: [] }],
+              }
+            }
+            return { session: { header: { id } }, descendants: [] }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-export-normal') }, { log: () => {}, warn: () => {} })
+  // Create an UNRELATED Swarm on disk to verify normal conversation export NEVER leaks or falls back to it!
+  runtime.store.initSwarm('unrelated-swarm-99', { title: 'Unrelated Swarm Must Not Leak', concurrency_confirmed: true })
+
+  const routes = createSwarmWebRoutes(runtime)
+  const exportRoute = routes.find(r => r.path === '/api/dsh-swarm/export')
+  assert.ok(exportRoute, '/api/dsh-swarm/export route must be registered')
+
+  async function callExport(query, method = 'GET') {
+    const headers = {}
+    let body = ''
+    const res = {
+      statusCode: 0,
+      setHeader(k, v) { headers[k.toLowerCase()] = v },
+      end(chunk) { body = String(chunk ?? '') },
+    }
+    await exportRoute.handler({ method, url: `/api/dsh-swarm/export?${query}` }, res)
+    return { statusCode: res.statusCode, headers, body }
+  }
+
+  // 1. Markdown export of normal conversation + native subagent
+  const mdRes = await callExport('sessionId=normal-chat-1&format=md&download=1&maxToolResultChars=60')
+  assert.equal(mdRes.statusCode, 200)
+  assert.equal(mdRes.headers['x-dsh-export-mode'], 'session')
+  assert.match(mdRes.headers['content-type'], /text\/markdown/)
+  assert.match(mdRes.headers['content-disposition'], /attachment; filename="dsh-session-log-normal-chat-1-.*\.md"/)
+  assert.ok(flushCalls >= 2, 'Live sessions must be flushed before reading persistence')
+  assert.match(mdRes.body, /Session Diagnostic Log: normal-chat-1/)
+  assert.match(mdRes.body, /Diagnose why my grep check returns 0/)
+  assert.match(mdRes.body, /SECRET_CHAIN_OF_THOUGHT_CHECK/)
+  assert.match(mdRes.body, /Red Team Auditor/)
+  assert.match(mdRes.body, /Found fake grep command returning constant 0/)
+  assert.match(mdRes.body, /42\.0k\/128\.0k \(32\.8%\)/)
+  assert.match(mdRes.body, /truncated/)
+  assert.equal(mdRes.body.includes('RAW_STREAM_NOISE_SHOULD_BE_STRIPPED'), false, 'Raw SSE stream chunks must be stripped')
+  assert.equal(mdRes.body.includes('Unrelated Swarm Must Not Leak'), false, 'Normal conversation export must NEVER fall back to an unrelated Swarm')
+
+  // 2. JSON export with reasoning & subagents toggled OFF
+  const jsonRes = await callExport('sessionId=normal-chat-1&format=json&includeReasoning=false&includeSubagents=false')
+  assert.equal(jsonRes.statusCode, 200)
+  const parsed = JSON.parse(jsonRes.body)
+  assert.equal(parsed.mode, 'session')
+  assert.equal(parsed.sessions.length, 1, 'includeSubagents=false must omit subagent sessions')
+  assert.equal(parsed.sessions[0].stats.context_pct, 32.8)
+  assert.equal(parsed.sessions[0].stats.tool_errors, 1)
+  assert.equal(jsonRes.body.includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), false, 'includeReasoning=false must omit reasoning blocks')
+
+  // 3. HEAD request & 404 on unknown session
+  const headRes = await callExport('sessionId=normal-chat-1&format=md', 'HEAD')
+  assert.equal(headRes.statusCode, 200)
+  assert.equal(headRes.body, '')
+  const notFound = await callExport('sessionId=does-not-exist-xyz&format=md')
+  assert.equal(notFound.statusCode, 404)
+}
+
+async function test_log_export_swarm_blackboard_members_and_context_telemetry() {
+  const { createSwarmWebRoutes } = await import('../index.js')
+  const listeners = new Map()
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on(ev, fn) { listeners.set(ev, fn); return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-export-swarm') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sw-exp', session: { header: { id: 'sw-exp', cwd: tempRoot } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'NIC Firmware Audit Swarm', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-tx', role: 'worker', brief: '[OWNERSHIP]\ntx\n[FORBIDDEN]\nrx\n[DONE_CRITERIA]\ndone' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-gate', role: 'verifier', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\ntx\n[DONE_CRITERIA]\nverify' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('post_board').execute(
+    { title: 'TX queue implemented', kind: 'report', mentions: ['qa-gate'], text: '@qa-gate TX ring ready' },
+    { agent: { id: 'sw-exp__impl-tx' } },
+  )
+  await registeredTools.get('post_board').execute(
+    { title: 'QA reject: log scan failed', kind: 'review', verdict: 'reject', mentions: ['impl-tx'], text: '@impl-tx Found FAIL in log' },
+    { agent: { id: 'sw-exp__qa-gate' } },
+  )
+
+  // Emit real `request/context` and `assistant/message` usage events for `@impl-tx`
+  const onSessionEvent = listeners.get('session/event')
+  onSessionEvent({ id: 'sw-exp__impl-tx' }, { type: 'request/context', seq: 0, time: 1732500100000, data: { provider: 'corp', model: 'deepseek-r1', contextWindow: 128000 } })
+  onSessionEvent({ id: 'sw-exp__impl-tx' }, {
+    type: 'assistant/message',
+    seq: 1,
+    time: 1732500101000,
+    data: {
+      turn: 1,
+      step: 1,
+      usage: { inputTokens: 64000, outputTokens: 800 },
+      stream: [],
+      message: { id: 'm1', role: 'assistant', source: { kind: 'model', provider: 'corp', model: 'deepseek-r1' }, content: [{ type: 'text', text: 'Implemented TX ring buffer.' }] },
+    },
+  })
+
+  // 1. Real context usage telemetry shows up in `swarm_status` (`ctx=64.0k/128.0k(50%)`)
+  const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })
+  assert.equal(statusRes.ok, true)
+  assert.match(statusRes.text, /ctx=64\.0k\/128\.0k\(50%\)/)
+
+  // 2. Exporting from a MEMBER session ID resolves the owning Swarm and bundles Blackboard + Roster + Member transcripts!
+  const routes = createSwarmWebRoutes(runtime)
+  const exportRoute = routes.find(r => r.path === '/api/dsh-swarm/export')
+  const stateRoute = routes.find(r => r.path === '/api/dsh-swarm/state')
+
+  const headers = {}
+  let body = ''
+  await exportRoute.handler(
+    { method: 'GET', url: '/api/dsh-swarm/export?sessionId=sw-exp__impl-tx&format=md&download=1' },
+    { statusCode: 0, setHeader(k, v) { headers[k.toLowerCase()] = v }, end(c) { body = String(c ?? '') } },
+  )
+  assert.equal(headers['x-dsh-export-mode'], 'swarm')
+  assert.match(headers['content-disposition'], /dsh-swarm-log-sw-exp-.*\.md/)
+  assert.match(body, /Swarm Diagnostic Log: NIC Firmware Audit Swarm/)
+  assert.match(body, /Swarm Blackboard Timeline/)
+  assert.match(body, /QA reject: log scan failed/)
+  assert.match(body, /Implemented TX ring buffer/)
+  assert.match(body, /64\.0k\/128\.0k \(50%\)/)
+
+  // 3. `/api/dsh-swarm/state` distinguishes `exactSwarmId` (non-null for Swarm, null for normal chat)
+  let swarmStateBody = ''
+  await stateRoute.handler(
+    { method: 'GET', url: '/api/dsh-swarm/state?sessionId=sw-exp' },
+    { statusCode: 0, setHeader() {}, end(c) { swarmStateBody = String(c ?? '') } },
+  )
+  assert.equal(JSON.parse(swarmStateBody).exactSwarmId, 'sw-exp')
+
+  let normalStateBody = ''
+  await stateRoute.handler(
+    { method: 'GET', url: '/api/dsh-swarm/state?sessionId=ordinary-chat-777' },
+    { statusCode: 0, setHeader() {}, end(c) { normalStateBody = String(c ?? '') } },
+  )
+  assert.equal(JSON.parse(normalStateBody).exactSwarmId, null)
+}
+
+async function test_client_registers_export_header_utility_slot_and_builds_urls() {
+  const clientSource = fs.readFileSync(CLIENT_PATH, 'utf8')
+  let loadedModule = null
+  const sandbox = {
+    window: {
+      __ModuleLoader__: {
+        load(def) { loadedModule = def },
+      },
+    },
+    console: { info() {}, warn() {}, error() {} },
+    setTimeout,
+    clearTimeout,
+  }
+  vm.runInNewContext(clientSource, sandbox, { filename: 'client.js' })
+  assert.ok(loadedModule && typeof loadedModule.factory === 'function')
+  const mod = loadedModule.factory(() => null)
+
+  // Verify URL builder for both normal session and explicit Swarm modes
+  assert.equal(
+    mod.buildExportUrl({ sessionId: 'chat-42', format: 'md', includeSubagents: true, includeReasoning: false, download: true }),
+    '/api/dsh-swarm/export?sessionId=chat-42&format=md&includeSubagents=true&includeReasoning=false&download=1',
+  )
+  assert.equal(
+    mod.buildExportUrl({ swarmId: 'sw-9', format: 'json', includeSubagents: true, includeReasoning: true }),
+    '/api/dsh-swarm/export?swarmId=sw-9&format=json&includeSubagents=true&includeReasoning=true',
+  )
+
+  // Verify `conversation.session.header.utilities` registers `dsh-swarm-export-log`
+  const registeredSlots = []
+  const fakeClientCtx = {
+    slots: {
+      inject(_name, fn) { fn() },
+      register(cfg) { registeredSlots.push(cfg); return () => {} },
+    },
+    effect(fn) { return fn() },
+  }
+  mod.apply(fakeClientCtx)
+  assert.ok(
+    registeredSlots.some(s => s.name === 'conversation.session.header.utilities' && s.id === 'dsh-swarm-export-log'),
+    'Client must register dsh-swarm-export-log into conversation.session.header.utilities for both Swarm and normal chats',
+  )
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -2699,6 +3014,7 @@ async function test_plugin_runtime_contains_zero_cjk_characters() {
     'src/host/tools.js',
     'src/host/worktree.js',
     'src/host/concurrency-gate.js',
+    'src/host/log-export.js',
   ]
   const cjkRegex = /[\u4e00-\u9fff]/
   for (const rel of runtimeFiles) {
@@ -2765,6 +3081,9 @@ try {
   await runTest('test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup', test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup)
   await runTest('test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip', test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip)
   await runTest('test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake', test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake)
+  await runTest('test_log_export_normal_conversation_with_subagents_and_usage', test_log_export_normal_conversation_with_subagents_and_usage)
+  await runTest('test_log_export_swarm_blackboard_members_and_context_telemetry', test_log_export_swarm_blackboard_members_and_context_telemetry)
+  await runTest('test_client_registers_export_header_utility_slot_and_builds_urls', test_client_registers_export_header_utility_slot_and_builds_urls)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

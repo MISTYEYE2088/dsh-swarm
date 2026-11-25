@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0 (2026-11-25)
+
+- **Unified Diagnostic Log Export for Both Swarm & Normal DSH Conversations (`src/host/log-export.js` + `/api/dsh-swarm/export`)**:
+  - Added host-side `collectDiagnosticExport()` and `formatDiagnosticMarkdown()` reading DSH sessions through official Host services (`sessions`, `sessionPersistence`, `sessionQuery`) with zero external npm dependencies.
+  - **Auto-detects mode strictly (`resolveSwarmId(..., { fallbackLatest: false })`)**: exporting a normal conversation exports ONLY that conversation + its native subagents (`mode="session"`) without cross-contaminating from unrelated Swarms on disk; exporting a Swarm coordinator or member session exports the full Swarm Roster, Active Plan, Merge Gate Rejections, Blackboard timeline (`events.jsonl`), and all member transcripts (`mode="swarm"`).
+  - Strips noisy raw SSE `assistant/message.data.stream` delta chunks while preserving user prompts, assistant replies, optional reasoning blocks, tool calls/results (with error highlighting & clean truncation), abnormal `turn/end` reasons, compaction markers, and real token/context usage.
+  - Supports **Markdown (`.md`)** (human & AI diagnostic report) and **JSON (`.json`)** (structured machine bundle) via `GET/HEAD /api/dsh-swarm/export`.
+- **Native DSH UI Extension for Log Export (`client.js`)**:
+  - Mounted `SwarmExportMenuButton` in `conversation.session.header.utilities` (visible on **every** normal conversation and Swarm session, right beside `dsh-session-id` and DSH's header menu) AND in the Swarm Right Sidebar toolbar (next to Refresh).
+  - Provides 1-click **Download Markdown (`.md`)**, **Download JSON (`.json`)**, and **Copy Markdown** (with clipboard fallback + inline status feedback), plus toggles for `Include subagents / members` and `Include reasoning`.
+- **Real Context Usage Telemetry (`swarm_status` + Export)**:
+  - Tracked `request/context` (`contextWindow`) and `assistant/message` (`usage.inputTokens`) in live member telemetry, surfacing real `ctx=42.0k/128.0k(33%)` in `swarm_status` and exported Swarm rosters.
+
 ## 0.3.13 (2026-11-24)
 
 - **Watchdog 10-Minute Sliding Window for `unparked_idle` + Coordinator Apology/Idle Loop Breaker**:

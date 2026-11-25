@@ -26,6 +26,7 @@ import {
 import { buildSwarmSystemMessage } from './stop-hook.js'
 import { getRoleSpec, getSpawnableRoles } from './prompts.js'
 import { runGit, createIsolatedWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
+import { formatCompactTokens } from './log-export.js'
 
 const TEXT_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -199,6 +200,8 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       last_tool_call_at: m.last_tool_call_at ?? null,
       last_tool_name: m.last_tool_name ?? null,
       last_error: m.last_error ?? null,
+      last_input_tokens: m.last_input_tokens ?? 0,
+      context_window: m.context_window ?? 0,
       queue_position: queuePos,
     })
   }
@@ -301,7 +304,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.13', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.4.0', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -1066,7 +1069,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.13', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.4.0', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1097,11 +1100,14 @@ export function createSwarmTools(runtime) {
           const qPart = m.queue_position > 0 ? ` q=#${m.queue_position}` : ''
           const errPart = m.last_error ? ` ERR=${m.last_error.code}:${m.last_error.message}` : ''
           const blkPart = m.last_park_blocked_seq > 0 ? ` blk=#${m.last_park_blocked_seq}` : ''
+          const ctxPart = m.context_window > 0 && m.last_input_tokens > 0
+            ? ` ctx=${formatCompactTokens(m.last_input_tokens)}/${formatCompactTokens(m.context_window)}(${Math.round((m.last_input_tokens / m.context_window) * 100)}%)`
+            : (m.last_input_tokens > 0 ? ` ctx=${formatCompactTokens(m.last_input_tokens)}` : '')
           const stepPart = m.stepSummary && m.status !== 'waiting' && m.status !== 'killed' ? ` | ${m.stepSummary}` : ''
           const budgetWarn = !m.killed && m.tool_call_count >= HIGH_TOOL_CALL_THRESHOLD
             ? ` [BUDGET_WARN: ${m.tool_call_count} tool calls]`
             : ''
-          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} ${route} ${m.workspace_mode} t=${m.turn_count} tc=${m.tool_call_count}${lastTool}${qPart}${errPart} r=#${m.last_read_seq} w=#${m.wait_since} p=#${m.last_post_seq}${blkPart}${stepPart}${budgetWarn}`
+          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} ${route} ${m.workspace_mode} t=${m.turn_count} tc=${m.tool_call_count}${ctxPart}${lastTool}${qPart}${errPart} r=#${m.last_read_seq} w=#${m.wait_since} p=#${m.last_post_seq}${blkPart}${stepPart}${budgetWarn}`
         }),
       ]
       return {

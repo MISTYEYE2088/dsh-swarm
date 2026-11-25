@@ -438,7 +438,7 @@ export class SwarmStore {
   }
 
   /** Resolve a root sessionId or child worker sessionId (`<swarmId>__<member>`) to an existing swarmId on disk. */
-  resolveSwarmId(sessionId) {
+  resolveSwarmId(sessionId, { fallbackLatest = true } = {}) {
     if (sessionId && this.exists(sessionId)) return sessionId
     if (typeof sessionId === 'string' && sessionId.includes('__')) {
       const prefix = sessionId.split('__')[0]
@@ -453,7 +453,7 @@ export class SwarmStore {
         }
       }
     }
-    return all.length > 0 ? all[0].swarm_id : null
+    return fallbackLatest && all.length > 0 ? all[0].swarm_id : null
   }
 
   // #FUNC Initialize or update a Swarm in the single append-only `events.jsonl` log and ensure `coordinator` exists in `offsets.json`.

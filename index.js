@@ -31,15 +31,21 @@ import {
   hasLeadingAuditBias,
 } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
+import {
+  collectDiagnosticExport,
+  formatDiagnosticMarkdown,
+  extractSessionTranscript,
+  safeExportFilename,
+} from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.3.13'
+export const PLUGIN_VERSION = '0.4.0'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.13'
+    if (!fs.existsSync(headFile)) return 'release-0.4.0'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -47,7 +53,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.3.13'
+    return 'release-0.4.0'
   }
 }
 
@@ -70,6 +76,10 @@ export {
   formatReviewRules,
   createSwarmTools,
   buildSwarmProjectionSnapshot,
+  collectDiagnosticExport,
+  formatDiagnosticMarkdown,
+  extractSessionTranscript,
+  safeExportFilename,
 }
 
 /** Cordis plugin name used by loader diagnostics. */
@@ -108,7 +118,7 @@ function sendJson(res, statusCode, payload) {
   res.end(body)
 }
 
-/** Build the read-only `/api/dsh-swarm/state` route for `webServer` (all Swarm mutations go through AI tools). */
+/** Build the read-only `/api/dsh-swarm/state` and `/api/dsh-swarm/export` routes for `webServer`. */
 export function createSwarmWebRoutes(runtime) {
   const { store, concurrencyGate } = runtime
   return [
@@ -120,6 +130,9 @@ export function createSwarmWebRoutes(runtime) {
           const url = new URL(req.url ?? '/api/dsh-swarm/state', 'http://127.0.0.1')
           const requestedSessionId = url.searchParams.get('sessionId') || ''
           const explicitSwarmId = url.searchParams.get('swarmId') || ''
+          const exactSwarmId = requestedSessionId
+            ? store.resolveSwarmId(requestedSessionId, { fallbackLatest: false })
+            : null
           const resolvedSwarmId = (explicitSwarmId && store.exists(explicitSwarmId))
             ? explicitSwarmId
             : store.resolveSwarmId(requestedSessionId)
@@ -129,11 +142,73 @@ export function createSwarmWebRoutes(runtime) {
           sendJson(res, 200, {
             ok: true,
             requestedSessionId,
+            exactSwarmId,
             resolvedSwarmId,
             swarms: store.listSwarms(),
             concurrency: concurrencyGate.snapshot(),
             snapshot,
           })
+        } catch (err) {
+          sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
+        }
+      },
+    },
+    {
+      kind: 'exact',
+      path: '/api/dsh-swarm/export',
+      async handler(req, res) {
+        try {
+          const url = new URL(req.url ?? '/api/dsh-swarm/export', 'http://127.0.0.1')
+          const sessionId = url.searchParams.get('sessionId') || ''
+          const swarmId = url.searchParams.get('swarmId') || ''
+          const formatParam = (url.searchParams.get('format') || 'md').toLowerCase()
+          const format = formatParam === 'json' ? 'json' : 'md'
+          const includeSubagents = url.searchParams.get('includeSubagents') !== 'false'
+          const includeReasoning = url.searchParams.get('includeReasoning') !== 'false'
+          const downloadParam = url.searchParams.get('download')
+          const isDownload = downloadParam === '1' || downloadParam === 'true'
+          const maxCharsRaw = url.searchParams.get('maxToolResultChars')
+          const maxToolResultChars = maxCharsRaw !== null && maxCharsRaw !== '' && Number.isFinite(Number(maxCharsRaw))
+            ? Number(maxCharsRaw)
+            : undefined
+
+          const result = await collectDiagnosticExport({
+            ctx: runtime.ctx,
+            store,
+            runtime,
+            sessionId,
+            swarmId,
+            includeSubagents,
+            includeReasoning,
+            ...(maxToolResultChars !== undefined ? { maxToolResultChars } : {}),
+          })
+          if (!result.ok) {
+            sendJson(res, result.status || 400, { ok: false, error: result.error })
+            return
+          }
+
+          const prefix = result.bundle.mode === 'swarm' ? 'dsh-swarm-log' : 'dsh-session-log'
+          const filename = safeExportFilename(prefix, result.bundle.root_session_id, format)
+          const contentType = format === 'json'
+            ? 'application/json; charset=utf-8'
+            : 'text/markdown; charset=utf-8'
+
+          res.statusCode = 200
+          res.setHeader('content-type', contentType)
+          res.setHeader('cache-control', 'no-store')
+          res.setHeader('x-dsh-export-mode', result.bundle.mode)
+          res.setHeader('x-dsh-export-filename', filename)
+          if (isDownload) {
+            res.setHeader('content-disposition', `attachment; filename="${filename}"`)
+          }
+          if (String(req.method || 'GET').toUpperCase() === 'HEAD') {
+            res.end('')
+            return
+          }
+          const body = format === 'json'
+            ? JSON.stringify(result.bundle, null, 2)
+            : formatDiagnosticMarkdown(result.bundle)
+          res.end(body)
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
         }
@@ -238,6 +313,7 @@ export function applyWith(ctx, config, deps = {}) {
   }
 
   const runtime = {
+    ctx,
     settings,
     store,
     worktreesRoot,
@@ -261,6 +337,9 @@ export function applyWith(ctx, config, deps = {}) {
         ...(t.last_tool_name ? { last_tool_name: t.last_tool_name } : {}),
         ...(t.last_error !== undefined ? { last_error: t.last_error } : {}),
         ...(t.phase ? { phase: t.phase } : {}),
+        ...(t.last_input_tokens > 0 ? { last_input_tokens: t.last_input_tokens } : {}),
+        ...(t.total_output_tokens > 0 ? { total_output_tokens: t.total_output_tokens } : {}),
+        ...(t.context_window > 0 ? { context_window: t.context_window } : {}),
       }
     },
 
@@ -1120,6 +1199,9 @@ export function applyWith(ctx, config, deps = {}) {
           last_tool_name: existing?.last_tool_name ?? null,
           last_error: existing?.last_error ?? null,
           phase: existing?.phase ?? 'RUNNING',
+          last_input_tokens: 0,
+          total_output_tokens: 0,
+          context_window: 0,
         }
         memberTelemetry.set(sid, t)
       }
@@ -1135,6 +1217,16 @@ export function applyWith(ctx, config, deps = {}) {
         t.last_error = null
         t.phase = 'RUNNING'
         scheduleTelemetryFlush(swarmId, false)
+      } else if (event.type === 'request/context') {
+        if (typeof event.data?.contextWindow === 'number' && event.data.contextWindow > 0) {
+          t.context_window = event.data.contextWindow
+        }
+      } else if (event.type === 'assistant/message') {
+        const usage = event.data?.usage
+        if (usage && typeof usage === 'object') {
+          if (Number(usage.inputTokens) > 0) t.last_input_tokens = Number(usage.inputTokens)
+          if (Number(usage.outputTokens) > 0) t.total_output_tokens += Number(usage.outputTokens)
+        }
       } else {
         const failure = extractEventFailure(event)
         if (failure && memberName !== 'coordinator') {

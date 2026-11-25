@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.13'
+    var VERSION = '0.4.0'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -652,6 +652,7 @@ window.__ModuleLoader__.load({
       try {
         var snap = data && data.snapshot ? data.snapshot : null
         return JSON.stringify({
+          exactSwarmId: data && data.exactSwarmId ? data.exactSwarmId : null,
           resolvedSwarmId: data && data.resolvedSwarmId ? data.resolvedSwarmId : null,
           swarms: data && data.swarms ? data.swarms : null,
           concurrency: data && data.concurrency ? data.concurrency : null,
@@ -778,6 +779,7 @@ window.__ModuleLoader__.load({
             return {
               loading: false,
               activeSessionId: sid || prev.activeSessionId,
+              exactSwarmId: data.exactSwarmId || null,
               resolvedSwarmId: data.resolvedSwarmId || prev.resolvedSwarmId,
               swarmsList: Array.isArray(data.swarms) ? data.swarms : prev.swarmsList,
               globalConcurrency: data.concurrency || prev.globalConcurrency,
@@ -852,6 +854,476 @@ window.__ModuleLoader__.load({
         })
       }
       return null
+    }
+
+    function renderDownloadIcon(size) {
+      var px = size || 14
+      if (React && Primitives && Primitives.IconDownloadOutlineRegular) {
+        return React.createElement(Primitives.IconDownloadOutlineRegular, {
+          style: { width: px + 'px', height: px + 'px', flex: '0 0 auto' },
+        })
+      }
+      if (!React) return null
+      return React.createElement(
+        'svg',
+        {
+          width: px,
+          height: px,
+          viewBox: '0 0 24 24',
+          fill: 'none',
+          stroke: 'currentColor',
+          strokeWidth: 2,
+          strokeLinecap: 'round',
+          strokeLinejoin: 'round',
+          style: { flex: '0 0 auto' },
+          'aria-hidden': 'true',
+        },
+        React.createElement('path', { d: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4' }),
+        React.createElement('polyline', { points: '7 10 12 15 17 10' }),
+        React.createElement('line', { x1: 12, y1: 15, x2: 12, y2: 3 }),
+      )
+    }
+
+    /** Build the `/api/dsh-swarm/export` URL for either a Swarm or regular DSH conversation. */
+    function buildExportUrl(opts) {
+      var o = opts || {}
+      var params = []
+      if (o.sessionId) params.push('sessionId=' + encodeURIComponent(String(o.sessionId)))
+      if (o.swarmId) params.push('swarmId=' + encodeURIComponent(String(o.swarmId)))
+      params.push('format=' + encodeURIComponent(o.format === 'json' ? 'json' : 'md'))
+      params.push('includeSubagents=' + (o.includeSubagents === false ? 'false' : 'true'))
+      params.push('includeReasoning=' + (o.includeReasoning === false ? 'false' : 'true'))
+      if (o.download) params.push('download=1')
+      return '/api/dsh-swarm/export?' + params.join('&')
+    }
+
+    function copyTextToClipboard(text) {
+      var value = String(text || '')
+      if (!value) return Promise.resolve(false)
+      if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+        return navigator.clipboard.writeText(value).then(
+          function () { return true },
+          function () { return copyTextFallback(value) },
+        )
+      }
+      return Promise.resolve(copyTextFallback(value))
+    }
+
+    function copyTextFallback(value) {
+      try {
+        if (typeof document === 'undefined' || !document.body) return false
+        var ta = document.createElement('textarea')
+        ta.value = value
+        ta.setAttribute('readonly', '')
+        ta.style.position = 'fixed'
+        ta.style.opacity = '0'
+        document.body.appendChild(ta)
+        ta.select()
+        var ok = document.execCommand && document.execCommand('copy')
+        document.body.removeChild(ta)
+        return Boolean(ok)
+      } catch (_e) {
+        return false
+      }
+    }
+
+    function triggerExportDownload(opts) {
+      if (typeof fetch !== 'function') return Promise.resolve({ ok: false, error: 'Fetch unavailable' })
+      var url = buildExportUrl(Object.assign({}, opts, { download: true }))
+      return fetch(url, { method: 'GET' })
+        .then(function (res) {
+          if (!res.ok) {
+            return res.json().catch(function () { return null }).then(function (j) {
+              return { ok: false, error: (j && j.error) || ('HTTP ' + res.status) }
+            })
+          }
+          var filename = res.headers.get('x-dsh-export-filename')
+            || ('dsh-log.' + (opts && opts.format === 'json' ? 'json' : 'md'))
+          return res.blob().then(function (blob) {
+            if (typeof URL !== 'undefined' && typeof document !== 'undefined' && document.body) {
+              var objUrl = URL.createObjectURL(blob)
+              var a = document.createElement('a')
+              a.href = objUrl
+              a.download = filename
+              document.body.appendChild(a)
+              a.click()
+              document.body.removeChild(a)
+              setTimeout(function () { try { URL.revokeObjectURL(objUrl) } catch (_e) {} }, 2000)
+            }
+            return { ok: true, filename: filename }
+          })
+        })
+        .catch(function (err) {
+          return { ok: false, error: String((err && err.message) || err || 'Export failed') }
+        })
+    }
+
+    function copyExportMarkdown(opts) {
+      if (typeof fetch !== 'function') return Promise.resolve({ ok: false, error: 'Fetch unavailable' })
+      var url = buildExportUrl(Object.assign({}, opts, { format: 'md', download: false }))
+      return fetch(url, { method: 'GET' })
+        .then(function (res) {
+          if (!res.ok) {
+            return res.json().catch(function () { return null }).then(function (j) {
+              return { ok: false, error: (j && j.error) || ('HTTP ' + res.status) }
+            })
+          }
+          return res.text().then(function (txt) {
+            return copyTextToClipboard(txt).then(function (copied) {
+              return copied ? { ok: true, chars: txt.length } : { ok: false, error: 'Clipboard write failed' }
+            })
+          })
+        })
+        .catch(function (err) {
+          return { ok: false, error: String((err && err.message) || err || 'Copy failed') }
+        })
+    }
+
+    function detectSwarmForHeader(ui, sessionId, explicitSwarmId) {
+      var list = Array.isArray(ui && ui.swarmsList) ? ui.swarmsList : []
+      if (explicitSwarmId) {
+        var foundExp = list.find(function (item) { return item && item.swarm_id === explicitSwarmId })
+        return { isSwarm: true, swarmId: explicitSwarmId, title: foundExp ? foundExp.title : explicitSwarmId }
+      }
+      if (!sessionId) return { isSwarm: false, swarmId: '', title: '' }
+      if (ui && ui.activeSessionId === sessionId && ui.exactSwarmId) {
+        var foundExact = list.find(function (item) { return item && item.swarm_id === ui.exactSwarmId })
+        return { isSwarm: true, swarmId: ui.exactSwarmId, title: foundExact ? foundExact.title : ui.exactSwarmId }
+      }
+      for (var i = 0; i < list.length; i += 1) {
+        var item = list[i]
+        if (!item || !item.swarm_id) continue
+        if (item.swarm_id === sessionId || sessionId.indexOf(item.swarm_id + '__') === 0) {
+          return { isSwarm: true, swarmId: item.swarm_id, title: item.title || item.swarm_id }
+        }
+      }
+      return { isSwarm: false, swarmId: '', title: '' }
+    }
+
+    function SwarmExportMenuButton(props) {
+      if (!React) return null
+      var ui = useUiState(props)
+      var compact = Boolean(props && props.compact)
+      var explicitSwarmId = (props && props.explicitSwarmId) || ''
+      var sessionId = (props && props.sessionId) || ui.activeSessionId || ''
+      if (!sessionId && !explicitSwarmId) return null
+
+      var openPair = React.useState(false)
+      var menuOpen = openPair[0]
+      var setMenuOpen = openPair[1]
+      var subPair = React.useState(true)
+      var includeSubagents = subPair[0]
+      var setIncludeSubagents = subPair[1]
+      var reasPair = React.useState(true)
+      var includeReasoning = reasPair[0]
+      var setIncludeReasoning = reasPair[1]
+      var busyPair = React.useState(false)
+      var busy = busyPair[0]
+      var setBusy = busyPair[1]
+      var msgPair = React.useState(null)
+      var statusMsg = msgPair[0]
+      var setStatusMsg = msgPair[1]
+
+      var rootRef = React.useRef ? React.useRef(null) : { current: null }
+      var clearTimerRef = React.useRef ? React.useRef(null) : { current: null }
+
+      if (typeof React.useEffect === 'function') {
+        React.useEffect(function () {
+          return function () {
+            if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+          }
+        }, [])
+
+        React.useEffect(function () {
+          if (!menuOpen || typeof document === 'undefined') return undefined
+          function onDocMouseDown(ev) {
+            if (rootRef.current && typeof rootRef.current.contains === 'function' && !rootRef.current.contains(ev.target)) {
+              setMenuOpen(false)
+            }
+          }
+          function onDocKeyDown(ev) {
+            if (ev && ev.key === 'Escape') setMenuOpen(false)
+          }
+          document.addEventListener('mousedown', onDocMouseDown)
+          document.addEventListener('keydown', onDocKeyDown)
+          return function () {
+            document.removeEventListener('mousedown', onDocMouseDown)
+            document.removeEventListener('keydown', onDocKeyDown)
+          }
+        }, [menuOpen])
+      }
+
+      var scope = detectSwarmForHeader(ui, sessionId, explicitSwarmId)
+      var shortSession = sessionId.length > 16 ? (sessionId.slice(0, 8) + '...' + sessionId.slice(-4)) : sessionId
+
+      function flashStatus(kind, text) {
+        setStatusMsg({ kind: kind, text: text })
+        if (clearTimerRef.current) clearTimeout(clearTimerRef.current)
+        clearTimerRef.current = setTimeout(function () {
+          setStatusMsg(null)
+        }, 2800)
+      }
+
+      function buildPayload(format) {
+        return {
+          sessionId: explicitSwarmId ? '' : sessionId,
+          swarmId: explicitSwarmId || '',
+          format: format,
+          includeSubagents: includeSubagents,
+          includeReasoning: includeReasoning,
+        }
+      }
+
+      function handleDownload(format) {
+        if (busy) return
+        setBusy(true)
+        setStatusMsg({ kind: 'info', text: 'Exporting...' })
+        triggerExportDownload(buildPayload(format)).then(function (res) {
+          setBusy(false)
+          if (res && res.ok) {
+            flashStatus('ok', 'Downloaded ' + (format === 'json' ? '.json' : '.md'))
+          } else {
+            flashStatus('err', (res && res.error) || 'Export failed')
+          }
+        })
+      }
+
+      function handleCopyMarkdown() {
+        if (busy) return
+        setBusy(true)
+        setStatusMsg({ kind: 'info', text: 'Copying...' })
+        copyExportMarkdown(buildPayload('md')).then(function (res) {
+          setBusy(false)
+          if (res && res.ok) {
+            flashStatus('ok', 'Copied Markdown (' + Math.round((res.chars || 0) / 1024) + ' KB)')
+          } else {
+            flashStatus('err', (res && res.error) || 'Copy failed')
+          }
+        })
+      }
+
+      var menuBtnStyle = {
+        display: 'flex',
+        flexDirection: 'column',
+        alignItems: 'flex-start',
+        gap: '1px',
+        width: '100%',
+        padding: '6px 8px',
+        border: 'none',
+        borderRadius: '6px',
+        background: 'transparent',
+        color: 'var(--dsw-alias-label-primary)',
+        textAlign: 'left',
+        cursor: busy ? 'wait' : 'pointer',
+        fontSize: '12px',
+      }
+
+      return React.createElement(
+        'div',
+        {
+          ref: rootRef,
+          style: {
+            position: 'relative',
+            display: 'inline-flex',
+            alignItems: 'center',
+            marginRight: compact ? '0' : '4px',
+          },
+        },
+        React.createElement(
+          'button',
+          {
+            type: 'button',
+            'aria-haspopup': 'menu',
+            'aria-expanded': menuOpen,
+            title: scope.isSwarm
+              ? 'Export Swarm diagnostic log (Blackboard + all member sessions)'
+              : 'Export conversation diagnostic log (+ subagents)',
+            onClick: function () { setMenuOpen(function (v) { return !v }) },
+            style: compact
+              ? {
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  width: '28px',
+                  height: '28px',
+                  padding: '6px',
+                  color: menuOpen ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-label-secondary)',
+                  background: menuOpen ? 'var(--dsw-alias-interactive-bg-hover)' : 'transparent',
+                  border: 'none',
+                  borderRadius: 'var(--dsw-radius-sm, 4px)',
+                  cursor: 'pointer',
+                }
+              : {
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  gap: '5px',
+                  padding: '2px 8px',
+                  borderRadius: '999px',
+                  cursor: 'pointer',
+                  fontSize: '11.5px',
+                  lineHeight: '18px',
+                  border: '1px solid var(--dsw-alias-border-l2)',
+                  background: menuOpen ? 'var(--dsw-alias-interactive-bg-hover)' : 'var(--dsw-alias-bg-layer-2)',
+                  color: statusMsg && statusMsg.kind === 'ok'
+                    ? 'var(--dsw-alias-state-success-primary, #10b981)'
+                    : 'var(--dsw-alias-label-secondary)',
+                  whiteSpace: 'nowrap',
+                },
+          },
+          renderDownloadIcon(compact ? 15 : 13),
+          compact ? null : React.createElement('span', null, statusMsg && statusMsg.kind === 'ok' ? 'Exported' : 'Export Log'),
+        ),
+        menuOpen
+          ? React.createElement(
+              'div',
+              {
+                role: 'menu',
+                style: {
+                  position: 'absolute',
+                  top: 'calc(100% + 5px)',
+                  right: 0,
+                  zIndex: 9500,
+                  minWidth: '240px',
+                  padding: '8px',
+                  borderRadius: '8px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  background: 'var(--dsw-alias-bg-layer-1)',
+                  color: 'var(--dsw-alias-label-primary)',
+                  boxShadow: 'var(--dsw-elevation-panel, 0 8px 24px rgba(0,0,0,0.22))',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: '4px',
+                },
+              },
+              React.createElement(
+                'div',
+                {
+                  style: {
+                    padding: '2px 6px 6px',
+                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
+                    marginBottom: '2px',
+                  },
+                },
+                React.createElement(
+                  'div',
+                  { style: { fontSize: '11.5px', fontWeight: 600, color: 'var(--dsw-alias-label-primary)' } },
+                  scope.isSwarm ? 'Swarm Diagnostic Log' : 'Conversation Diagnostic Log',
+                ),
+                React.createElement(
+                  'div',
+                  {
+                    style: {
+                      fontSize: '10.5px',
+                      color: 'var(--dsw-alias-label-tertiary)',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      maxWidth: '220px',
+                    },
+                  },
+                  scope.isSwarm ? (scope.title || scope.swarmId) : ('Session ' + shortSession),
+                ),
+              ),
+              React.createElement(
+                'label',
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '3px 6px',
+                    fontSize: '11.5px',
+                    color: 'var(--dsw-alias-label-secondary)',
+                    cursor: 'pointer',
+                  },
+                },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: includeSubagents,
+                  onChange: function (e) { setIncludeSubagents(Boolean(e && e.target && e.target.checked)) },
+                }),
+                scope.isSwarm ? 'Include all member sessions' : 'Include subagents',
+              ),
+              React.createElement(
+                'label',
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '3px 6px 6px',
+                    fontSize: '11.5px',
+                    color: 'var(--dsw-alias-label-secondary)',
+                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
+                    cursor: 'pointer',
+                  },
+                },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: includeReasoning,
+                  onChange: function (e) { setIncludeReasoning(Boolean(e && e.target && e.target.checked)) },
+                }),
+                'Include reasoning blocks',
+              ),
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  role: 'menuitem',
+                  disabled: busy,
+                  onClick: function () { handleDownload('md') },
+                  style: menuBtnStyle,
+                },
+                React.createElement('span', { style: { fontWeight: 500 } }, 'Download Markdown (.md)'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Clean report for review & AI diagnosis'),
+              ),
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  role: 'menuitem',
+                  disabled: busy,
+                  onClick: function () { handleDownload('json') },
+                  style: menuBtnStyle,
+                },
+                React.createElement('span', { style: { fontWeight: 500 } }, 'Download JSON (.json)'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Structured bundle (stream-stripped)'),
+              ),
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  role: 'menuitem',
+                  disabled: busy,
+                  onClick: handleCopyMarkdown,
+                  style: menuBtnStyle,
+                },
+                React.createElement('span', { style: { fontWeight: 500 } }, 'Copy Markdown to Clipboard'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Paste straight into another AI chat'),
+              ),
+              statusMsg
+                ? React.createElement(
+                    'div',
+                    {
+                      style: {
+                        marginTop: '2px',
+                        padding: '4px 6px',
+                        borderRadius: '4px',
+                        fontSize: '11px',
+                        background: 'var(--dsw-alias-bg-layer-2)',
+                        color: statusMsg.kind === 'err'
+                          ? 'var(--dsw-alias-state-error-primary, #ef4444)'
+                          : statusMsg.kind === 'ok'
+                            ? 'var(--dsw-alias-state-success-primary, #10b981)'
+                            : 'var(--dsw-alias-label-secondary)',
+                      },
+                    },
+                    statusMsg.text,
+                  )
+                : null,
+            )
+          : null,
+      )
     }
 
     function toggleSwarmRightbar() {
@@ -1180,7 +1652,10 @@ window.__ModuleLoader__.load({
                       + 'read:#' + m.last_read_seq
                       + ' wait:#' + m.wait_since
                       + ' post:#' + m.last_post_seq
-                      + (m.last_park_blocked_seq ? ' blocked:#' + m.last_park_blocked_seq : ''),
+                      + (m.last_park_blocked_seq ? ' blocked:#' + m.last_park_blocked_seq : '')
+                      + (m.context_window > 0 && m.last_input_tokens > 0
+                        ? ' · ctx:' + Math.round(m.last_input_tokens / 1000) + 'k/' + Math.round(m.context_window / 1000) + 'k (' + Math.round((m.last_input_tokens / m.context_window) * 100) + '%)'
+                        : ''),
                   ),
                   React.createElement(
                     'div',
@@ -2191,6 +2666,13 @@ window.__ModuleLoader__.load({
                   }),
                 )
               : null,
+            snap
+              ? React.createElement(SwarmExportMenuButton, {
+                  compact: true,
+                  explicitSwarmId: targetSwarmId,
+                  sessionId: sessionId,
+                })
+              : null,
             React.createElement(
               'button',
               {
@@ -2435,6 +2917,21 @@ window.__ModuleLoader__.load({
           if (typeof d === 'function') disposers.push(d)
         })
 
+        ctx.slots.inject('conversation.session.header.utilities', function () {
+          try {
+            var d = ctx.slots.register(
+              {
+                name: 'conversation.session.header.utilities',
+                id: 'dsh-swarm-export-log',
+                order: 80,
+                inject: function () { return { hooks: { swarmUi: uiStore } } },
+              },
+              SwarmExportMenuButton,
+            )
+            if (typeof d === 'function') disposers.push(d)
+          } catch (_dupErr) {}
+        })
+
         ctx.slots.inject('shell.overlay', function () {
           var d = ctx.slots.register(
             {
@@ -2457,6 +2954,7 @@ window.__ModuleLoader__.load({
           computeEdgeVisualStyle: computeEdgeVisualStyle,
           computeRoundTableLayout: computeRoundTableLayout,
           computeRoundTableFromEvents: computeRoundTableFromEvents,
+          buildExportUrl: buildExportUrl,
           getState: function () { return uiStore.getSnapshot() },
           refresh: function (sessionId) { return fetchSwarmState(sessionId) },
           pushSnapshot: function (sessionId, snapshot) {
@@ -2507,6 +3005,7 @@ window.__ModuleLoader__.load({
     exports.computeRoundTableFromEvents = computeRoundTableFromEvents
     exports.computeStateFingerprint = computeStateFingerprint
     exports.fetchSwarmState = fetchSwarmState
+    exports.buildExportUrl = buildExportUrl
     exports.uiStore = uiStore
     return module.exports
   },
