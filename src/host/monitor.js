@@ -56,6 +56,20 @@ export function detectMemberHealthIssues({
 
     if (liveness.status === 'working' || liveness.status === 'queued') continue
 
+    if (liveness.status === 'unparked_idle') {
+      issues.push({
+        kind: 'member_unparked_idle',
+        memberName: name,
+        target: 'coordinator',
+        seq: member.last_post_seq || member.brief_seq || 0,
+        signature: `member_unparked_idle:${name}:${member.turn_count ?? 0}:${member.last_post_seq ?? 0}`,
+        title: `Watchdog alert: @${name} stopped mid-task without parking`,
+        nudgePrompt: `[Watchdog Auto-Resume] @${name} stopped mid-task without calling swarm_wait (turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}). Execute your pending step now, post results to the board, and call swarm_wait(since=${member.last_read_seq ?? 0}).`,
+        prompt: `@coordinator [WATCHDOG_ALERT] Member @${name} is unparked_idle (stopped mid-task without calling swarm_wait and ignored auto-resume; turns=${member.turn_count ?? 0}, post=#${member.last_post_seq ?? 0}). Inspect via swarm_status and redirect, hot-swap, or kill.`,
+      })
+      continue
+    }
+
     const createdMs = member.created_at ? Date.parse(member.created_at) : NaN
     const ageMs = Number.isFinite(createdMs) ? Math.max(0, nowMs - createdMs) : 0
     const isZombie = liveness.status === 'zombie'
@@ -339,11 +353,19 @@ export class SwarmMonitorDaemon {
     if (issues.length === 0) return { action: 'healthy' }
 
     const first = issues[0]
-    if (first.kind === 'member_zombie' && !this.autoNudgedZombies.has(first.signature) && typeof this.onAutoNudge === 'function') {
+    if (
+      (first.kind === 'member_zombie' || first.kind === 'member_unparked_idle')
+      && !this.autoNudgedZombies.has(first.signature)
+      && typeof this.onAutoNudge === 'function'
+    ) {
       this.autoNudgedZombies.add(first.signature)
-      const nudged = await this.onAutoNudge(first.memberName)
+      const nudged = await this.onAutoNudge(first.memberName, first.nudgePrompt ?? null)
       if (nudged) {
-        return { action: 'auto_nudged_zombie', memberName: first.memberName, signature: first.signature }
+        return {
+          action: first.kind === 'member_unparked_idle' ? 'auto_nudged_unparked_idle' : 'auto_nudged_zombie',
+          memberName: first.memberName,
+          signature: first.signature,
+        }
       }
     }
 

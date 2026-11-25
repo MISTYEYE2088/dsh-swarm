@@ -833,12 +833,13 @@ export class SwarmStore {
     return { member: this.readMembers(swarmId)[spec.name], briefPost }
   }
 
-  /** Compute unresolved `[REJECT]` merge-gate blocks from active members with `can_block_merge === true`. */
+  /** Compute unresolved `[REJECT]` merge-gate blocks and per-reviewer consecutive reject streaks from `events.jsonl`. */
   computeActiveRejections(swarmId) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
     const supersededBy = computeSupersededMap(records)
     const byReviewer = new Map()
+    const rejectStreaks = new Map()
 
     for (const rec of records) {
       if (!rec || rec.type === 'control') continue
@@ -855,6 +856,8 @@ export class SwarmStore {
 
       if (isReject) {
         if (!supersededBy.has(rec.seq)) {
+          const nextStreak = (rejectStreaks.get(rec.agent) ?? 0) + 1
+          rejectStreaks.set(rec.agent, nextStreak)
           byReviewer.set(rec.agent, {
             seq: rec.seq,
             reviewer: rec.agent,
@@ -862,10 +865,12 @@ export class SwarmStore {
             title: rec.title || deriveFallbackTitle(text, 'Rejection'),
             mentions: rec.mentions ?? [],
             time: rec.time,
+            consecutive_rejects: nextStreak,
             summary: text.slice(0, 180),
           })
         }
       } else if (isApprove) {
+        rejectStreaks.set(rec.agent, 0)
         byReviewer.delete(rec.agent)
       }
     }

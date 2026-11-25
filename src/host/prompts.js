@@ -12,7 +12,38 @@ export const ARCHITECT_REVIEW_RULES = Object.freeze([
   Object.freeze(['C6:delete-dead-code', 'When changing design, delete obsolete paths, dead branches, debug prints, and scratch artifacts cleanly.']),
   Object.freeze(['C7:SSOT', 'Every domain fact, state, or constant lives in exactly one authoritative place (no parallel copies synced by hand).']),
   Object.freeze(['C8:verified-cmds', 'Every new script, path, symbol, or doc command must have real execution evidence (capture output and scan for error/fail/skip keywords, not rc==0 alone); never game checks by cutting features or faking zero-output commands.']),
+  Object.freeze(['C9:global-conflict-and-switches', 'Check changes against existing tree/firmware semantics (never diff-only) and audit every silent skip/downgrade switch.']),
+  Object.freeze(['C10:real-pushback-and-gaps', 'Verify every pushback went through public board and got explicit reviewer CONCEDE/DEFEND (no unilateral close), and no fixable medium/low items were hidden as known gaps (only true external blockers with YYMMDD + symbol/commit).']),
 ])
+
+/** Broad leading-bias / framing-contamination patterns (checked server-side for reviewer-only alerts; never disclosed to senders). */
+export const LEADING_BIAS_PATTERNS = Object.freeze([
+  /\b(?:closing|final|last)\s+round\b/i,
+  /\brubber\s*stamp\b/i,
+  /\bsanity\s+check\s+only\b/i,
+  /\bjust\s+(?:confirm|verify|rubber|check\s+off)\b/i,
+  /\bconfirm\s+(?:it|this|that)\s+(?:is\s+fixed|fixes|works|passes|matches)\b/i,
+  /\bverify\s+(?:it|this|that)\s+(?:is\s+fixed|passes|works)\b/i,
+  /\bno\s+(?:issues?|bugs?|criticals?|findings?)\s+(?:expected|left|remaining)\b/i,
+  /\bzero\s+(?:critical|findings?|issues?)\s+(?:is|are)\s+(?:also\s+)?(?:acceptable|valid|ok|expected)\b/i,
+  /\bshould\s+be\s+(?:clean|fine|green|ready|good\s+to\s+merge)\b/i,
+  /\b(?:looks?\s+good|ready)\s+to\s+(?:merge|close|ship)\b/i,
+  /\bminor\s+(?:only|issues?\s+only)\b/i,
+  /\balready\s+(?:fixed|verified|tested|passed|confirmed|clean)\b/i,
+  /\ball\s+(?:green|tests?\s+pass(?:ed)?|checks?\s+pass(?:ed)?)\b/i,
+  /\bexpected\s+(?:count|output|result|vector|value)\b/i,
+  /\b(?:must\s+equal|target\s+count|should\s+output)\b/i,
+  /\b(?:rc\s*=\s*0|100%\s+pass)\b/i,
+])
+
+// #FUNC Detect whether a board post contains leading-bias or framing pressure that could contaminate an independent reviewer.
+// #NOT  Never returns the matched keyword or leaks the detector to the message sender.
+// #EDGE-IN A post claiming "closing round, already verified, all green" triggers the reviewer-only `[BLIND_AUDIT_ALERT]` while staying invisible to the sender → test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip
+// #WHY  Keeping `hasLeadingAuditBias` strictly boolean and reviewer-only stops senders from gaming regexes while resetting reviewer skepticism on the `user` turn.
+export function hasLeadingAuditBias(text) {
+  if (typeof text !== 'string' || text.length === 0) return false
+  return LEADING_BIAS_PATTERNS.some(re => re.test(text))
+}
 
 /** Normalize a 2D `[[title, detail], ...]` meta-rule array into frozen tuples. */
 export function normalizeReviewRules(rules) {

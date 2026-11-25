@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.11/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.12/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.11/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.12/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2345,9 +2345,9 @@ async function test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup() {
     formatReviewRules,
   } = await import('../src/host/prompts.js')
 
-  // 1. Verify ARCHITECT_REVIEW_RULES is a 2D [[title, detail], ...] array with C1..C8
+  // 1. Verify ARCHITECT_REVIEW_RULES is a 2D [[title, detail], ...] array with C1..C10
   assert.equal(Array.isArray(ARCHITECT_REVIEW_RULES), true)
-  assert.equal(ARCHITECT_REVIEW_RULES.length, 8)
+  assert.equal(ARCHITECT_REVIEW_RULES.length, 10)
   for (const row of ARCHITECT_REVIEW_RULES) {
     assert.equal(Array.isArray(row) && row.length === 2, true)
     assert.ok(row[0].startsWith('C') && row[1].length > 10)
@@ -2428,6 +2428,114 @@ async function test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup() {
   }
 }
 
+async function test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip() {
+  const registeredTools = new Map()
+  const steeredByAgent = new Map()
+  const fakeAgents = new Map()
+  for (const id of ['sw-whip', 'sw-whip__arch-1', 'sw-whip__impl-1']) {
+    steeredByAgent.set(id, [])
+    fakeAgents.set(id, {
+      id,
+      status: 'idle',
+      session: { header: { id, cwd: tempRoot } },
+      steer(m) { steeredByAgent.get(id).push(m) },
+    })
+  }
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') return { get(id) { return fakeAgents.get(id) } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-whip') }, { log: () => {}, warn: () => {} })
+  const coordAgent = fakeAgents.get('sw-whip')
+
+  await registeredTools.get('swarm_init').execute({ title: 'Whip & Blind Audit Test', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'arch-1', role: 'architect', brief: '[OWNERSHIP]\nreview\n[FORBIDDEN]\nedit\n[DONE_CRITERIA]\ngate' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'impl-1', role: 'worker', brief: '[OWNERSHIP]\nsrc\n[FORBIDDEN]\ntests\n[DONE_CRITERIA]\ncode' },
+    { agent: coordAgent },
+  )
+
+  // 1. Worker posts leading/contaminating message to @arch-1 -> ONLY reviewer receives [BLIND_AUDIT_ALERT], sender NEVER sees it!
+  const workerPost = await registeredTools.get('post_board').execute(
+    {
+      title: 'Closing round check: already verified and all green',
+      kind: 'report',
+      mentions: ['arch-1'],
+      text: '@arch-1 This is the final round, all tests passed with rc=0, just confirm it is fixed.',
+    },
+    { agent: fakeAgents.get('sw-whip__impl-1') },
+  )
+  assert.equal(workerPost.ok, true)
+  assert.equal(workerPost.text.includes('BLIND_AUDIT'), false, 'Sender must NEVER see BLIND_AUDIT_ALERT')
+  const archWakeups = steeredByAgent.get('sw-whip__arch-1')
+  assert.equal(archWakeups.length, 1)
+  const archWakeText = archWakeups[0].content[0].text
+  assert.match(archWakeText, /\[BLIND_AUDIT_ALERT\]/)
+  assert.match(archWakeText, /NEVER mention this alert/)
+  assert.match(archWakeText, /C9:global-conflict-and-switches/)
+  assert.match(archWakeText, /C10:real-pushback-and-gaps/)
+  assert.equal(archWakeText.includes('final round'), false, 'Alert must NOT disclose the matched trigger keyword')
+
+  // 2. Two consecutive rejects by @arch-1 -> triggers [ESCALATE_TO_HUMAN] in post_board, coordinator wakeup, and swarm_status!
+  const rej1 = await registeredTools.get('post_board').execute(
+    { title: 'Reject round 1: hardcoded list', kind: 'review', verdict: 'reject', mentions: ['impl-1'], text: '@impl-1 fix C3' },
+    { agent: fakeAgents.get('sw-whip__arch-1') },
+  )
+  assert.equal(rej1.consecutive_rejects, 1)
+  assert.equal(rej1.text.includes('ESCALATE_TO_HUMAN'), false)
+
+  const rej2 = await registeredTools.get('post_board').execute(
+    { title: 'Reject round 2: still patching locally', kind: 'review', verdict: 'reject', mentions: ['impl-1', 'coordinator'], text: '@impl-1 @coordinator still broken' },
+    { agent: fakeAgents.get('sw-whip__arch-1') },
+  )
+  assert.equal(rej2.consecutive_rejects, 2)
+  assert.match(rej2.text, /\[ESCALATE_TO_HUMAN\]/)
+  const coordWakeups = steeredByAgent.get('sw-whip')
+  assert.ok(coordWakeups.some(m => /\[ESCALATE_TO_HUMAN\]/.test(m.content[0].text)), 'Coordinator wakeup must surface ESCALATE_TO_HUMAN on 2nd consecutive reject')
+
+  const statusAfterRej2 = await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })
+  assert.match(statusAfterRej2.text, /x2 ESCALATE_TO_HUMAN/)
+
+  // 3. State-machine anti-slacking detector: worker with turns>0, wake_mode='working', idle agent -> `unparked_idle`!
+  runtime.store.flushOffsets('sw-whip', { 'impl-1': { turn_count: 3, wake_mode: 'working' } })
+  const slackerMember = runtime.store.readMembers('sw-whip')['impl-1']
+  const slackerLiveness = statusOf(slackerMember, {
+    liveAgent: { status: 'idle' },
+    sessionEvents: [{ type: 'turn/end', data: { turn: 3, reason: { kind: 'stop' } } }],
+  })
+  assert.equal(slackerLiveness.status, 'unparked_idle', 'Worker that stopped without swarm_wait must be flagged unparked_idle, NOT waiting')
+
+  // Watchdog healthTick whips slacker directly on 1st strike (even while peers are working!), escalates to @coordinator on 2nd strike!
+  const autoNudges = []
+  const escalatedAlerts = []
+  const wd = new SwarmMonitorDaemon({
+    store: runtime.store,
+    swarmId: 'sw-whip',
+    getMemberLiveness: (name) => (name === 'impl-1' ? slackerLiveness : { status: 'working', stepSummary: 'busy' }),
+    onAutoNudge: async (memberName, prompt) => { autoNudges.push({ memberName, prompt }); return true },
+    onPostStall: async (alert) => { escalatedAlerts.push(alert) },
+  })
+  const tick1 = await wd.healthTick()
+  assert.equal(tick1.action, 'auto_nudged_unparked_idle')
+  assert.equal(autoNudges.length, 1)
+  assert.equal(autoNudges[0].memberName, 'impl-1')
+  assert.match(autoNudges[0].prompt, /Watchdog Auto-Resume/)
+
+  const tick2 = await wd.healthTick()
+  assert.equal(tick2.action, 'health_alert')
+  assert.equal(escalatedAlerts.length, 1)
+  assert.equal(escalatedAlerts[0].target, 'coordinator')
+  assert.match(escalatedAlerts[0].text, /unparked_idle/)
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -2506,6 +2614,7 @@ try {
   await runTest('test_lore_master_role_and_tier_b_guardrails', test_lore_master_role_and_tier_b_guardrails)
   await runTest('test_parameterized_role_registry_auto_covers_stop_hook_and_gates', test_parameterized_role_registry_auto_covers_stop_hook_and_gates)
   await runTest('test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup', test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup)
+  await runTest('test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip', test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

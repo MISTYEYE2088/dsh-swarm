@@ -133,6 +133,7 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     working: 0,
     queued: 0,
     waiting: 0,
+    unparked_idle: 0,
     starting: 0,
     zombie: 0,
     error: 0,
@@ -156,6 +157,7 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       if (liveness.status === 'working') memberSummary.working += 1
       else if (liveness.status === 'queued') memberSummary.queued += 1
       else if (liveness.status === 'waiting') memberSummary.waiting += 1
+      else if (liveness.status === 'unparked_idle') memberSummary.unparked_idle += 1
       else if (liveness.status === 'starting') memberSummary.starting += 1
       else if (liveness.status === 'zombie') memberSummary.zombie += 1
       else if (liveness.status === 'error') memberSummary.error += 1
@@ -299,7 +301,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.11', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.12', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -820,6 +822,14 @@ export function createSwarmTools(runtime) {
           notes.push(`verdict=${postRecord.verdict}`)
         }
 
+        let consecutiveRejects = 0
+        if (postRecord.verdict === 'reject') {
+          const activeRej = store.computeActiveRejections(swarmId).find(r => r.reviewer === callerName)
+          consecutiveRejects = activeRej?.consecutive_rejects ?? 1
+        }
+        const escalateHumanNote = consecutiveRejects >= 2
+          ? `\n[ESCALATE_TO_HUMAN] @${callerName} reached ${consecutiveRejects} consecutive rejects—stop local patching and ask the user to arbitrate architecture/scope.`
+          : ''
         const archiveNote = archivePath
           ? `\n[SWARM_ARCHIVED] ${archivePath}`
           : ''
@@ -839,9 +849,10 @@ export function createSwarmTools(runtime) {
           silent_mentions: silentMentions,
           unreachable: unreachableTargets,
           ignored_prose_mentions: val.ignored_prose_mentions,
+          ...(consecutiveRejects > 0 ? { consecutive_rejects: consecutiveRejects } : {}),
           ...(archivePath ? { archive_path: archivePath } : {}),
           ...(releaseHygiene ? { release_hygiene: releaseHygiene } : {}),
-          text: `OK #${postRecord.seq} (read=#${postRecord.seq}${notesSuffix})${hygieneNote}${archiveNote}${fpNote}`,
+          text: `OK #${postRecord.seq} (read=#${postRecord.seq}${notesSuffix})${escalateHumanNote}${hygieneNote}${archiveNote}${fpNote}`,
         }
       })
     },
@@ -1054,7 +1065,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.3.11', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.3.12', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1069,13 +1080,13 @@ export function createSwarmTools(runtime) {
         ? `Watchdog: ${wd.active ? 'ACTIVE' : 'SLEEPING'} (health=${wd.healthIntervalSec}s, stall=${wd.stallIntervalSec}s, alerts=${wd.alertsPosted}${wd.lastCheckAt ? ', last_check=' + wd.lastCheckAt : ''})`
         : 'Watchdog: standby'
       const rejLine = snap.activeRejections.length > 0
-        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role}): ${r.title}`).join(', ')}`
+        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role}${r.consecutive_rejects >= 2 ? ', x' + r.consecutive_rejects + ' ESCALATE_TO_HUMAN' : ''}): ${r.title}`).join(', ')}`
         : 'Active Merge-Gate Rejections: none'
 
       const HIGH_TOOL_CALL_THRESHOLD = 80
       const lines = [
         `Runtime: dsh-swarm v${fp.version} (${fp.commit}) | "${snap.swarm.title}" ${snap.swarm.status} head=#${snap.headSeq}${snap.swarm.project_root ? ' root=' + snap.swarm.project_root : ''}`,
-        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} (cfg=${snap.concurrency.configuredLimit}, q=${snap.concurrency.queued}, 429=${snap.concurrency.rateLimitHits}) | Members: ${ms.totalActive} active (${ms.working}w/${ms.waiting}idle/${ms.starting}start${ms.zombie ? '/' + ms.zombie + 'zmb' : ''}${ms.error ? '/' + ms.error + 'err' : ''}, ${ms.killed} killed)`,
+        `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} (cfg=${snap.concurrency.configuredLimit}, q=${snap.concurrency.queued}, 429=${snap.concurrency.rateLimitHits}) | Members: ${ms.totalActive} active (${ms.working}w/${ms.waiting}idle/${ms.starting}start${ms.unparked_idle ? '/' + ms.unparked_idle + 'unparked' : ''}${ms.zombie ? '/' + ms.zombie + 'zmb' : ''}${ms.error ? '/' + ms.error + 'err' : ''}, ${ms.killed} killed)`,
         wdLine,
         ...(snap.activeRejections.length > 0 ? [rejLine] : []),
         ...snap.members.map(m => {

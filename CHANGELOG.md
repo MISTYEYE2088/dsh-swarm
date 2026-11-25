@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.12 (2026-11-24)
+
+- **Asymmetric Reviewer-Only `[BLIND_AUDIT_ALERT]` (Zero Sender Leak)**:
+  - Added `hasLeadingAuditBias()` in `src/host/prompts.js` with broad framing/closing-pressure/expected-count patterns.
+  - When a post with leading bias wakes a `canBlockMerge` reviewer (`architect`/`verifier`), `dispatchPostWakeups` injects `[BLIND_AUDIT_ALERT]` strictly into the reviewer's `user` wakeup message (instructing from-scratch inspection and prohibiting disclosing the alert or trigger to the sender). Senders never see the alert and cannot game keywords.
+- **Expanded 2D `ARCHITECT_REVIEW_RULES` (`C9` + `C10`)**:
+  - Added `C9:global-conflict-and-switches` (verify against full tree/firmware semantics & audit silent skip switches) and `C10:real-pushback-and-gaps` (enforce public-board pushback with reviewer `CONCEDE`/`DEFEND` and ban hiding fixable medium/low items as known gaps).
+- **2+ Consecutive Rejects Auto-Escalation (`[ESCALATE_TO_HUMAN]`)**:
+  - Derived `consecutive_rejects` directly from `events.jsonl` in `computeActiveRejections` (zero new state); hitting `>= 2` consecutive rejects surfaces `[ESCALATE_TO_HUMAN]` in `post_board`, `swarm_status`, and Coordinator wakeups to break local-patching loops.
+- **State-Machine Anti-Slacking Detector (`unparked_idle` + Automatic Re-Wake Whip)**:
+  - Fixed `statusOf()` so an active non-coordinator member with `wake_mode === 'working'` whose turn ended without `swarm_wait` is classified as `unparked_idle` (not falsely masked as `waiting`).
+  - Watchdog `healthTick()` detects `unparked_idle` even while peers are working, sends a direct `[Watchdog Auto-Resume]` whip on 1st strike, and escalates a `[WATCHDOG_ALERT]` to `@coordinator` if ignored.
+
 ## 0.3.11 (2026-11-24)
 
 - **2D Array Meta Review Rules (`ARCHITECT_REVIEW_RULES` / `roleSpec.reviewRules`) + Dynamic `user`-Side Wakeup Anchor**:

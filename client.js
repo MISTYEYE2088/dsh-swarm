@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.3.11'
+    var VERSION = '0.3.12'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -1037,7 +1037,7 @@ window.__ModuleLoader__.load({
             ? React.createElement(
                 'div',
                 { style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', fontVariantNumeric: 'tabular-nums' } },
-                'Members: ' + memberSummary.working + ' working · ' + memberSummary.waiting + ' waiting · ' + memberSummary.starting + ' starting' + (memberSummary.zombie > 0 ? ' · ' + memberSummary.zombie + ' zombie' : '') + (memberSummary.error > 0 ? ' · ' + memberSummary.error + ' error' : ''),
+                'Members: ' + memberSummary.working + ' working · ' + memberSummary.waiting + ' waiting · ' + memberSummary.starting + ' starting' + (memberSummary.unparked_idle > 0 ? ' · ' + memberSummary.unparked_idle + ' unparked_idle' : '') + (memberSummary.zombie > 0 ? ' · ' + memberSummary.zombie + ' zombie' : '') + (memberSummary.error > 0 ? ' · ' + memberSummary.error + ' error' : ''),
               )
             : null,
         ),

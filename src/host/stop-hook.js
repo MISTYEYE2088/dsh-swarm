@@ -228,6 +228,17 @@ export function statusOf(member, {
     }
   }
 
+  if (
+    getRoleSpec(member.role).requireParkOnStop
+    && member.wake_mode === 'working'
+    && !lastBatchHadSwarmWaitDone
+  ) {
+    return {
+      status: 'unparked_idle',
+      stepSummary: `Unparked idle (stopped after ${turns} turn(s) without swarm_wait; post=#${lastPost})`,
+    }
+  }
+
   const wakeLabel = member.wake_mode === 'anything' ? 'anything' : 'mentions'
   const kindsNote = Array.isArray(member.wake_kinds) && member.wake_kinds.length > 0
     ? `, kinds=${member.wake_kinds.join('|')}`
