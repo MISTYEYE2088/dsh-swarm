@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.1 (2026-11-25)
+
+- **Accurate Compaction Verbatim-Retained Tail Overlap Across Adjacent Epochs (`retained_from_epoch`)**:
+  - DSH compaction (`compaction-basic`, `DEFAULT_RETAIN_RATIO = 0.16`) summarizes only `shadowedSeqs` / `shadowedRange` and leaves the newest tail verbatim on the model-visible surface.
+  - Updated `extractSessionTranscript()` in `src/host/log-export.js` to compute the exact unshadowed tail from `shadowedSeqs`/`shadowedRange` and carry those verbatim entries into the start of `epoch-(N+1).jsonl` immediately after `compaction_checkpoint` (tagged with `retained_from_epoch`, without double-counting stats or duplicating `timeline.jsonl` rows), and recorded `retained_from_epoch`, `retained_lines`, and `retained_seq_range` in `manifest.json` and `timeline.jsonl`.
+
 ## 0.5.0 (2026-11-25)
 
 - **AI-First Programmatic JSONL Forensic Bundle + Automatic Compaction Epoch File Splitting**:

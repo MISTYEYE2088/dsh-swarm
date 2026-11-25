@@ -2749,29 +2749,60 @@ async function test_log_export_normal_conversation_epochs_zip_and_timeline() {
             },
           },
           { type: 'turn/end', seq: 9, time: 1732500002500, data: { turn: 1, reason: { kind: 'completed' } } },
-          // Compaction boundary -> MUST split into a brand-new `epoch-01.jsonl` file!
-          { type: 'compaction/start', seq: 10, time: 1732500010000, data: { compactionId: 'cmp-1', turn: 2 } },
+          // Unshadowed verbatim-retained tail (DSH keeps ~16% newest tail intact across compaction!)
+          { type: 'turn/start', seq: 10, time: 1732500008000, data: { turn: 2 } },
+          {
+            type: 'user/message',
+            seq: 11,
+            time: 1732500008100,
+            data: { id: 'u_tail', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'RETAINED_TAIL_PROMPT kept verbatim across compaction.' }] },
+          },
+          {
+            type: 'assistant/message',
+            seq: 12,
+            time: 1732500008500,
+            data: {
+              turn: 2,
+              step: 1,
+              stream: [],
+              message: {
+                id: 'a_tail',
+                role: 'assistant',
+                source: { kind: 'model', provider: 'corp', model: 'deepseek-r1' },
+                content: [{ type: 'text', text: 'RETAINED_TAIL_REPLY still visible in Epoch 1 context.' }],
+              },
+            },
+          },
+          { type: 'turn/end', seq: 13, time: 1732500008600, data: { turn: 2, reason: { kind: 'completed' } } },
+          // Compaction shadows ONLY older prefix seq 4..8 and leaves seq 11..12 verbatim!
+          { type: 'compaction/start', seq: 14, time: 1732500010000, data: { compactionId: 'cmp-1', turn: 3 } },
           {
             type: 'compaction/summary',
-            seq: 11,
+            seq: 15,
             time: 1732500010500,
-            data: { compactionId: 'cmp-1', shadowedTokenCount: 41000, summary: [{ type: 'text', text: 'Compacted Epoch 0: investigated run_llt.sh.' }] },
+            data: {
+              compactionId: 'cmp-1',
+              shadowedRange: { start: 4, end: 8 },
+              shadowedSeqs: [4, 6, 8],
+              shadowedTokenCount: 41000,
+              summary: [{ type: 'text', text: 'Compacted Epoch 0 prefix (seq 4..8): investigated run_llt.sh.' }],
+            },
           },
           {
             type: 'user/message',
-            seq: 12,
+            seq: 16,
             time: 1732500010600,
             data: { id: 'cp1', role: 'user', source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'Checkpoint summary carried into Epoch 1.' }] },
           },
-          { type: 'compaction/end', seq: 13, time: 1732500010700, data: { compactionId: 'cmp-1', turn: 2 } },
-          { type: 'turn/start', seq: 14, time: 1732500011000, data: { turn: 2 } },
+          { type: 'compaction/end', seq: 17, time: 1732500010700, data: { compactionId: 'cmp-1', turn: 3 } },
+          { type: 'turn/start', seq: 18, time: 1732500011000, data: { turn: 3 } },
           {
             type: 'user/message',
-            seq: 15,
+            seq: 19,
             time: 1732500011100,
             data: { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Why are there still hardcoded numbers after compaction?' }] },
           },
-          { type: 'turn/end', seq: 16, time: 1732500011500, data: { turn: 2, reason: { kind: 'completed' } } },
+          { type: 'turn/end', seq: 20, time: 1732500011500, data: { turn: 3, reason: { kind: 'completed' } } },
         ],
       },
     ],
@@ -2916,11 +2947,29 @@ print(json.dumps(out))`,
   assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), false, 'Reasoning must be omitted by default')
   assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('NOISY_SKILL_CATALOG_TEXT'), false, 'Harness injections must be omitted by default')
   assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('RAW_STREAM_NOISE_SHOULD_BE_STRIPPED'), false, 'Raw stream deltas must be stripped')
+  assert.ok(ep0Lines.some(l => l.seq === 11 && l.kind === 'human'), 'Epoch 0 must retain its end tail seq 11')
   assert.equal(ep1Lines[0].kind, 'compaction', 'Epoch 1 must open with the compaction summary record')
+  assert.equal(ep1Lines[0].retained_from_epoch, 0)
+  assert.equal(ep1Lines[0].retained_lines, 2)
+  assert.deepEqual(ep1Lines[0].retained_seq_range, [11, 12])
   assert.equal(ep1Lines[1].kind, 'compaction_checkpoint', 'Compact checkpoint joins Epoch 1 without double-splitting')
+  assert.equal(ep1Lines[2].seq, 11, 'Verbatim-retained tail seq 11 must appear immediately after checkpoint in Epoch 1')
+  assert.equal(ep1Lines[2].retained_from_epoch, 0)
+  assert.match(ep1Lines[2].text, /RETAINED_TAIL_PROMPT/)
+  assert.equal(ep1Lines[3].seq, 12, 'Verbatim-retained tail seq 12 must appear in Epoch 1')
+  assert.equal(ep1Lines[3].retained_from_epoch, 0)
+  assert.equal(ep1Lines[4].seq, 19, 'Post-compaction prompt follows the retained tail')
+  assert.equal(ep1Lines[4].retained_from_epoch, undefined)
+  assert.equal(manifest.sessions[0].epochs[1].retained_from_epoch, 0)
+  assert.equal(manifest.sessions[0].epochs[1].retained_lines, 2)
+  assert.deepEqual(manifest.sessions[0].epochs[1].retained_seq_range, [11, 12])
+  assert.equal(manifest.totals.human_prompts, 3, 'Carried-over retained tail must NOT double-count human_prompts')
 
-  // Verify programmatic `{file, line}` jump pointers in timeline.jsonl resolve to the EXACT matching JSONL line!
+  // Verify programmatic `{file, line}` jump pointers in timeline.jsonl resolve to the EXACT matching JSONL line with zero duplicates!
   const timelineRows = extracted['timeline.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  const retainedPromptTimelineHits = timelineRows.filter(r => r.type === 'human.prompt' && r.seq === 11)
+  assert.equal(retainedPromptTimelineHits.length, 1, 'Retained tail prompt must appear ONCE in timeline.jsonl (birth epoch only)')
+  assert.equal(retainedPromptTimelineHits[0].file, 'sessions/main/epoch-00.jsonl')
   const humanPrompt2 = timelineRows.find(r => r.type === 'human.prompt' && r.epoch === 1)
   assert.ok(humanPrompt2, 'timeline.jsonl must index human prompts in epoch 1')
   assert.equal(humanPrompt2.file, 'sessions/main/epoch-01.jsonl')
@@ -2929,7 +2978,7 @@ print(json.dumps(out))`,
   assert.match(jumpedRecord.text, /hardcoded numbers after compaction/)
 
   const compTimeline = timelineRows.find(r => r.type === 'compaction')
-  assert.ok(compTimeline && compTimeline.from_epoch === 0 && compTimeline.to_epoch === 1 && compTimeline.file === 'sessions/main/epoch-01.jsonl')
+  assert.ok(compTimeline && compTimeline.from_epoch === 0 && compTimeline.to_epoch === 1 && compTimeline.retained_lines === 2 && compTimeline.file === 'sessions/main/epoch-01.jsonl')
 
   // 2. Opt-in `includeReasoning=true&includeInjections=true` + standalone `format=timeline` & `format=manifest`
   const tlRes = await callExport('sessionId=normal-chat-1&format=timeline')

@@ -38,14 +38,14 @@ import {
   safeExportFilename,
 } from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.5.0'
+export const PLUGIN_VERSION = '0.5.1'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.5.0'
+    if (!fs.existsSync(headFile)) return 'release-0.5.1'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -53,7 +53,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.5.0'
+    return 'release-0.5.1'
   }
 }
 

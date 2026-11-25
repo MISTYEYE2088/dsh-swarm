@@ -145,6 +145,9 @@ function createEpochBucket(epochIndex) {
     start_ts_ms: 0,
     end_ts: '',
     end_ts_ms: 0,
+    retained_from_epoch: null,
+    retained_lines: 0,
+    retained_seq_range: null,
     human_prompts: 0,
     turns: 0,
     tool_calls: 0,
@@ -158,10 +161,46 @@ function createEpochBucket(epochIndex) {
   }
 }
 
-// #FUNC Transform a raw DSH session header and `SessionEvent[]` log into compaction-split JSONL epochs with separated human/relay/harness noise and real token accounting.
-// #NOT  Never embeds raw `assistant/message.data.stream` SSE delta arrays and never mixes `skill-catalog`/`runtime-context` injections into `kind="human"` prompts.
-// #EDGE-IN A single session hitting `compaction/summary` + `compact-checkpoint` splits cleanly into `epoch-00.jsonl` and `epoch-01.jsonl` while omitting harness injections and reasoning by default → test_log_export_normal_conversation_epochs_zip_and_timeline
-// #WHY  Splitting each session at every compaction boundary keeps each JSONL file bounded to one context window so AI investigators jump directly by `{file, line}` without overflowing context.
+/** Extract the exact verbatim-retained tail entries from `prevEpoch` left unshadowed by DSH compaction (`shadowedSeqs` / `shadowedRange`). */
+function extractRetainedTail(prevEpoch, summaryData) {
+  if (!prevEpoch || !Array.isArray(prevEpoch.entries) || prevEpoch.entries.length === 0) return []
+  const shadowedSeqs = Array.isArray(summaryData?.shadowedSeqs)
+    ? summaryData.shadowedSeqs.map(Number).filter(Number.isFinite)
+    : []
+  const shadowedEnd = Number(summaryData?.shadowedRange?.end)
+  if (shadowedSeqs.length === 0 && !Number.isFinite(shadowedEnd)) return []
+
+  const shadowedSet = new Set(shadowedSeqs)
+  let cutIdx = -1
+  for (let i = 0; i < prevEpoch.entries.length; i += 1) {
+    const seq = prevEpoch.entries[i]?.seq
+    if (typeof seq !== 'number') continue
+    if (shadowedSet.has(seq) || (Number.isFinite(shadowedEnd) && seq === shadowedEnd)) {
+      cutIdx = i
+    }
+  }
+  if (cutIdx === -1 && Number.isFinite(shadowedEnd)) {
+    for (let i = 0; i < prevEpoch.entries.length; i += 1) {
+      const seq = prevEpoch.entries[i]?.seq
+      if (typeof seq === 'number' && seq <= shadowedEnd) cutIdx = i
+    }
+    if (cutIdx === -1) {
+      return prevEpoch.entries.filter(e =>
+        typeof e.seq === 'number'
+        && e.seq > shadowedEnd
+        && e.kind !== 'compaction'
+        && e.kind !== 'compaction_checkpoint',
+      )
+    }
+  }
+  if (cutIdx === -1 || cutIdx >= prevEpoch.entries.length - 1) return []
+  return prevEpoch.entries.slice(cutIdx + 1)
+}
+
+// #FUNC Transform a raw DSH session header and `SessionEvent[]` log into compaction-split JSONL epochs that preserve DSH's exact verbatim-retained tail overlap across adjacent epochs.
+// #NOT  Never embeds raw `assistant/message.data.stream` SSE delta arrays, never mixes `skill-catalog`/`runtime-context` injections into `kind="human"`, and never double-counts carried-over retained tail entries in stats or timeline.
+// #EDGE-IN A session whose `compaction/summary` shadows `seq 4..8` while retaining `seq 9..12` duplicates `seq 9..12` verbatim at the top of `epoch-01.jsonl` tagged with `retained_from_epoch: 0` right after `compaction_checkpoint` → test_log_export_normal_conversation_epochs_zip_and_timeline
+// #WHY  Replaying DSH's exact unshadowed tail (`shadowedRange`/`shadowedSeqs`) into the next epoch file lets an AI inspect a single `epoch-XX.jsonl` and see the true verbatim context window the model actually saw after compaction.
 export function extractSessionTranscript(header, events, options = {}) {
   const includeReasoning = options.includeReasoning === true
   const includeInjections = options.includeInjections === true
@@ -208,6 +247,29 @@ export function extractSessionTranscript(header, events, options = {}) {
   const epochs = [createEpochBucket(0)]
   let currentEpoch = epochs[0]
   let splitCompactionId = null
+  let pendingRetainedTail = null
+
+  const flushPendingRetainedTail = () => {
+    if (!pendingRetainedTail) return
+    const { fromEpoch, entries } = pendingRetainedTail
+    pendingRetainedTail = null
+    if (!Array.isArray(entries) || entries.length === 0) return
+    currentEpoch.retained_from_epoch = fromEpoch
+    currentEpoch.retained_lines = entries.length
+    const seqs = entries.map(e => e.seq).filter(n => typeof n === 'number')
+    if (seqs.length > 0) {
+      currentEpoch.retained_seq_range = [seqs[0], seqs[seqs.length - 1]]
+    }
+    for (const orig of entries) {
+      const line = currentEpoch.entries.length + 1
+      currentEpoch.entries.push({
+        ...orig,
+        line,
+        epoch: currentEpoch.epoch,
+        retained_from_epoch: orig.retained_from_epoch ?? fromEpoch,
+      })
+    }
+  }
 
   const pushEntry = (record, seq, timeObj) => {
     const line = currentEpoch.entries.length + 1
@@ -279,28 +341,42 @@ export function extractSessionTranscript(header, events, options = {}) {
         break
       }
       case 'compaction/summary': {
+        flushPendingRetainedTail()
         compactionsCount += 1
+        const prevEpoch = currentEpoch
+        const retainedEntries = extractRetainedTail(prevEpoch, data)
         const prevCtxPct = contextWindow > 0 && lastInputTokens > 0
           ? Math.round((lastInputTokens / contextWindow) * 1000) / 10
           : null
-        openNextEpochIfNeeded()
+        const didSplit = openNextEpochIfNeeded()
         splitCompactionId = data.compactionId ?? '__active__'
         const summaryUnpacked = Array.isArray(data.summary)
           ? unpackContentBlocks(data.summary).text
           : (typeof data.summary === 'string' ? data.summary : '')
         const summaryText = truncateText(summaryUnpacked, maxErrResultChars)
         if (summaryText) currentEpoch.summary_preview = compactPreview(summaryText, 160)
+        const retainedSeqs = retainedEntries.map(e => e.seq).filter(n => typeof n === 'number')
         pushEntry({
           kind: 'compaction',
           event_type: 'compaction/summary',
           compaction_id: data.compactionId ?? null,
+          ...(data.shadowedRange ? { shadowed_range: data.shadowedRange } : {}),
           ...(typeof data.shadowedTokenCount === 'number' ? { shadowed_tokens: data.shadowedTokenCount } : {}),
           ...(prevCtxPct !== null ? { ctx_before_pct: prevCtxPct } : {}),
+          ...(didSplit && retainedEntries.length > 0 ? {
+            retained_from_epoch: prevEpoch.epoch,
+            retained_lines: retainedEntries.length,
+            ...(retainedSeqs.length > 0 ? { retained_seq_range: [retainedSeqs[0], retainedSeqs[retainedSeqs.length - 1]] } : {}),
+          } : {}),
           ...(summaryText ? { summary: summaryText } : {}),
         }, seq, timeObj)
+        if (didSplit && retainedEntries.length > 0) {
+          pendingRetainedTail = { fromEpoch: prevEpoch.epoch, entries: retainedEntries }
+        }
         break
       }
       case 'compaction/end': {
+        flushPendingRetainedTail()
         if (data.error) {
           errorsCount += 1
           currentEpoch.errors += 1
@@ -332,8 +408,11 @@ export function extractSessionTranscript(header, events, options = {}) {
             source: tag,
             text: cpText,
           }, seq, timeObj)
+          // Place the verbatim-retained tail immediately after the checkpoint summary so the epoch mirrors the exact model context order.
+          flushPendingRetainedTail()
           break
         }
+        flushPendingRetainedTail()
         if (category === 'harness_inject') {
           if (!includeInjections) {
             omittedInjections += 1
@@ -383,6 +462,7 @@ export function extractSessionTranscript(header, events, options = {}) {
         break
       }
       case 'assistant/message': {
+        flushPendingRetainedTail()
         const msg = data.message ?? {}
         const src = msg.source ?? {}
         rememberModel(src.provider, src.model)
@@ -496,6 +576,7 @@ export function extractSessionTranscript(header, events, options = {}) {
         break
     }
   }
+  flushPendingRetainedTail()
 
   const contextPct = contextWindow > 0 && lastInputTokens > 0
     ? Math.round((lastInputTokens / contextWindow) * 1000) / 10
@@ -952,6 +1033,11 @@ export async function collectDiagnosticExport({
         end_seq: ep.end_seq,
         start_ts: ep.start_ts,
         end_ts: ep.end_ts,
+        ...(ep.retained_lines > 0 ? {
+          retained_from_epoch: ep.retained_from_epoch,
+          retained_lines: ep.retained_lines,
+          retained_seq_range: ep.retained_seq_range,
+        } : {}),
         human_prompts: ep.human_prompts,
         turns: ep.turns,
         tool_calls: ep.tool_calls,
@@ -963,6 +1049,8 @@ export async function collectDiagnosticExport({
       })
 
       for (const entry of ep.entries) {
+        // Carried-over retained tail entries belong to their birth epoch in `timeline.jsonl` (avoid duplicate timeline events).
+        if (entry.retained_from_epoch !== undefined && entry.kind !== 'compaction') continue
         if (entry.kind === 'human') {
           pushTimeline(entry.ts_ms, {
             type: 'human.prompt',
@@ -981,8 +1069,14 @@ export async function collectDiagnosticExport({
             from_epoch: Math.max(0, ep.epoch - 1),
             to_epoch: ep.epoch,
             seq: entry.seq ?? null,
+            ...(entry.shadowed_range ? { shadowed_range: entry.shadowed_range } : {}),
             ...(entry.shadowed_tokens !== undefined ? { shadowed_tokens: entry.shadowed_tokens } : {}),
             ...(entry.ctx_before_pct !== undefined ? { ctx_before_pct: entry.ctx_before_pct } : {}),
+            ...(entry.retained_lines ? {
+              retained_from_epoch: entry.retained_from_epoch,
+              retained_lines: entry.retained_lines,
+              ...(entry.retained_seq_range ? { retained_seq_range: entry.retained_seq_range } : {}),
+            } : {}),
             file: filePath,
             line: entry.line,
           })
