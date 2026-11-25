@@ -9,6 +9,9 @@ import { getRoleSpec } from './prompts.js'
 
 export const DIAGNOSTIC_EXPORT_FORMAT = 'dsh-swarm-diagnostic-log/v1'
 export const DEFAULT_MAX_TOOL_RESULT_CHARS = 4000
+export const COMPACT_MAX_TOOL_ARG_CHARS = 320
+export const COMPACT_MAX_OK_RESULT_CHARS = 280
+export const COMPACT_MAX_ERR_RESULT_CHARS = 2000
 
 /** Build a filesystem-safe download filename for a Swarm or conversation diagnostic export. */
 export function safeExportFilename(prefix, id, ext, now = new Date()) {
@@ -97,9 +100,17 @@ function formatTimestamp(ts) {
 // #WHY  Stripping `data.stream` while preserving `usage`, `contextWindow`, tool arguments/results, and abnormal `turn/end` reasons keeps exports compact enough for human review and cross-AI pathology diagnosis.
 export function extractSessionTranscript(header, events, options = {}) {
   const includeReasoning = options.includeReasoning !== false
-  const maxToolResultChars = options.maxToolResultChars !== undefined
-    ? Number(options.maxToolResultChars)
-    : DEFAULT_MAX_TOOL_RESULT_CHARS
+  const detail = options.detail === 'full' ? 'full' : 'compact'
+  const explicitCap = options.maxToolResultChars !== undefined ? Number(options.maxToolResultChars) : null
+  const maxToolArgChars = explicitCap !== null
+    ? explicitCap
+    : (detail === 'full' ? DEFAULT_MAX_TOOL_RESULT_CHARS : COMPACT_MAX_TOOL_ARG_CHARS)
+  const maxOkResultChars = explicitCap !== null
+    ? explicitCap
+    : (detail === 'full' ? DEFAULT_MAX_TOOL_RESULT_CHARS : COMPACT_MAX_OK_RESULT_CHARS)
+  const maxErrResultChars = explicitCap !== null
+    ? explicitCap
+    : (detail === 'full' ? DEFAULT_MAX_TOOL_RESULT_CHARS : COMPACT_MAX_ERR_RESULT_CHARS)
   const safeEvents = Array.isArray(events) ? events : []
 
   const models = []
@@ -231,7 +242,7 @@ export function extractSessionTranscript(header, events, options = {}) {
           name,
           arguments: truncateText(
             typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {}),
-            maxToolResultChars,
+            maxToolArgChars,
           ),
         })
         break
@@ -253,7 +264,7 @@ export function extractSessionTranscript(header, events, options = {}) {
           name: toolName,
           is_error: isError,
           ...(data.error ? { error: data.error } : {}),
-          text: truncateText(unpacked.text, maxToolResultChars),
+          text: truncateText(unpacked.text, isError ? maxErrResultChars : maxOkResultChars),
           ...(unpacked.attachments.length > 0 ? { attachments: unpacked.attachments } : {}),
         })
         break
@@ -452,11 +463,13 @@ export async function collectDiagnosticExport({
   runtime,
   sessionId = '',
   swarmId = '',
+  detail = 'compact',
   includeSubagents = true,
   includeReasoning = true,
-  maxToolResultChars = DEFAULT_MAX_TOOL_RESULT_CHARS,
+  maxToolResultChars,
   signal,
 } = {}) {
+  const effectiveDetail = detail === 'full' ? 'full' : 'compact'
   const reqSessionId = String(sessionId ?? '').trim()
   const explicitSwarmId = String(swarmId ?? '').trim()
 
@@ -485,8 +498,9 @@ export async function collectDiagnosticExport({
       sessionId: sid,
       explicitLabel: meta.explicitLabel,
       label: meta.label,
+      detail: effectiveDetail,
       includeReasoning,
-      maxToolResultChars,
+      ...(maxToolResultChars !== undefined ? { maxToolResultChars } : {}),
     })
     const entry = {
       ...transcript,
@@ -608,9 +622,10 @@ export async function collectDiagnosticExport({
       root_session_id: rootSessionId,
       requested_session_id: reqSessionId || rootSessionId,
       options: {
+        detail: effectiveDetail,
         include_subagents: includeSubagents,
         include_reasoning: includeReasoning,
-        max_tool_result_chars: maxToolResultChars,
+        ...(maxToolResultChars !== undefined ? { max_tool_result_chars: maxToolResultChars } : {}),
       },
       totals,
       ...(swarmSection ? { swarm: swarmSection } : {}),
@@ -758,22 +773,33 @@ export function formatDiagnosticMarkdown(bundle) {
         if (entry.attachments) lines.push(entry.attachments.join(' '))
         lines.push('')
       } else if (entry.kind === 'tool_call') {
-        lines.push(`> **Tool Call** \`${entry.name}\` (${tsPrefix.trim() || 'call'}):`)
-        lines.push('```json')
-        lines.push(entry.arguments || '{}')
-        lines.push('```')
-        lines.push('')
+        if (bundle.options?.detail === 'compact') {
+          const singleArg = String(entry.arguments || '{}').replace(/\s+/g, ' ')
+          lines.push(`> \`${entry.name}\`(${singleArg})`)
+        } else {
+          lines.push(`> **Tool Call** \`${entry.name}\` (${tsPrefix.trim() || 'call'}):`)
+          lines.push('```json')
+          lines.push(entry.arguments || '{}')
+          lines.push('```')
+          lines.push('')
+        }
       } else if (entry.kind === 'tool_result') {
         const statusLabel = entry.is_error ? 'ERROR' : 'OK'
         const errInfo = entry.error ? ` (${entry.error.code || entry.error.name}: ${entry.error.reason || ''})` : ''
-        lines.push(`> **Tool Result** \`${entry.name}\` [${statusLabel}]${errInfo}:`)
-        if (entry.text) {
-          lines.push('```text')
-          lines.push(entry.text)
-          lines.push('```')
+        if (bundle.options?.detail === 'compact' && !entry.is_error) {
+          const preview = String(entry.text || '').replace(/\s+/g, ' ').trim()
+          lines.push(`> -> \`${entry.name}\` [OK]${preview ? ': ' + preview : ''}`)
+          lines.push('')
+        } else {
+          lines.push(`> **Tool Result** \`${entry.name}\` [${statusLabel}]${errInfo}:`)
+          if (entry.text) {
+            lines.push('```text')
+            lines.push(entry.text)
+            lines.push('```')
+          }
+          if (entry.attachments) lines.push(entry.attachments.join(' '))
+          lines.push('')
         }
-        if (entry.attachments) lines.push(entry.attachments.join(' '))
-        lines.push('')
       } else if (entry.kind === 'turn_end') {
         const errText = entry.error ? ` — ${entry.error.code}: ${entry.error.message}` : ''
         lines.push(`> **[TURN_END: ${entry.reason_kind}]** (turn=${entry.turn ?? '?'}${errText})`)

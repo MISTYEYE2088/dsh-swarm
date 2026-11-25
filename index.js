@@ -38,14 +38,14 @@ import {
   safeExportFilename,
 } from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.4.0'
+export const PLUGIN_VERSION = '0.4.1'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.4.0'
+    if (!fs.existsSync(headFile)) return 'release-0.4.1'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -53,7 +53,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.4.0'
+    return 'release-0.4.1'
   }
 }
 
@@ -163,6 +163,8 @@ export function createSwarmWebRoutes(runtime) {
           const swarmId = url.searchParams.get('swarmId') || ''
           const formatParam = (url.searchParams.get('format') || 'md').toLowerCase()
           const format = formatParam === 'json' ? 'json' : 'md'
+          const detailParam = (url.searchParams.get('detail') || 'compact').toLowerCase()
+          const detail = detailParam === 'full' ? 'full' : 'compact'
           const includeSubagents = url.searchParams.get('includeSubagents') !== 'false'
           const includeReasoning = url.searchParams.get('includeReasoning') !== 'false'
           const downloadParam = url.searchParams.get('download')
@@ -178,6 +180,7 @@ export function createSwarmWebRoutes(runtime) {
             runtime,
             sessionId,
             swarmId,
+            detail,
             includeSubagents,
             includeReasoning,
             ...(maxToolResultChars !== undefined ? { maxToolResultChars } : {}),

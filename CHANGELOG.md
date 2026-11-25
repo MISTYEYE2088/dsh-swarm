@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 (2026-11-25)
+
+- **Compact Diagnostic Digest Mode by Default (`detail=compact|full`)**:
+  - Live testing against a real 120-subagent, 20,657-tool-call DSH session showed `4000`-char tool dumps inflated Markdown exports to 74 MB.
+  - Made `detail=compact` the default (1-line summaries for `OK` tool calls/results capped at `320`/`280` chars while preserving full `2000`-char traces for `ERROR` tool results, full user/assistant messages, and full Swarm Blackboard posts), plus added a `Full tool outputs (verbose)` toggle (`detail=full`) in the header/sidebar export menu.
+
 ## 0.4.0 (2026-11-25)
 
 - **Unified Diagnostic Log Export for Both Swarm & Normal DSH Conversations (`src/host/log-export.js` + `/api/dsh-swarm/export`)**:

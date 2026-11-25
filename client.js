@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.4.0'
+    var VERSION = '0.4.1'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -891,6 +891,7 @@ window.__ModuleLoader__.load({
       if (o.sessionId) params.push('sessionId=' + encodeURIComponent(String(o.sessionId)))
       if (o.swarmId) params.push('swarmId=' + encodeURIComponent(String(o.swarmId)))
       params.push('format=' + encodeURIComponent(o.format === 'json' ? 'json' : 'md'))
+      params.push('detail=' + encodeURIComponent(o.detail === 'full' ? 'full' : 'compact'))
       params.push('includeSubagents=' + (o.includeSubagents === false ? 'false' : 'true'))
       params.push('includeReasoning=' + (o.includeReasoning === false ? 'false' : 'true'))
       if (o.download) params.push('download=1')
@@ -1017,6 +1018,9 @@ window.__ModuleLoader__.load({
       var reasPair = React.useState(true)
       var includeReasoning = reasPair[0]
       var setIncludeReasoning = reasPair[1]
+      var fullPair = React.useState(false)
+      var fullToolOutputs = fullPair[0]
+      var setFullToolOutputs = fullPair[1]
       var busyPair = React.useState(false)
       var busy = busyPair[0]
       var setBusy = busyPair[1]
@@ -1069,6 +1073,7 @@ window.__ModuleLoader__.load({
           sessionId: explicitSwarmId ? '' : sessionId,
           swarmId: explicitSwarmId || '',
           format: format,
+          detail: fullToolOutputs ? 'full' : 'compact',
           includeSubagents: includeSubagents,
           includeReasoning: includeReasoning,
         }
@@ -1251,10 +1256,9 @@ window.__ModuleLoader__.load({
                     display: 'flex',
                     alignItems: 'center',
                     gap: '6px',
-                    padding: '3px 6px 6px',
+                    padding: '3px 6px',
                     fontSize: '11.5px',
                     color: 'var(--dsw-alias-label-secondary)',
-                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
                     cursor: 'pointer',
                   },
                 },
@@ -1264,6 +1268,27 @@ window.__ModuleLoader__.load({
                   onChange: function (e) { setIncludeReasoning(Boolean(e && e.target && e.target.checked)) },
                 }),
                 'Include reasoning blocks',
+              ),
+              React.createElement(
+                'label',
+                {
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '3px 6px 6px',
+                    fontSize: '11.5px',
+                    color: 'var(--dsw-alias-label-secondary)',
+                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
+                    cursor: 'pointer',
+                  },
+                },
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: fullToolOutputs,
+                  onChange: function (e) { setFullToolOutputs(Boolean(e && e.target && e.target.checked)) },
+                }),
+                'Full tool outputs (verbose)',
               ),
               React.createElement(
                 'button',

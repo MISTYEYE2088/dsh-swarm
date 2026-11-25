@@ -2977,11 +2977,11 @@ async function test_client_registers_export_header_utility_slot_and_builds_urls(
   // Verify URL builder for both normal session and explicit Swarm modes
   assert.equal(
     mod.buildExportUrl({ sessionId: 'chat-42', format: 'md', includeSubagents: true, includeReasoning: false, download: true }),
-    '/api/dsh-swarm/export?sessionId=chat-42&format=md&includeSubagents=true&includeReasoning=false&download=1',
+    '/api/dsh-swarm/export?sessionId=chat-42&format=md&detail=compact&includeSubagents=true&includeReasoning=false&download=1',
   )
   assert.equal(
-    mod.buildExportUrl({ swarmId: 'sw-9', format: 'json', includeSubagents: true, includeReasoning: true }),
-    '/api/dsh-swarm/export?swarmId=sw-9&format=json&includeSubagents=true&includeReasoning=true',
+    mod.buildExportUrl({ swarmId: 'sw-9', format: 'json', detail: 'full', includeSubagents: true, includeReasoning: true }),
+    '/api/dsh-swarm/export?swarmId=sw-9&format=json&detail=full&includeSubagents=true&includeReasoning=true',
   )
 
   // Verify `conversation.session.header.utilities` registers `dsh-swarm-export-log`
