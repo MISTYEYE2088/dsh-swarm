@@ -1040,7 +1040,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
     { agent: callerAgent },
   )
   assert.equal(initRes.ok, true)
-  assert.match(initRes.text, /dsh-swarm v0\.3\.10/)
+  assert.match(initRes.text, /dsh-swarm v0\.3\.11/)
   assert.equal(initRes.swarm.default_provider, 'opencode-go')
   assert.equal(initRes.swarm.default_model, 'deepseek-v4.1-flash')
 
@@ -1097,7 +1097,7 @@ async function test_r0_to_r8_error_observability_monitor_deps_and_archive() {
 
   const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: callerAgent })
   assert.equal(statusRes.ok, true)
-  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.10/)
+  assert.match(statusRes.text, /Runtime: dsh-swarm v0\.3\.11/)
   assert.match(statusRes.text, /status=error/)
   assert.match(statusRes.text, /LLM In-Flight Slots:/)
   assert.match(statusRes.text, /Watchdog:/)
@@ -2336,6 +2336,98 @@ async function test_parameterized_role_registry_auto_covers_stop_hook_and_gates(
   }
 }
 
+async function test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup() {
+  const {
+    ARCHITECT_REVIEW_RULES,
+    registerRole,
+    unregisterRole,
+    renderRolePrompt,
+    formatReviewRules,
+  } = await import('../src/host/prompts.js')
+
+  // 1. Verify ARCHITECT_REVIEW_RULES is a 2D [[title, detail], ...] array with C1..C8
+  assert.equal(Array.isArray(ARCHITECT_REVIEW_RULES), true)
+  assert.equal(ARCHITECT_REVIEW_RULES.length, 8)
+  for (const row of ARCHITECT_REVIEW_RULES) {
+    assert.equal(Array.isArray(row) && row.length === 2, true)
+    assert.ok(row[0].startsWith('C') && row[1].length > 10)
+  }
+
+  // 2. Rendered architect prompt expands all 8 rules from the 2D array
+  const archPrompt = renderRolePrompt('architect', { memberName: 'arch-1', cwd: '/repo', briefSeq: 1, brief: 'review' })
+  for (const [title] of ARCHITECT_REVIEW_RULES) {
+    assert.ok(archPrompt.includes(title), `Architect system prompt must render ${title}`)
+  }
+
+  // 3. Dynamic user-side wakeup anchor injects titles from roleSpec.reviewRules with zero hardcoding!
+  try {
+    const customRules = [
+      ['N1:no-hotpath-alloc', 'Zero heap allocations in TX/RX datapath.'],
+      ['N2:spec-register-match', 'Bitfields must match NIC hardware register table.'],
+    ]
+    registerRole('nic_reviewer', {
+      prompt: '# [SWARM: NIC REVIEWER]\n{{REVIEW_RULES}}',
+      canBlockMerge: true,
+      reviewRules: customRules,
+    })
+
+    const customPrompt = renderRolePrompt('nic_reviewer', { memberName: 'nic-rev' })
+    assert.match(customPrompt, /N1:no-hotpath-alloc/)
+    assert.match(customPrompt, /N2:spec-register-match/)
+    assert.equal(
+      formatReviewRules(customRules, 'anchor'),
+      'Check (N1:no-hotpath-alloc | N2:spec-register-match) -> start review with 1-line OK/FAIL per rule.',
+    )
+
+    // Verify dispatchPostWakeups attaches the user-side anchor automatically for roles with reviewRules (and NOT for worker)
+    const steeredRev = []
+    const steeredWorker = []
+    const fakeAgents = new Map([
+      ['sw-meta__nic-rev', { id: 'sw-meta__nic-rev', status: 'idle', steer(m) { steeredRev.push(m) } }],
+      ['sw-meta__impl-1', { id: 'sw-meta__impl-1', status: 'idle', steer(m) { steeredWorker.push(m) } }],
+    ])
+    const fakeCtx = {
+      on() { return () => {} },
+      effect(fn) { return fn() },
+      get(name) {
+        if (name === 'agents') return { get(id) { return fakeAgents.get(id) } }
+        return undefined
+      },
+    }
+    const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-meta-rules') }, { log: () => {}, warn: () => {} })
+    runtime.store.initSwarm('sw-meta', { title: 'Meta Rules Wakeup', concurrency_confirmed: true })
+    runtime.store.registerMemberWithBrief('sw-meta', {
+      name: 'nic-rev',
+      session_id: 'sw-meta__nic-rev',
+      role: 'nic_reviewer',
+      brief: '[OWNERSHIP] review\n[FORBIDDEN] edit\n[DONE_CRITERIA] ok',
+    })
+    runtime.store.registerMemberWithBrief('sw-meta', {
+      name: 'impl-1',
+      session_id: 'sw-meta__impl-1',
+      role: 'worker',
+      brief: '[OWNERSHIP] tx\n[FORBIDDEN] rx\n[DONE_CRITERIA] ok',
+    })
+
+    const post = runtime.store.appendBoardRecord('sw-meta', {
+      type: 'post',
+      agent: 'coordinator',
+      title: 'Please review TX ring patch',
+      kind: 'report',
+      mentions: ['nic-rev', 'impl-1'],
+      text: '@nic-rev @impl-1 ready',
+    })
+    await runtime.dispatchPostWakeups('sw-meta', post)
+
+    assert.equal(steeredRev.length, 1)
+    assert.match(steeredRev[0].content[0].text, /Check \(N1:no-hotpath-alloc \| N2:spec-register-match\)/)
+    assert.equal(steeredWorker.length, 1)
+    assert.equal(steeredWorker[0].content[0].text.includes('Check ('), false, 'Worker without reviewRules must not get review anchor')
+  } finally {
+    unregisterRole('nic_reviewer')
+  }
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -2413,6 +2505,7 @@ try {
   await runTest('test_scoped_lazy_tool_unlock_on_swarm_init', test_scoped_lazy_tool_unlock_on_swarm_init)
   await runTest('test_lore_master_role_and_tier_b_guardrails', test_lore_master_role_and_tier_b_guardrails)
   await runTest('test_parameterized_role_registry_auto_covers_stop_hook_and_gates', test_parameterized_role_registry_auto_covers_stop_hook_and_gates)
+  await runTest('test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup', test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

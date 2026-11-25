@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.11 (2026-11-24)
+
+- **2D Array Meta Review Rules (`ARCHITECT_REVIEW_RULES` / `roleSpec.reviewRules`) + Dynamic `user`-Side Wakeup Anchor**:
+  - Defined `C1..C8` architectural review meta-rules as a single 2D `[[title, detail], ...]` array in `src/host/prompts.js` (overridable per role via `registerRole` or `config.roles.<role>.reviewRules`).
+  - `renderRolePrompt()` expands full `[title, detail]` bullets into the System Prompt, while `dispatchPostWakeups()` dynamically injects a compact 1-line `user`-turn wakeup anchor derived solely from `rule[0]` titles (zero hardcoded summary strings, directly mitigating DeepSeek system-prompt decay).
+- **Anti-Reward-Hacking Verifier & Log-Scan Hardening**:
+  - Updated `VERIFIER_SOP_PROMPT` to capture command output and scan for error/fail/skip/localized failure keywords instead of trusting exit code `0` alone, require real executed commands + non-empty stdout on `verdict="approve"`, and classify evidence basis (External Anchor / Hand-Calculated / Circular / Unverified Assumption).
+  - Updated `COORDINATOR_SOP_PROMPT` so `override_reason` is reserved for explicit user approval or requirement changes.
+  - Updated `LORE_MASTER_SOP_PROMPT` to cite `file path + symbol/function name` instead of brittle `file:line`.
+
 ## 0.3.10 (2026-11-24)
 
 - **Parameterized Single-Source-of-Truth Role Registry (`ROLE_REGISTRY` / `registerRole`)**:

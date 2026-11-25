@@ -21,21 +21,23 @@ import { SwarmMonitorDaemon } from './src/host/monitor.js'
 import {
   renderRolePrompt,
   COORDINATOR_SOP_PROMPT,
+  ARCHITECT_REVIEW_RULES,
   registerRole,
   unregisterRole,
   getRoleSpec,
   getSpawnableRoles,
+  formatReviewRules,
 } from './src/host/prompts.js'
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 
-export const PLUGIN_VERSION = '0.3.10'
+export const PLUGIN_VERSION = '0.3.11'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.3.10'
+    if (!fs.existsSync(headFile)) return 'release-0.3.11'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -57,10 +59,12 @@ export {
   statusOf,
   SwarmMonitorDaemon,
   renderRolePrompt,
+  ARCHITECT_REVIEW_RULES,
   registerRole,
   unregisterRole,
   getRoleSpec,
   getSpawnableRoles,
+  formatReviewRules,
   createSwarmTools,
   buildSwarmProjectionSnapshot,
 }
@@ -785,7 +789,9 @@ export function applyWith(ctx, config, deps = {}) {
           }))
           const chPart = postRecord.channel && postRecord.channel !== 'main' ? ` #${postRecord.channel}` : ''
           const titlePart = postRecord.title ? `: ${postRecord.title}` : ''
-          const wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})`
+          const rulesAnchor = formatReviewRules(getRoleSpec(m.role).reviewRules, 'anchor')
+          const anchorPart = rulesAnchor && postRecord.kind !== 'done' ? `\n${rulesAnchor}` : ''
+          const wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}`
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
           } else {
