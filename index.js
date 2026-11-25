@@ -33,19 +33,19 @@ import {
 import { createSwarmTools, createSwarmCommand, buildSwarmProjectionSnapshot, WORKER_SWARM_TOOL_NAMES } from './src/host/tools.js'
 import {
   collectDiagnosticExport,
-  formatDiagnosticMarkdown,
+  buildZipArchive,
   extractSessionTranscript,
   safeExportFilename,
 } from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.4.1'
+export const PLUGIN_VERSION = '0.5.0'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.4.1'
+    if (!fs.existsSync(headFile)) return 'release-0.5.0'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -53,7 +53,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.4.1'
+    return 'release-0.5.0'
   }
 }
 
@@ -77,7 +77,7 @@ export {
   createSwarmTools,
   buildSwarmProjectionSnapshot,
   collectDiagnosticExport,
-  formatDiagnosticMarkdown,
+  buildZipArchive,
   extractSessionTranscript,
   safeExportFilename,
 }
@@ -161,12 +161,13 @@ export function createSwarmWebRoutes(runtime) {
           const url = new URL(req.url ?? '/api/dsh-swarm/export', 'http://127.0.0.1')
           const sessionId = url.searchParams.get('sessionId') || ''
           const swarmId = url.searchParams.get('swarmId') || ''
-          const formatParam = (url.searchParams.get('format') || 'md').toLowerCase()
-          const format = formatParam === 'json' ? 'json' : 'md'
+          const formatRaw = (url.searchParams.get('format') || 'zip').toLowerCase()
+          const format = ['zip', 'timeline', 'manifest', 'json'].includes(formatRaw) ? formatRaw : 'zip'
           const detailParam = (url.searchParams.get('detail') || 'compact').toLowerCase()
           const detail = detailParam === 'full' ? 'full' : 'compact'
           const includeSubagents = url.searchParams.get('includeSubagents') !== 'false'
-          const includeReasoning = url.searchParams.get('includeReasoning') !== 'false'
+          const includeReasoning = url.searchParams.get('includeReasoning') === 'true'
+          const includeInjections = url.searchParams.get('includeInjections') === 'true'
           const downloadParam = url.searchParams.get('download')
           const isDownload = downloadParam === '1' || downloadParam === 'true'
           const maxCharsRaw = url.searchParams.get('maxToolResultChars')
@@ -183,6 +184,7 @@ export function createSwarmWebRoutes(runtime) {
             detail,
             includeSubagents,
             includeReasoning,
+            includeInjections,
             ...(maxToolResultChars !== undefined ? { maxToolResultChars } : {}),
           })
           if (!result.ok) {
@@ -191,10 +193,15 @@ export function createSwarmWebRoutes(runtime) {
           }
 
           const prefix = result.bundle.mode === 'swarm' ? 'dsh-swarm-log' : 'dsh-session-log'
-          const filename = safeExportFilename(prefix, result.bundle.root_session_id, format)
-          const contentType = format === 'json'
-            ? 'application/json; charset=utf-8'
-            : 'text/markdown; charset=utf-8'
+          const ext = format === 'timeline' ? 'jsonl' : (format === 'zip' ? 'zip' : 'json')
+          const filename = safeExportFilename(
+            format === 'timeline' ? `${prefix}-timeline` : (format === 'manifest' ? `${prefix}-manifest` : prefix),
+            result.bundle.root_session_id,
+            ext,
+          )
+          const contentType = format === 'zip'
+            ? 'application/zip'
+            : (format === 'timeline' ? 'application/x-ndjson; charset=utf-8' : 'application/json; charset=utf-8')
 
           res.statusCode = 200
           res.setHeader('content-type', contentType)
@@ -208,10 +215,24 @@ export function createSwarmWebRoutes(runtime) {
             res.end('')
             return
           }
-          const body = format === 'json'
-            ? JSON.stringify(result.bundle, null, 2)
-            : formatDiagnosticMarkdown(result.bundle)
-          res.end(body)
+          if (format === 'zip') {
+            const rootDirName = filename.replace(/\.zip$/i, '')
+            res.end(buildZipArchive(result.bundle.files, rootDirName))
+            return
+          }
+          if (format === 'timeline') {
+            res.end(result.bundle.timeline_jsonl)
+            return
+          }
+          if (format === 'manifest') {
+            res.end(`${JSON.stringify(result.bundle.manifest, null, 2)}\n`)
+            return
+          }
+          res.end(`${JSON.stringify({
+            manifest: result.bundle.manifest,
+            timeline: result.bundle.timeline,
+            files: result.bundle.files.map(f => ({ path: f.path, bytes: Buffer.byteLength(f.content, 'utf8') })),
+          }, null, 2)}\n`)
         } catch (err) {
           sendJson(res, 500, { ok: false, error: String(err?.message ?? err) })
         }

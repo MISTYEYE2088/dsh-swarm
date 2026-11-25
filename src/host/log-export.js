@@ -1,23 +1,27 @@
-// Diagnostic log exporter for both Swarm sessions (Blackboard + all member
-// transcripts) and regular DSH conversations (root session + subagents).
+// AI-first programmatic JSONL forensic log exporter for both Swarm sessions
+// and regular DSH conversations, with automatic compaction epoch file splitting
+// and zero-dependency standard ZIP packaging (`node:zlib`).
 //
 // Strictly English-only and zero external npm dependencies. Reads committed DSH
 // session logs through official Host services (`sessions`, `sessionPersistence`,
 // `sessionQuery`) with graceful fallbacks for in-memory or test hosts.
 
+import zlib from 'node:zlib'
 import { getRoleSpec } from './prompts.js'
 
-export const DIAGNOSTIC_EXPORT_FORMAT = 'dsh-swarm-diagnostic-log/v1'
+export const DIAGNOSTIC_EXPORT_FORMAT = 'dsh-swarm-forensic-log/v2'
 export const DEFAULT_MAX_TOOL_RESULT_CHARS = 4000
 export const COMPACT_MAX_TOOL_ARG_CHARS = 320
 export const COMPACT_MAX_OK_RESULT_CHARS = 280
 export const COMPACT_MAX_ERR_RESULT_CHARS = 2000
+export const COMPACT_MAX_RELAY_CHARS = 600
 
-/** Build a filesystem-safe download filename for a Swarm or conversation diagnostic export. */
+/** Build a filesystem-safe export basename or filename with UTC timestamp. */
 export function safeExportFilename(prefix, id, ext, now = new Date()) {
   const safePrefix = String(prefix || 'dsh-log').replace(/[^A-Za-z0-9_-]/g, '_')
-  const safeId = String(id || 'session').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64) || 'session'
-  const safeExt = ext === 'json' ? 'json' : 'md'
+  const safeId = String(id || 'session').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 48) || 'session'
+  const allowedExts = { zip: 'zip', jsonl: 'jsonl', json: 'json' }
+  const safeExt = allowedExts[ext] || 'zip'
   const pad = n => String(n).padStart(2, '0')
   const stamp = [
     now.getUTCFullYear(),
@@ -31,12 +35,66 @@ export function safeExportFilename(prefix, id, ext, now = new Date()) {
   return `${safePrefix}-${safeId}-${stamp}.${safeExt}`
 }
 
+/** Format an integer token count compactly (e.g. `42.0k`). */
+export function formatCompactTokens(tokens) {
+  const n = Number(tokens)
+  if (!Number.isFinite(n) || n <= 0) return '0'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
+  return String(Math.round(n))
+}
+
 /** Truncate long text cleanly while reporting omitted character count. */
 function truncateText(text, maxChars) {
   const raw = String(text ?? '')
   if (!Number.isFinite(maxChars) || maxChars <= 0 || raw.length <= maxChars) return raw
   const omitted = raw.length - maxChars
-  return `${raw.slice(0, maxChars)}\n... (truncated ${omitted} chars)`
+  return `${raw.slice(0, maxChars)} ... (truncated ${omitted} chars)`
+}
+
+/** Collapse whitespace into a compact single-line preview for timeline/index rows. */
+function compactPreview(text, maxChars = 140) {
+  const oneLine = String(text ?? '').replace(/\s+/g, ' ').trim()
+  if (oneLine.length <= maxChars) return oneLine
+  return `${oneLine.slice(0, maxChars - 3)}...`
+}
+
+/** Sanitize a label into a safe short directory slug. */
+function slugifySegment(raw, maxLen = 28) {
+  const cleaned = String(raw ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, maxLen)
+  return cleaned || 'session'
+}
+
+/** Normalize epoch ms or ISO timestamp into `{ ts, ts_ms }`. */
+function normalizeTime(raw) {
+  if (typeof raw === 'number' && Number.isFinite(raw) && raw > 0) {
+    return { ts: new Date(raw).toISOString(), ts_ms: Math.floor(raw) }
+  }
+  if (typeof raw === 'string' && raw.trim()) {
+    const parsed = Date.parse(raw)
+    if (Number.isFinite(parsed)) {
+      return { ts: new Date(parsed).toISOString(), ts_ms: parsed }
+    }
+    return { ts: raw.trim(), ts_ms: 0 }
+  }
+  return { ts: '', ts_ms: 0 }
+}
+
+/** Classify a DSH `user/message` source so genuine human prompts never mix with repetitive harness snapshots. */
+function classifyUserSource(source) {
+  const src = source && typeof source === 'object' ? source : {}
+  const kind = String(src.kind ?? 'user')
+  const form = String(src.form ?? '')
+  const tag = form ? `${kind}:${form}` : kind
+  if (kind === 'compact-checkpoint') return { category: 'compaction_checkpoint', tag }
+  if (kind === 'user' && form === 'notice') return { category: 'swarm_notice', tag }
+  if (kind === 'user' || kind === 'goal') return { category: 'human', tag }
+  if (kind === 'subagent-settled' || kind === 'agent-message') return { category: 'relay', tag }
+  return { category: 'harness_inject', tag }
 }
 
 /** Extract semantic text, reasoning, tool calls, and attachment descriptors from DSH content blocks. */
@@ -63,9 +121,9 @@ function unpackContentBlocks(content) {
           : JSON.stringify(block.arguments ?? {}),
       })
     } else if (block.type === 'image' && block.attachment) {
-      attachments.push(`[image: ${block.attachment.attachmentId ?? 'unknown'} (${block.attachment.mediaType ?? 'image'})]`)
+      attachments.push({ type: 'image', id: String(block.attachment.attachmentId ?? ''), media_type: String(block.attachment.mediaType ?? '') })
     } else if (block.type === 'file' && block.attachment) {
-      attachments.push(`[file: ${block.attachment.name ?? block.attachment.attachmentId ?? 'unknown'} (${block.attachment.bytes ?? 0}B)]`)
+      attachments.push({ type: 'file', id: String(block.attachment.attachmentId ?? ''), name: String(block.attachment.name ?? ''), bytes: Number(block.attachment.bytes) || 0 })
     }
   }
   return {
@@ -76,30 +134,37 @@ function unpackContentBlocks(content) {
   }
 }
 
-/** Format an integer token count compactly (e.g. `42.0k`). */
-export function formatCompactTokens(tokens) {
-  const n = Number(tokens)
-  if (!Number.isFinite(n) || n <= 0) return '0'
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
-  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`
-  return String(Math.round(n))
-}
-
-/** Format a Unix epoch ms or ISO string cleanly as UTC ISO timestamp. */
-function formatTimestamp(ts) {
-  if (typeof ts === 'number' && Number.isFinite(ts) && ts > 0) {
-    return new Date(ts).toISOString()
+/** Build a new mutable compaction epoch accumulator. */
+function createEpochBucket(epochIndex) {
+  return {
+    epoch: epochIndex,
+    file_name: `epoch-${String(epochIndex).padStart(2, '0')}.jsonl`,
+    start_seq: null,
+    end_seq: null,
+    start_ts: '',
+    start_ts_ms: 0,
+    end_ts: '',
+    end_ts_ms: 0,
+    human_prompts: 0,
+    turns: 0,
+    tool_calls: 0,
+    tool_errors: 0,
+    errors: 0,
+    peak_input_tokens: 0,
+    peak_context_pct: null,
+    first_human_preview: '',
+    summary_preview: '',
+    entries: [],
   }
-  if (typeof ts === 'string' && ts.trim()) return ts.trim()
-  return ''
 }
 
-// #FUNC Transform a raw DSH session header and `SessionEvent[]` log into a clean, stream-stripped diagnostic transcript with real token/context accounting.
-// #NOT  Never embeds raw `assistant/message.data.stream` SSE chunk arrays that inflate exports by orders of magnitude.
-// #EDGE-IN A session with `request/context` (`contextWindow`), `assistant/message` (`usage`, `reasoning`, `stream`), `tool/call`, and errored `tool/result` yields accurate `context_pct`, strips `stream`, and respects `includeReasoning` → test_log_export_normal_conversation_with_subagents_and_usage
-// #WHY  Stripping `data.stream` while preserving `usage`, `contextWindow`, tool arguments/results, and abnormal `turn/end` reasons keeps exports compact enough for human review and cross-AI pathology diagnosis.
+// #FUNC Transform a raw DSH session header and `SessionEvent[]` log into compaction-split JSONL epochs with separated human/relay/harness noise and real token accounting.
+// #NOT  Never embeds raw `assistant/message.data.stream` SSE delta arrays and never mixes `skill-catalog`/`runtime-context` injections into `kind="human"` prompts.
+// #EDGE-IN A single session hitting `compaction/summary` + `compact-checkpoint` splits cleanly into `epoch-00.jsonl` and `epoch-01.jsonl` while omitting harness injections and reasoning by default → test_log_export_normal_conversation_epochs_zip_and_timeline
+// #WHY  Splitting each session at every compaction boundary keeps each JSONL file bounded to one context window so AI investigators jump directly by `{file, line}` without overflowing context.
 export function extractSessionTranscript(header, events, options = {}) {
-  const includeReasoning = options.includeReasoning !== false
+  const includeReasoning = options.includeReasoning === true
+  const includeInjections = options.includeInjections === true
   const detail = options.detail === 'full' ? 'full' : 'compact'
   const explicitCap = options.maxToolResultChars !== undefined ? Number(options.maxToolResultChars) : null
   const maxToolArgChars = explicitCap !== null
@@ -111,6 +176,7 @@ export function extractSessionTranscript(header, events, options = {}) {
   const maxErrResultChars = explicitCap !== null
     ? explicitCap
     : (detail === 'full' ? DEFAULT_MAX_TOOL_RESULT_CHARS : COMPACT_MAX_ERR_RESULT_CHARS)
+  const maxRelayChars = detail === 'full' ? DEFAULT_MAX_TOOL_RESULT_CHARS : COMPACT_MAX_RELAY_CHARS
   const safeEvents = Array.isArray(events) ? events : []
 
   const models = []
@@ -128,18 +194,57 @@ export function extractSessionTranscript(header, events, options = {}) {
   let totalOutputTokens = 0
   let turns = 0
   let steps = 0
+  let humanPromptsCount = 0
   let toolCallsCount = 0
   let toolErrorsCount = 0
   let errorsCount = 0
   let compactionsCount = 0
+  let omittedInjections = 0
+  const omittedBySource = {}
   let labelFromDescriptor = ''
+  let currentTurn = 0
 
   const toolNameByCallId = new Map()
-  const entries = []
+  const epochs = [createEpochBucket(0)]
+  let currentEpoch = epochs[0]
+  let splitCompactionId = null
+
+  const pushEntry = (record, seq, timeObj) => {
+    const line = currentEpoch.entries.length + 1
+    const stamped = {
+      line,
+      epoch: currentEpoch.epoch,
+      ...(seq !== null ? { seq } : {}),
+      ...(timeObj.ts ? { ts: timeObj.ts, ts_ms: timeObj.ts_ms } : {}),
+      ...record,
+    }
+    currentEpoch.entries.push(stamped)
+    if (seq !== null) {
+      if (currentEpoch.start_seq === null) currentEpoch.start_seq = seq
+      currentEpoch.end_seq = seq
+    }
+    if (timeObj.ts_ms > 0) {
+      if (currentEpoch.start_ts_ms === 0) {
+        currentEpoch.start_ts = timeObj.ts
+        currentEpoch.start_ts_ms = timeObj.ts_ms
+      }
+      currentEpoch.end_ts = timeObj.ts
+      currentEpoch.end_ts_ms = timeObj.ts_ms
+    }
+    return stamped
+  }
+
+  const openNextEpochIfNeeded = () => {
+    if (currentEpoch.entries.length === 0) return false
+    const nextBucket = createEpochBucket(epochs.length)
+    epochs.push(nextBucket)
+    currentEpoch = nextBucket
+    return true
+  }
 
   for (const ev of safeEvents) {
     if (!ev || typeof ev !== 'object') continue
-    const ts = formatTimestamp(ev.time)
+    const timeObj = normalizeTime(ev.time)
     const seq = typeof ev.seq === 'number' ? ev.seq : null
     const data = ev.data ?? {}
 
@@ -164,26 +269,117 @@ export function extractSessionTranscript(header, events, options = {}) {
         break
       }
       case 'turn/start': {
-        turns = Math.max(turns + 1, Number(data.turn) || 0)
+        currentTurn = Number(data.turn) || (currentTurn + 1)
+        turns = Math.max(turns + 1, currentTurn)
+        currentEpoch.turns += 1
         break
       }
       case 'step/start': {
         steps += 1
         break
       }
+      case 'compaction/summary': {
+        compactionsCount += 1
+        const prevCtxPct = contextWindow > 0 && lastInputTokens > 0
+          ? Math.round((lastInputTokens / contextWindow) * 1000) / 10
+          : null
+        openNextEpochIfNeeded()
+        splitCompactionId = data.compactionId ?? '__active__'
+        const summaryUnpacked = Array.isArray(data.summary)
+          ? unpackContentBlocks(data.summary).text
+          : (typeof data.summary === 'string' ? data.summary : '')
+        const summaryText = truncateText(summaryUnpacked, maxErrResultChars)
+        if (summaryText) currentEpoch.summary_preview = compactPreview(summaryText, 160)
+        pushEntry({
+          kind: 'compaction',
+          event_type: 'compaction/summary',
+          compaction_id: data.compactionId ?? null,
+          ...(typeof data.shadowedTokenCount === 'number' ? { shadowed_tokens: data.shadowedTokenCount } : {}),
+          ...(prevCtxPct !== null ? { ctx_before_pct: prevCtxPct } : {}),
+          ...(summaryText ? { summary: summaryText } : {}),
+        }, seq, timeObj)
+        break
+      }
+      case 'compaction/end': {
+        if (data.error) {
+          errorsCount += 1
+          currentEpoch.errors += 1
+          pushEntry({
+            kind: 'compaction_error',
+            event_type: 'compaction/end',
+            compaction_id: data.compactionId ?? null,
+            error: String(data.error),
+          }, seq, timeObj)
+        }
+        splitCompactionId = null
+        break
+      }
       case 'user/message': {
         const unpacked = unpackContentBlocks(data.content)
         const src = data.source ?? {}
-        const sourceTag = [src.kind, src.form].filter(Boolean).join(':') || 'user'
-        entries.push({
-          kind: 'user',
-          seq,
-          time: ts,
-          source: sourceTag,
-          ...(typeof src.summary === 'string' && src.summary ? { summary: src.summary } : {}),
+        const { category, tag } = classifyUserSource(src)
+        if (category === 'compaction_checkpoint') {
+          if (!splitCompactionId) {
+            compactionsCount += 1
+            openNextEpochIfNeeded()
+          }
+          const cpText = truncateText(unpacked.text, maxErrResultChars)
+          if (cpText && !currentEpoch.summary_preview) {
+            currentEpoch.summary_preview = compactPreview(cpText, 160)
+          }
+          pushEntry({
+            kind: 'compaction_checkpoint',
+            source: tag,
+            text: cpText,
+          }, seq, timeObj)
+          break
+        }
+        if (category === 'harness_inject') {
+          if (!includeInjections) {
+            omittedInjections += 1
+            omittedBySource[tag] = (omittedBySource[tag] || 0) + 1
+            break
+          }
+          pushEntry({
+            kind: 'harness_inject',
+            source: tag,
+            ...(typeof src.summary === 'string' && src.summary ? { summary: src.summary } : {}),
+            text: truncateText(unpacked.text, maxOkResultChars),
+          }, seq, timeObj)
+          break
+        }
+        if (category === 'relay') {
+          pushEntry({
+            kind: 'relay',
+            source: tag,
+            ...(src.senderSessionId ? { sender_session_id: String(src.senderSessionId) } : {}),
+            ...(typeof src.summary === 'string' && src.summary ? { summary: src.summary } : {}),
+            text: truncateText(unpacked.text, maxRelayChars),
+          }, seq, timeObj)
+          break
+        }
+        if (category === 'swarm_notice') {
+          pushEntry({
+            kind: 'swarm_notice',
+            source: tag,
+            ...(typeof src.summary === 'string' && src.summary ? { summary: src.summary } : {}),
+            text: unpacked.text,
+          }, seq, timeObj)
+          break
+        }
+        // Genuine human prompt!
+        humanPromptsCount += 1
+        currentEpoch.human_prompts += 1
+        if (!currentEpoch.first_human_preview && unpacked.text) {
+          currentEpoch.first_human_preview = compactPreview(unpacked.text, 140)
+        }
+        pushEntry({
+          kind: 'human',
+          turn: currentTurn || null,
+          source: tag,
           text: unpacked.text,
           ...(unpacked.attachments.length > 0 ? { attachments: unpacked.attachments } : {}),
-        })
+        }, seq, timeObj)
         break
       }
       case 'assistant/message': {
@@ -201,42 +397,51 @@ export function extractSessionTranscript(header, events, options = {}) {
           if (inp > 0) {
             lastInputTokens = inp
             if (inp > peakInputTokens) peakInputTokens = inp
+            if (inp > currentEpoch.peak_input_tokens) {
+              currentEpoch.peak_input_tokens = inp
+              if (contextWindow > 0) {
+                currentEpoch.peak_context_pct = Math.round((inp / contextWindow) * 1000) / 10
+              }
+            }
           }
           if (out > 0) totalOutputTokens += out
         }
-        entries.push({
+        const hasVisibleContent = Boolean(unpacked.text)
+          || (includeReasoning && Boolean(unpacked.reasoning))
+          || unpacked.attachments.length > 0
+          || data.interrupted === true
+        if (!hasVisibleContent && unpacked.toolCalls.length > 0) {
+          // Pure tool-dispatch assistant turn without prose: subsequent `tool/call` records carry the exact call details.
+          break
+        }
+        pushEntry({
           kind: 'assistant',
-          seq,
-          time: ts,
-          turn: data.turn ?? null,
+          turn: data.turn ?? currentTurn ?? null,
           step: data.step ?? null,
           model: src.provider && src.model ? `${src.provider}/${src.model}` : (src.model || ''),
-          text: unpacked.text,
+          ...(unpacked.text ? { text: unpacked.text } : {}),
           ...(includeReasoning && unpacked.reasoning ? { reasoning: unpacked.reasoning } : {}),
-          ...(unpacked.toolCalls.length > 0 ? { tool_calls: unpacked.toolCalls } : {}),
           ...(unpacked.attachments.length > 0 ? { attachments: unpacked.attachments } : {}),
           ...(usage ? {
             usage: {
               input_tokens: Number(usage.inputTokens) || 0,
               output_tokens: Number(usage.outputTokens) || 0,
               ...(Number(usage.cacheReadTokens) > 0 ? { cache_read_tokens: Number(usage.cacheReadTokens) } : {}),
-              ...(Number(usage.reasoningTokens) > 0 ? { reasoning_tokens: Number(usage.reasoningTokens) } : {}),
             },
           } : {}),
           ...(data.interrupted === true ? { interrupted: true } : {}),
-        })
+        }, seq, timeObj)
         break
       }
       case 'tool/call': {
         toolCallsCount += 1
+        currentEpoch.tool_calls += 1
         const callId = String(data.callId ?? '')
         const name = String(data.name ?? 'tool')
         if (callId) toolNameByCallId.set(callId, name)
-        entries.push({
+        pushEntry({
           kind: 'tool_call',
-          seq,
-          time: ts,
-          turn: data.turn ?? null,
+          turn: data.turn ?? currentTurn ?? null,
           step: data.step ?? null,
           call_id: callId,
           name,
@@ -244,7 +449,7 @@ export function extractSessionTranscript(header, events, options = {}) {
             typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {}),
             maxToolArgChars,
           ),
-        })
+        }, seq, timeObj)
         break
       }
       case 'tool/result': {
@@ -252,13 +457,14 @@ export function extractSessionTranscript(header, events, options = {}) {
         const callId = String(msg.toolCallId ?? msg.source?.callId ?? '')
         const toolName = toolNameByCallId.get(callId) ?? 'tool'
         const isError = msg.isError === true || Boolean(data.error)
-        if (isError) toolErrorsCount += 1
+        if (isError) {
+          toolErrorsCount += 1
+          currentEpoch.tool_errors += 1
+        }
         const unpacked = unpackContentBlocks(msg.content)
-        entries.push({
+        pushEntry({
           kind: 'tool_result',
-          seq,
-          time: ts,
-          turn: data.turn ?? null,
+          turn: data.turn ?? currentTurn ?? null,
           step: data.step ?? null,
           call_id: callId,
           name: toolName,
@@ -266,38 +472,24 @@ export function extractSessionTranscript(header, events, options = {}) {
           ...(data.error ? { error: data.error } : {}),
           text: truncateText(unpacked.text, isError ? maxErrResultChars : maxOkResultChars),
           ...(unpacked.attachments.length > 0 ? { attachments: unpacked.attachments } : {}),
-        })
+        }, seq, timeObj)
         break
       }
       case 'turn/end': {
         const reason = data.reason ?? { kind: 'completed' }
-        if (reason.kind === 'error') errorsCount += 1
+        if (reason.kind === 'error') {
+          errorsCount += 1
+          currentEpoch.errors += 1
+        }
         if (reason.kind && reason.kind !== 'completed') {
-          entries.push({
+          pushEntry({
             kind: 'turn_end',
-            seq,
-            time: ts,
-            turn: data.turn ?? null,
+            turn: data.turn ?? currentTurn ?? null,
             reason_kind: reason.kind,
             ...(reason.error ? { error: { code: reason.error.code ?? 'ERROR', message: reason.error.message ?? String(reason.error) } } : {}),
             ...(reason.reason ? { cancel_cause: reason.reason } : {}),
-          })
+          }, seq, timeObj)
         }
-        break
-      }
-      case 'compaction/start':
-      case 'compaction/end':
-      case 'compaction/summary': {
-        if (ev.type === 'compaction/start') compactionsCount += 1
-        if (ev.type === 'compaction/end' && data.error) errorsCount += 1
-        entries.push({
-          kind: 'compaction',
-          event_type: ev.type,
-          seq,
-          time: ts,
-          ...(data.turn !== undefined ? { turn: data.turn } : {}),
-          ...(data.error ? { error: String(data.error) } : {}),
-        })
         break
       }
       default:
@@ -311,12 +503,21 @@ export function extractSessionTranscript(header, events, options = {}) {
   const peakContextPct = contextWindow > 0 && peakInputTokens > 0
     ? Math.round((peakInputTokens / contextWindow) * 1000) / 10
     : null
+  const created = normalizeTime(header?.createdAt)
+  const totalEntries = epochs.reduce((sum, ep) => sum + ep.entries.length, 0)
+  const firstTsMs = epochs.find(ep => ep.start_ts_ms > 0)?.start_ts_ms || created.ts_ms
+  const lastTsMs = [...epochs].reverse().find(ep => ep.end_ts_ms > 0)?.end_ts_ms || firstTsMs
 
   return {
     session_id: header?.id ?? options.sessionId ?? '',
     label: options.explicitLabel || labelFromDescriptor || options.label || header?.id || options.sessionId || '',
     cwd: header?.cwd ?? null,
-    created_at: formatTimestamp(header?.createdAt),
+    created_at: created.ts,
+    created_ts_ms: created.ts_ms,
+    start_ts: firstTsMs > 0 ? new Date(firstTsMs).toISOString() : created.ts,
+    start_ts_ms: firstTsMs,
+    end_ts: lastTsMs > 0 ? new Date(lastTsMs).toISOString() : created.ts,
+    end_ts_ms: lastTsMs,
     origin: header?.origin ?? 'main',
     parent_session: header?.parentSession ?? null,
     delegation_depth: header?.delegationDepth ?? 0,
@@ -324,13 +525,17 @@ export function extractSessionTranscript(header, events, options = {}) {
     models,
     stats: {
       raw_events: safeEvents.length,
-      entries: entries.length,
+      entries: totalEntries,
+      epochs: epochs.length,
+      human_prompts: humanPromptsCount,
       turns,
       steps,
       tool_calls: toolCallsCount,
       tool_errors: toolErrorsCount,
       errors: errorsCount,
       compactions: compactionsCount,
+      omitted_injections: omittedInjections,
+      ...(omittedInjections > 0 ? { omitted_by_source: omittedBySource } : {}),
       last_input_tokens: lastInputTokens,
       peak_input_tokens: peakInputTokens,
       total_output_tokens: totalOutputTokens,
@@ -338,7 +543,7 @@ export function extractSessionTranscript(header, events, options = {}) {
       context_pct: contextPct,
       peak_context_pct: peakContextPct,
     },
-    entries,
+    epochs,
   }
 }
 
@@ -350,17 +555,13 @@ async function loadDshSession({ ctx, runtime, sessionId, signal }) {
   const querySvc = ctx?.get?.('sessionQuery')
   const agentsSvc = ctx?.get?.('agents')
 
-  // 1. Flush any live in-memory session so persistence observes the complete prefix.
   const liveSession = sessionsSvc?.get?.(sessionId) ?? agentsSvc?.get?.(sessionId)?.session ?? null
   if (liveSession && typeof sessionsSvc?.flush === 'function') {
     try {
       await sessionsSvc.flush(liveSession)
-    } catch {
-      // Fall through to read whatever is durable or in-memory.
-    }
+    } catch {}
   }
 
-  // 2. Primary durable read through `sessionPersistence.open(id, 'read')` (supports zstd JSONL, SQLite, etc.).
   if (persistenceSvc && typeof persistenceSvc.open === 'function') {
     let handle = null
     try {
@@ -372,10 +573,8 @@ async function loadDshSession({ ctx, runtime, sessionId, signal }) {
         events: Array.isArray(res?.events) ? res.events : [],
         source: 'sessionPersistence',
       }
-    } catch (err) {
-      if (err?.name !== 'SessionPersistenceNotFoundError' && err?.code !== 'SESSION_NOT_FOUND') {
-        // Fall through to query / live fallbacks when storage read fails.
-      }
+    } catch {
+      // Fall through to secondary readers.
     } finally {
       if (handle && typeof handle.close === 'function') {
         try { await handle.close() } catch {}
@@ -383,7 +582,6 @@ async function loadDshSession({ ctx, runtime, sessionId, signal }) {
     }
   }
 
-  // 3. Secondary durable read through `sessionQuery.readSession(id)`.
   if (querySvc && typeof querySvc.readSession === 'function') {
     try {
       const snap = await querySvc.readSession(sessionId)
@@ -395,12 +593,9 @@ async function loadDshSession({ ctx, runtime, sessionId, signal }) {
           source: 'sessionQuery',
         }
       }
-    } catch {
-      // Fall through to live in-memory session.
-    }
+    } catch {}
   }
 
-  // 4. Live in-memory Session snapshot or runtime ring buffer fallback.
   if (liveSession) {
     const events = typeof liveSession.snapshotEvents === 'function'
       ? liveSession.snapshotEvents()
@@ -452,11 +647,17 @@ async function collectDescendantSessionIds({ ctx, sessionId, signal }) {
   }
 }
 
-// #FUNC Collect a complete diagnostic log bundle for either a Swarm (blackboard + roster + all member sessions) or a regular DSH conversation (root session + native subagents).
-// #NOT  Never falls back to an unrelated Swarm when exporting a normal non-Swarm conversation.
-// #EDGE-IN Exporting a normal conversation while an unrelated Swarm exists on disk returns `mode: "session"` with only that conversation and its own subagents → test_log_export_normal_conversation_with_subagents_and_usage
-// #EDGE-IN Exporting from a Swarm member's session ID resolves the owning Swarm and bundles the blackboard plus coordinator and member transcripts → test_log_export_swarm_blackboard_members_and_context_telemetry
-// #WHY  Strict `resolveSwarmId(sessionId, { fallbackLatest: false })` prevents cross-session contamination while sharing one unified exporter for Swarm and regular chats.
+/** Serialize an array of objects as newline-terminated JSONL. */
+function toJsonl(records) {
+  if (!Array.isArray(records) || records.length === 0) return ''
+  return `${records.map(r => JSON.stringify(r)).join('\n')}\n`
+}
+
+// #FUNC Collect a complete AI-first programmatic forensic bundle (`manifest.json`, chronological `timeline.jsonl` with `{file, line}` pointers, `swarm/board.jsonl`, and compaction-split `sessions/*/epoch-XX.jsonl` files).
+// #NOT  Never falls back to an unrelated Swarm when exporting a normal non-Swarm conversation, and never merges multiple compaction epochs into one giant file.
+// #EDGE-IN Exporting a normal conversation with a compaction event and native subagent splits main into `epoch-00.jsonl` + `epoch-01.jsonl` and populates `timeline.jsonl` with exact `{file, line}` jump pointers → test_log_export_normal_conversation_epochs_zip_and_timeline
+// #EDGE-IN Exporting a Swarm preserves chronological multi-agent spawn/board/model_switch/kill choreography in `timeline.jsonl` alongside `swarm/board.jsonl` and per-member epoch files → test_log_export_swarm_blackboard_members_and_context_telemetry
+// #WHY  Combining a tiny `manifest.json`, chronological `timeline.jsonl` pointers, and compaction-split JSONL files lets an AI audit multi-day 100+ subagent sessions programmatically without exploding context.
 export async function collectDiagnosticExport({
   ctx,
   store,
@@ -465,7 +666,8 @@ export async function collectDiagnosticExport({
   swarmId = '',
   detail = 'compact',
   includeSubagents = true,
-  includeReasoning = true,
+  includeReasoning = false,
+  includeInjections = false,
   maxToolResultChars,
   signal,
 } = {}) {
@@ -487,10 +689,11 @@ export async function collectDiagnosticExport({
   }
 
   const exportedAt = new Date().toISOString()
-  const sessionsOut = []
+  const sessionsRaw = []
   const seenSessionIds = new Set()
+  let subIdx = 0
 
-  const addSessionTranscript = async (sid, meta = {}) => {
+  const addSession = async (sid, meta = {}) => {
     if (!sid || seenSessionIds.has(sid)) return null
     seenSessionIds.add(sid)
     const loaded = await loadDshSession({ ctx, runtime, sessionId: sid, signal })
@@ -500,9 +703,21 @@ export async function collectDiagnosticExport({
       label: meta.label,
       detail: effectiveDetail,
       includeReasoning,
+      includeInjections,
       ...(maxToolResultChars !== undefined ? { maxToolResultChars } : {}),
     })
+    let sessionKey = 'main'
+    let dirName = 'main'
+    if (!meta.isRoot) {
+      subIdx += 1
+      const num = `S${String(subIdx).padStart(3, '0')}`
+      sessionKey = num
+      const slug = slugifySegment(meta.memberName || transcript.label || sid)
+      dirName = `${num}-${slug}`
+    }
     const entry = {
+      key: sessionKey,
+      dir: `sessions/${dirName}`,
       ...transcript,
       found: loaded.found,
       source: loaded.source,
@@ -510,11 +725,12 @@ export async function collectDiagnosticExport({
       ...(meta.role ? { role: meta.role } : {}),
       ...(meta.killed !== undefined ? { killed: meta.killed } : {}),
     }
-    sessionsOut.push(entry)
+    sessionsRaw.push(entry)
     return entry
   }
 
   let swarmSection = null
+  const memberKeyByName = new Map()
   if (mode === 'swarm') {
     const { events, projection } = store.projectState(resolvedSwarmId)
     const membersMap = store.readMembers(resolvedSwarmId)
@@ -554,6 +770,33 @@ export async function collectDiagnosticExport({
       })
     }
 
+    const coordRow = roster.find(r => r.name === 'coordinator')
+    await addSession(coordRow?.session_id || resolvedSwarmId, {
+      isRoot: true,
+      explicitLabel: '@coordinator (coordinator)',
+      memberName: 'coordinator',
+      role: 'coordinator',
+      killed: false,
+    })
+    memberKeyByName.set('coordinator', { key: 'main', dir: 'sessions/main' })
+
+    if (includeSubagents) {
+      for (const row of roster) {
+        if (row.name === 'coordinator' || !row.session_id) continue
+        const s = await addSession(row.session_id, {
+          explicitLabel: `@${row.name} (${row.role})`,
+          memberName: row.name,
+          role: row.role,
+          killed: row.killed,
+        })
+        if (s) memberKeyByName.set(row.name, { key: s.key, dir: s.dir })
+      }
+      const extraDescendants = await collectDescendantSessionIds({ ctx, sessionId: resolvedSwarmId, signal })
+      for (const childId of extraDescendants) {
+        await addSession(childId, { label: `subagent:${childId}` })
+      }
+    }
+
     const domainEvents = events.filter(ev => ev && ev.type !== 'state.checkpoint')
     swarmSection = {
       swarm: projection.swarm,
@@ -561,255 +804,416 @@ export async function collectDiagnosticExport({
       plan: projection.plan,
       watchdog,
       active_rejections: activeRejections,
-      roster,
+      board_file: 'swarm/board.jsonl',
+      roster: roster.map(r => ({
+        ...r,
+        session_key: memberKeyByName.get(r.name)?.key ?? null,
+        session_dir: memberKeyByName.get(r.name)?.dir ?? null,
+      })),
       events: domainEvents,
     }
-
-    // Load Coordinator session first, then all Swarm members, then any extra native subagents.
-    const coordRow = roster.find(r => r.name === 'coordinator')
-    await addSessionTranscript(coordRow?.session_id || resolvedSwarmId, {
-      explicitLabel: '@coordinator (coordinator)',
-      memberName: 'coordinator',
-      role: 'coordinator',
-      killed: false,
-    })
-
-    if (includeSubagents) {
-      for (const row of roster) {
-        if (row.name === 'coordinator' || !row.session_id) continue
-        await addSessionTranscript(row.session_id, {
-          explicitLabel: `@${row.name} (${row.role})`,
-          memberName: row.name,
-          role: row.role,
-          killed: row.killed,
-        })
-      }
-      const extraDescendants = await collectDescendantSessionIds({ ctx, sessionId: resolvedSwarmId, signal })
-      for (const childId of extraDescendants) {
-        await addSessionTranscript(childId, { label: `subagent:${childId}` })
-      }
-    }
   } else {
-    const rootEntry = await addSessionTranscript(rootSessionId, { label: `main:${rootSessionId}` })
+    const rootEntry = await addSession(rootSessionId, { isRoot: true, label: `main:${rootSessionId}` })
     if (!rootEntry || !rootEntry.found) {
       return { ok: false, status: 404, error: `Session "${rootSessionId}" not found.` }
     }
     if (includeSubagents) {
       const descendants = await collectDescendantSessionIds({ ctx, sessionId: rootSessionId, signal })
       for (const childId of descendants) {
-        await addSessionTranscript(childId, { label: `subagent:${childId}` })
+        await addSession(childId, { label: `subagent:${childId}` })
       }
     }
   }
 
-  const totals = {
-    sessions: sessionsOut.length,
-    sessions_with_transcript: sessionsOut.filter(s => s.found).length,
-    turns: sessionsOut.reduce((sum, s) => sum + (s.stats?.turns ?? 0), 0),
-    tool_calls: sessionsOut.reduce((sum, s) => sum + (s.stats?.tool_calls ?? 0), 0),
-    tool_errors: sessionsOut.reduce((sum, s) => sum + (s.stats?.tool_errors ?? 0), 0),
-    errors: sessionsOut.reduce((sum, s) => sum + (s.stats?.errors ?? 0), 0),
-    compactions: sessionsOut.reduce((sum, s) => sum + (s.stats?.compactions ?? 0), 0),
+  // Build chronological `timeline.jsonl`, file list, and compact `manifest.json` index.
+  const files = []
+  const timeline = []
+  let timelineOrder = 0
+  const pushTimeline = (tsMs, rec) => {
+    timelineOrder += 1
+    const norm = normalizeTime(tsMs)
+    timeline.push({
+      _order: timelineOrder,
+      ts: norm.ts,
+      ts_ms: norm.ts_ms,
+      ...rec,
+    })
   }
+
+  // 1. Swarm board.jsonl + chronological multi-agent lifecycle & communication timeline
+  let boardJsonl = ''
+  if (swarmSection) {
+    const boardRecords = []
+    for (let i = 0; i < swarmSection.events.length; i += 1) {
+      const ev = swarmSection.events[i]
+      const boardLine = i + 1
+      const norm = normalizeTime(ev.ts_ms)
+      const p = ev.payload ?? {}
+      const boardRow = {
+        line: boardLine,
+        offset: ev.offset ?? i,
+        seq: ev.seq ?? p.seq ?? 0,
+        ts: norm.ts,
+        ts_ms: norm.ts_ms,
+        type: ev.type,
+        actor: ev.actor ?? p.agent ?? 'system',
+        ...p,
+      }
+      boardRecords.push(boardRow)
+
+      if (ev.type === 'board.post') {
+        pushTimeline(norm.ts_ms, {
+          type: 'board.post',
+          seq: p.seq ?? ev.seq ?? 0,
+          agent: p.agent || ev.actor || 'system',
+          kind: p.kind || 'post',
+          ...(p.verdict ? { verdict: p.verdict } : {}),
+          mentions: Array.isArray(p.mentions) ? p.mentions : [],
+          title: p.title || compactPreview(p.text, 90),
+          board_file: 'swarm/board.jsonl',
+          board_line: boardLine,
+        })
+      } else if (ev.type === 'member.spawn') {
+        const ref = memberKeyByName.get(p.name)
+        pushTimeline(norm.ts_ms, {
+          type: 'swarm.spawn',
+          agent: p.name,
+          role: p.role,
+          model: `${p.applied_provider || p.provider || 'inherit'}/${p.applied_model || p.model || 'inherit'}`,
+          workspace: p.workspace_mode || 'inherit',
+          ...(ref ? { session_key: ref.key, file: `${ref.dir}/epoch-00.jsonl` } : {}),
+          board_file: 'swarm/board.jsonl',
+          board_line: boardLine,
+        })
+      } else if (ev.type === 'member.kill') {
+        pushTimeline(norm.ts_ms, {
+          type: 'swarm.kill',
+          agent: p.name,
+          ...(p.handover_to ? { handover_to: p.handover_to } : {}),
+          ...(p.reason ? { reason: p.reason } : {}),
+          board_file: 'swarm/board.jsonl',
+          board_line: boardLine,
+        })
+      } else if (ev.type === 'member.model_switch') {
+        pushTimeline(norm.ts_ms, {
+          type: 'swarm.model_switch',
+          agent: p.name,
+          to: `${p.applied_provider || ''}/${p.applied_model || ''}`,
+          ...(p.reason ? { reason: p.reason } : {}),
+          board_file: 'swarm/board.jsonl',
+          board_line: boardLine,
+        })
+      } else if (ev.type === 'swarm.init' || ev.type === 'plan.update' || ev.type === 'swarm.done') {
+        pushTimeline(norm.ts_ms, {
+          type: ev.type,
+          actor: ev.actor || 'coordinator',
+          ...(p.title ? { title: p.title } : {}),
+          ...(p.goal ? { goal: compactPreview(p.goal, 120) } : {}),
+          ...(p.status ? { status: p.status } : {}),
+          board_file: 'swarm/board.jsonl',
+          board_line: boardLine,
+        })
+      }
+    }
+    boardJsonl = toJsonl(boardRecords)
+    files.push({ path: 'swarm/board.jsonl', content: boardJsonl })
+  }
+
+  // 2. Per-session compaction-split `epoch-XX.jsonl` files + exact `{file, line}` timeline pointers
+  const toolErrorCountsByName = {}
+  const sessionManifestRows = []
+
+  for (const s of sessionsRaw) {
+    const epochManifestRows = []
+    if (s.key !== 'main') {
+      pushTimeline(s.start_ts_ms || s.created_ts_ms, {
+        type: 'session.start',
+        session_key: s.key,
+        session_id: s.session_id,
+        label: s.label,
+        ...(s.role ? { role: s.role } : {}),
+        ...(s.models.length > 0 ? { model: s.models[0] } : {}),
+        dir: s.dir,
+        file: `${s.dir}/${s.epochs[0]?.file_name || 'epoch-00.jsonl'}`,
+      })
+    }
+
+    for (const ep of s.epochs) {
+      const filePath = `${s.dir}/${ep.file_name}`
+      const jsonlText = toJsonl(ep.entries)
+      files.push({ path: filePath, content: jsonlText })
+
+      epochManifestRows.push({
+        epoch: ep.epoch,
+        file: filePath,
+        lines: ep.entries.length,
+        bytes: Buffer.byteLength(jsonlText, 'utf8'),
+        start_seq: ep.start_seq,
+        end_seq: ep.end_seq,
+        start_ts: ep.start_ts,
+        end_ts: ep.end_ts,
+        human_prompts: ep.human_prompts,
+        turns: ep.turns,
+        tool_calls: ep.tool_calls,
+        tool_errors: ep.tool_errors,
+        errors: ep.errors,
+        peak_context_pct: ep.peak_context_pct,
+        ...(ep.first_human_preview ? { first_human_preview: ep.first_human_preview } : {}),
+        ...(ep.summary_preview ? { compaction_summary_preview: ep.summary_preview } : {}),
+      })
+
+      for (const entry of ep.entries) {
+        if (entry.kind === 'human') {
+          pushTimeline(entry.ts_ms, {
+            type: 'human.prompt',
+            session_key: s.key,
+            epoch: ep.epoch,
+            turn: entry.turn ?? null,
+            seq: entry.seq ?? null,
+            file: filePath,
+            line: entry.line,
+            preview: compactPreview(entry.text, 140),
+          })
+        } else if (entry.kind === 'compaction' || (entry.kind === 'compaction_checkpoint' && ep.epoch > 0 && entry.line === 1)) {
+          pushTimeline(entry.ts_ms, {
+            type: 'compaction',
+            session_key: s.key,
+            from_epoch: Math.max(0, ep.epoch - 1),
+            to_epoch: ep.epoch,
+            seq: entry.seq ?? null,
+            ...(entry.shadowed_tokens !== undefined ? { shadowed_tokens: entry.shadowed_tokens } : {}),
+            ...(entry.ctx_before_pct !== undefined ? { ctx_before_pct: entry.ctx_before_pct } : {}),
+            file: filePath,
+            line: entry.line,
+          })
+        } else if (entry.kind === 'turn_end') {
+          pushTimeline(entry.ts_ms, {
+            type: 'error.turn',
+            session_key: s.key,
+            epoch: ep.epoch,
+            turn: entry.turn ?? null,
+            seq: entry.seq ?? null,
+            reason: entry.reason_kind,
+            ...(entry.error ? { code: entry.error.code, message: compactPreview(entry.error.message, 120) } : {}),
+            file: filePath,
+            line: entry.line,
+          })
+        } else if (entry.kind === 'tool_result' && entry.is_error) {
+          toolErrorCountsByName[entry.name] = (toolErrorCountsByName[entry.name] || 0) + 1
+          pushTimeline(entry.ts_ms, {
+            type: 'error.tool',
+            session_key: s.key,
+            epoch: ep.epoch,
+            turn: entry.turn ?? null,
+            seq: entry.seq ?? null,
+            tool: entry.name,
+            ...(entry.error?.code ? { code: entry.error.code } : {}),
+            preview: compactPreview(entry.error?.reason || entry.text, 120),
+            file: filePath,
+            line: entry.line,
+          })
+        }
+      }
+    }
+
+    if (s.key !== 'main' && s.end_ts_ms > 0) {
+      pushTimeline(s.end_ts_ms, {
+        type: 'session.end',
+        session_key: s.key,
+        label: s.label,
+        turns: s.stats.turns,
+        tool_calls: s.stats.tool_calls,
+        tool_errors: s.stats.tool_errors,
+        errors: s.stats.errors,
+        ...(s.stats.peak_context_pct !== null ? { peak_context_pct: s.stats.peak_context_pct } : {}),
+      })
+    }
+
+    sessionManifestRows.push({
+      key: s.key,
+      session_id: s.session_id,
+      label: s.label,
+      ...(s.member_name ? { member_name: s.member_name } : {}),
+      ...(s.role ? { role: s.role } : {}),
+      ...(s.killed !== undefined ? { killed: s.killed } : {}),
+      origin: s.origin,
+      found: s.found,
+      source: s.source,
+      cwd: s.cwd,
+      models: s.models,
+      dir: s.dir,
+      stats: s.stats,
+      epochs: epochManifestRows,
+    })
+  }
+
+  // Sort timeline strictly chronologically (preserving stable order on ties) and strip internal `_order`.
+  timeline.sort((a, b) => (a.ts_ms - b.ts_ms) || (a._order - b._order))
+  const cleanTimeline = timeline.map((item, idx) => {
+    const copy = { timeline_line: idx + 1, ...item }
+    delete copy._order
+    return copy
+  })
+  const timelineJsonl = toJsonl(cleanTimeline)
+
+  const topErrorTools = Object.entries(toolErrorCountsByName)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([tool, count]) => ({ tool, count }))
+
+  const totals = {
+    sessions: sessionsRaw.length,
+    sessions_with_transcript: sessionsRaw.filter(s => s.found).length,
+    epochs: sessionsRaw.reduce((sum, s) => sum + s.epochs.length, 0),
+    timeline_events: cleanTimeline.length,
+    human_prompts: sessionsRaw.reduce((sum, s) => sum + (s.stats?.human_prompts ?? 0), 0),
+    turns: sessionsRaw.reduce((sum, s) => sum + (s.stats?.turns ?? 0), 0),
+    tool_calls: sessionsRaw.reduce((sum, s) => sum + (s.stats?.tool_calls ?? 0), 0),
+    tool_errors: sessionsRaw.reduce((sum, s) => sum + (s.stats?.tool_errors ?? 0), 0),
+    errors: sessionsRaw.reduce((sum, s) => sum + (s.stats?.errors ?? 0), 0),
+    compactions: sessionsRaw.reduce((sum, s) => sum + (s.stats?.compactions ?? 0), 0),
+    omitted_injections: sessionsRaw.reduce((sum, s) => sum + (s.stats?.omitted_injections ?? 0), 0),
+  }
+
+  const rootCwd = (swarmSection?.swarm?.project_root) || sessionsRaw[0]?.cwd || null
+  const manifest = {
+    format: DIAGNOSTIC_EXPORT_FORMAT,
+    ai_guide: [
+      '1. Inspect manifest.json for session/epoch file paths, compaction counts, peak context %, and Swarm roster.',
+      '2. Filter timeline.jsonl programmatically by type (human.prompt | board.post | swarm.spawn | swarm.kill | compaction | session.start | error.turn | error.tool) or ts_ms window.',
+      '3. Jump directly to the exact {file, line} in sessions/<key>/epoch-XX.jsonl or swarm/board.jsonl instead of loading all files at once.',
+    ],
+    exported_at: exportedAt,
+    mode,
+    root_session_id: rootSessionId,
+    requested_session_id: reqSessionId || rootSessionId,
+    cwd: rootCwd,
+    options: {
+      detail: effectiveDetail,
+      include_subagents: includeSubagents,
+      include_reasoning: includeReasoning,
+      include_injections: includeInjections,
+      ...(maxToolResultChars !== undefined ? { max_tool_result_chars: maxToolResultChars } : {}),
+    },
+    totals,
+    anomalies: {
+      top_error_tools: topErrorTools,
+      high_tool_sessions: sessionManifestRows
+        .filter(s => (s.stats?.tool_calls ?? 0) >= 80)
+        .map(s => ({ key: s.key, label: s.label, tool_calls: s.stats.tool_calls, tool_errors: s.stats.tool_errors })),
+      ...(swarmSection ? { active_rejections: swarmSection.active_rejections } : {}),
+    },
+    ...(swarmSection ? {
+      swarm: {
+        title: swarmSection.swarm?.title || '',
+        status: swarmSection.swarm?.status || 'UNKNOWN',
+        head_seq: swarmSection.head_seq,
+        concurrency_limit: swarmSection.swarm?.concurrency_limit ?? null,
+        plan: swarmSection.plan,
+        watchdog: swarmSection.watchdog,
+        active_rejections: swarmSection.active_rejections,
+        board_file: swarmSection.board_file,
+        roster: swarmSection.roster,
+      },
+    } : {}),
+    sessions: sessionManifestRows,
+  }
+
+  const orderedFiles = [
+    { path: 'manifest.json', content: `${JSON.stringify(manifest, null, 2)}\n` },
+    { path: 'timeline.jsonl', content: timelineJsonl },
+    ...files,
+  ]
 
   return {
     ok: true,
     status: 200,
     bundle: {
       format: DIAGNOSTIC_EXPORT_FORMAT,
-      exported_at: exportedAt,
       mode,
       root_session_id: rootSessionId,
-      requested_session_id: reqSessionId || rootSessionId,
-      options: {
-        detail: effectiveDetail,
-        include_subagents: includeSubagents,
-        include_reasoning: includeReasoning,
-        ...(maxToolResultChars !== undefined ? { max_tool_result_chars: maxToolResultChars } : {}),
-      },
-      totals,
-      ...(swarmSection ? { swarm: swarmSection } : {}),
-      sessions: sessionsOut,
+      manifest,
+      timeline: cleanTimeline,
+      timeline_jsonl: timelineJsonl,
+      files: orderedFiles,
     },
   }
 }
 
-/** Render a diagnostic log bundle as clean, AI- and human-readable Markdown. */
-export function formatDiagnosticMarkdown(bundle) {
-  if (!bundle || typeof bundle !== 'object') return ''
-  const lines = []
-  const isSwarm = bundle.mode === 'swarm' && bundle.swarm
-  const rootSession = Array.isArray(bundle.sessions) && bundle.sessions.length > 0 ? bundle.sessions[0] : null
-  const title = isSwarm
-    ? `Swarm Diagnostic Log: ${bundle.swarm.swarm?.title || bundle.root_session_id}`
-    : `Session Diagnostic Log: ${bundle.root_session_id}`
+// #FUNC Build a standards-compliant PKZIP archive (`Buffer`) from `{ path, content }` entries using only Node built-in `zlib.crc32` and `zlib.deflateRawSync`.
+// #NOT  Requires zero external npm dependencies (`fflate`/`jszip` not needed) and never leaks unprefixed paths when `rootFolder` is supplied.
+// #EDGE-IN Generated ZIP archive passes Python `zipfile.ZipFile.testzip()` integrity verification with UTF-8 filenames and multiple epoch JSONL files → test_log_export_normal_conversation_epochs_zip_and_timeline
+// #WHY  Using `zlib.deflateRawSync` and `zlib.crc32` keeps `dsh-swarm` 100% zero-dependency so remote `dsh plugin add` installs work out-of-the-box without build steps.
+export function buildZipArchive(entries, rootFolder = '') {
+  const prefix = rootFolder ? `${String(rootFolder).replace(/[\\/]+$/g, '')}/` : ''
+  const localParts = []
+  const centralParts = []
+  let offset = 0
 
-  lines.push(`# ${title}`)
-  lines.push('')
-  lines.push('| Field | Value |')
-  lines.push('| --- | --- |')
-  lines.push(`| Format | \`${bundle.format}\` |`)
-  lines.push(`| Mode | \`${bundle.mode}\` |`)
-  lines.push(`| Root Session | \`${bundle.root_session_id}\` |`)
-  if (bundle.requested_session_id && bundle.requested_session_id !== bundle.root_session_id) {
-    lines.push(`| Requested Session | \`${bundle.requested_session_id}\` |`)
-  }
-  const cwd = (isSwarm ? bundle.swarm.swarm?.project_root : null) || rootSession?.cwd || '-'
-  lines.push(`| CWD / Project Root | \`${cwd}\` |`)
-  lines.push(`| Exported At | ${bundle.exported_at} |`)
-  const t = bundle.totals ?? {}
-  lines.push(`| Sessions Included | ${t.sessions ?? 0} (${t.sessions_with_transcript ?? 0} with transcript) |`)
-  lines.push(`| Totals | turns=${t.turns ?? 0}, tool_calls=${t.tool_calls ?? 0}, tool_errors=${t.tool_errors ?? 0}, errors=${t.errors ?? 0}, compactions=${t.compactions ?? 0} |`)
-  lines.push('')
+  for (const entry of entries ?? []) {
+    const relPath = String(entry.path ?? '').replace(/^\/+/, '').replace(/\\/g, '/')
+    if (!relPath) continue
+    const nameBuf = Buffer.from(`${prefix}${relPath}`, 'utf8')
+    const rawBuf = Buffer.isBuffer(entry.content)
+      ? entry.content
+      : Buffer.from(String(entry.content ?? ''), 'utf8')
+    const crc = zlib.crc32(rawBuf) >>> 0
+    const deflated = rawBuf.length > 0 ? zlib.deflateRawSync(rawBuf, { level: 6 }) : rawBuf
+    const useDeflate = rawBuf.length > 0 && deflated.length < rawBuf.length
+    const method = useDeflate ? 8 : 0
+    const payload = useDeflate ? deflated : rawBuf
+    const flags = 0x0800 // UTF-8 filename encoding
+    const modTime = 0
+    const modDate = 0x5921 // 2024-09-01 valid DOS date
 
-  if (isSwarm) {
-    const sw = bundle.swarm
-    lines.push('## Swarm Overview & Roster')
-    lines.push('')
-    lines.push(`- **Status**: \`${sw.swarm?.status || 'UNKNOWN'}\` | **Head Floor**: \`#${sw.head_seq ?? 0}\` | **Concurrency Limit**: ${sw.swarm?.concurrency_limit ?? '-'}`)
-    if (sw.active_rejections && sw.active_rejections.length > 0) {
-      lines.push(`- **Active Merge-Gate Rejections (${sw.active_rejections.length})**: ${sw.active_rejections.map(r => `#${r.seq} @${r.reviewer} (x${r.consecutive_rejects ?? 1}): ${r.title}`).join('; ')}`)
-    }
-    if (sw.plan?.goal) {
-      lines.push(`- **Plan Goal**: ${sw.plan.goal}`)
-    }
-    lines.push('')
-    if (Array.isArray(sw.roster) && sw.roster.length > 0) {
-      lines.push('| Member | Role | Model | Workspace | Status | Turns | Tools | Context | Last Post | Error |')
-      lines.push('| --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- |')
-      for (const r of sw.roster) {
-        const ctxStr = r.context_window > 0 && r.last_input_tokens > 0
-          ? `${formatCompactTokens(r.last_input_tokens)}/${formatCompactTokens(r.context_window)} (${Math.round((r.last_input_tokens / r.context_window) * 100)}%)`
-          : '-'
-        const errStr = r.last_error ? `${r.last_error.code}: ${r.last_error.message}`.replace(/\|/g, '/') : '-'
-        lines.push(`| @${r.name} | ${r.role}${r.can_block_merge ? ':gate' : ''} | ${r.applied_provider}/${r.applied_model} | ${r.workspace_mode} | ${r.status}${r.killed ? ' (killed)' : ''} | ${r.turn_count} | ${r.tool_call_count} | ${ctxStr} | #${r.last_post_seq} | ${errStr} |`)
-      }
-      lines.push('')
-    }
+    const localHeader = Buffer.alloc(30)
+    localHeader.writeUInt32LE(0x04034b50, 0)
+    localHeader.writeUInt16LE(20, 4)
+    localHeader.writeUInt16LE(flags, 6)
+    localHeader.writeUInt16LE(method, 8)
+    localHeader.writeUInt16LE(modTime, 10)
+    localHeader.writeUInt16LE(modDate, 12)
+    localHeader.writeUInt32LE(crc, 14)
+    localHeader.writeUInt32LE(payload.length, 18)
+    localHeader.writeUInt32LE(rawBuf.length, 22)
+    localHeader.writeUInt16LE(nameBuf.length, 26)
+    localHeader.writeUInt16LE(0, 28)
 
-    lines.push('## Swarm Blackboard Timeline (`events.jsonl`)')
-    lines.push('')
-    for (const ev of sw.events ?? []) {
-      const timeStr = formatTimestamp(ev.ts_ms)
-      if (ev.type === 'board.post') {
-        const p = ev.payload ?? {}
-        const mentionsStr = Array.isArray(p.mentions) && p.mentions.length > 0
-          ? ` -> ${p.mentions.map(m => '@' + m).join(' ')}`
-          : ''
-        const verdictStr = p.verdict ? ` [verdict=${p.verdict}]` : ''
-        const chStr = p.channel && p.channel !== 'main' ? ` #${p.channel}` : ''
-        lines.push(`### #${p.seq ?? ev.seq} @${p.agent || ev.actor} (${p.kind || 'post'}${chStr})${verdictStr}${mentionsStr}`)
-        lines.push(`*${timeStr}*${p.title ? ` — **${p.title}**` : ''}`)
-        lines.push('')
-        lines.push(String(p.text ?? '').trim())
-        lines.push('')
-      } else if (ev.type === 'member.spawn' || ev.type === 'member.kill' || ev.type === 'member.model_switch' || ev.type === 'swarm.done' || ev.type === 'plan.update') {
-        const p = ev.payload ?? {}
-        const summary = ev.type === 'member.spawn'
-          ? `spawned @${p.name} (${p.role}, ${p.applied_provider || p.provider || 'inherit'}/${p.applied_model || p.model || 'inherit'}, ws=${p.workspace_mode || 'inherit'})`
-          : ev.type === 'member.kill'
-            ? `retired @${p.name}${p.handover_to ? ' -> @' + p.handover_to : ''}${p.reason ? ' (' + p.reason + ')' : ''}`
-            : ev.type === 'member.model_switch'
-              ? `switched @${p.name} to ${p.applied_provider}/${p.applied_model} (${p.reason || ''})`
-              : ev.type === 'plan.update'
-                ? `updated plan: ${p.goal || ''}`
-                : `closed swarm (${p.status || 'DONE'})`
-        lines.push(`- **[${ev.type}]** (${timeStr}, seq #${ev.seq ?? 0}, by @${ev.actor || 'system'}): ${summary}`)
-      }
-    }
-    lines.push('')
+    localParts.push(localHeader, nameBuf, payload)
+
+    const centralHeader = Buffer.alloc(46)
+    centralHeader.writeUInt32LE(0x02014b50, 0)
+    centralHeader.writeUInt16LE(0x0314, 4)
+    centralHeader.writeUInt16LE(20, 6)
+    centralHeader.writeUInt16LE(flags, 8)
+    centralHeader.writeUInt16LE(method, 10)
+    centralHeader.writeUInt16LE(modTime, 12)
+    centralHeader.writeUInt16LE(modDate, 14)
+    centralHeader.writeUInt32LE(crc, 16)
+    centralHeader.writeUInt32LE(payload.length, 20)
+    centralHeader.writeUInt32LE(rawBuf.length, 24)
+    centralHeader.writeUInt16LE(nameBuf.length, 28)
+    centralHeader.writeUInt16LE(0, 30)
+    centralHeader.writeUInt16LE(0, 32)
+    centralHeader.writeUInt16LE(0, 34)
+    centralHeader.writeUInt16LE(0, 36)
+    centralHeader.writeUInt32LE(0, 38)
+    centralHeader.writeUInt32LE(offset, 42)
+
+    centralParts.push(centralHeader, nameBuf)
+    offset += localHeader.length + nameBuf.length + payload.length
   }
 
-  lines.push('## Session Transcripts')
-  lines.push('')
-  for (const s of bundle.sessions ?? []) {
-    const st = s.stats ?? {}
-    const ctxNote = st.context_window > 0 && st.last_input_tokens > 0
-      ? ` | ctx=${formatCompactTokens(st.last_input_tokens)}/${formatCompactTokens(st.context_window)} (${st.context_pct}%${st.peak_context_pct && st.peak_context_pct !== st.context_pct ? ', peak ' + st.peak_context_pct + '%' : ''})`
-      : (st.last_input_tokens > 0 ? ` | last_in=${formatCompactTokens(st.last_input_tokens)}` : '')
-    const modelNote = Array.isArray(s.models) && s.models.length > 0 ? ` | models=${s.models.join(', ')}` : ''
-    lines.push(`### Session: ${s.label || s.session_id}`)
-    lines.push(`- **ID**: \`${s.session_id}\` | **Origin**: \`${s.origin}\` | **Source**: \`${s.source}\`${modelNote}${ctxNote}`)
-    lines.push(`- **Stats**: turns=${st.turns ?? 0}, steps=${st.steps ?? 0}, tool_calls=${st.tool_calls ?? 0}, tool_errors=${st.tool_errors ?? 0}, errors=${st.errors ?? 0}, compactions=${st.compactions ?? 0}`)
-    lines.push('')
+  const centralDirBuf = Buffer.concat(centralParts)
+  const eocd = Buffer.alloc(22)
+  eocd.writeUInt32LE(0x06054b50, 0)
+  eocd.writeUInt16LE(0, 4)
+  eocd.writeUInt16LE(0, 6)
+  eocd.writeUInt16LE(centralParts.length / 2, 8)
+  eocd.writeUInt16LE(centralParts.length / 2, 10)
+  eocd.writeUInt32LE(centralDirBuf.length, 12)
+  eocd.writeUInt32LE(offset, 16)
+  eocd.writeUInt16LE(0, 20)
 
-    if (!s.found || !Array.isArray(s.entries) || s.entries.length === 0) {
-      lines.push(`*(No transcript entries recorded for this session.)*`)
-      lines.push('')
-      continue
-    }
-
-    for (const entry of s.entries) {
-      const tsPrefix = entry.time ? `[${entry.time.slice(11, 19)}] ` : ''
-      if (entry.kind === 'user') {
-        const tag = entry.source && entry.source !== 'user' ? ` (${entry.source}${entry.summary ? ': ' + entry.summary : ''})` : ''
-        lines.push(`#### ${tsPrefix}USER${tag}`)
-        if (entry.text) lines.push(entry.text)
-        if (entry.attachments) lines.push(entry.attachments.join(' '))
-        lines.push('')
-      } else if (entry.kind === 'assistant') {
-        const metaParts = []
-        if (entry.turn !== null && entry.turn !== undefined) metaParts.push(`T${entry.turn}.S${entry.step ?? 0}`)
-        if (entry.model) metaParts.push(entry.model)
-        if (entry.usage) {
-          metaParts.push(`in=${formatCompactTokens(entry.usage.input_tokens)} out=${formatCompactTokens(entry.usage.output_tokens)}`)
-        }
-        if (entry.interrupted) metaParts.push('INTERRUPTED')
-        lines.push(`#### ${tsPrefix}ASSISTANT${metaParts.length > 0 ? ' (' + metaParts.join(' | ') + ')' : ''}`)
-        if (entry.reasoning) {
-          lines.push('<details><summary>Reasoning</summary>')
-          lines.push('')
-          lines.push(entry.reasoning)
-          lines.push('')
-          lines.push('</details>')
-          lines.push('')
-        }
-        if (entry.text) lines.push(entry.text)
-        if (entry.tool_calls && entry.tool_calls.length > 0 && !s.entries.some(e => e.kind === 'tool_call' && e.call_id === entry.tool_calls[0].id)) {
-          for (const tc of entry.tool_calls) {
-            lines.push(`- **Tool Call** \`${tc.name}\`: \`${tc.arguments}\``)
-          }
-        }
-        if (entry.attachments) lines.push(entry.attachments.join(' '))
-        lines.push('')
-      } else if (entry.kind === 'tool_call') {
-        if (bundle.options?.detail === 'compact') {
-          const singleArg = String(entry.arguments || '{}').replace(/\s+/g, ' ')
-          lines.push(`> \`${entry.name}\`(${singleArg})`)
-        } else {
-          lines.push(`> **Tool Call** \`${entry.name}\` (${tsPrefix.trim() || 'call'}):`)
-          lines.push('```json')
-          lines.push(entry.arguments || '{}')
-          lines.push('```')
-          lines.push('')
-        }
-      } else if (entry.kind === 'tool_result') {
-        const statusLabel = entry.is_error ? 'ERROR' : 'OK'
-        const errInfo = entry.error ? ` (${entry.error.code || entry.error.name}: ${entry.error.reason || ''})` : ''
-        if (bundle.options?.detail === 'compact' && !entry.is_error) {
-          const preview = String(entry.text || '').replace(/\s+/g, ' ').trim()
-          lines.push(`> -> \`${entry.name}\` [OK]${preview ? ': ' + preview : ''}`)
-          lines.push('')
-        } else {
-          lines.push(`> **Tool Result** \`${entry.name}\` [${statusLabel}]${errInfo}:`)
-          if (entry.text) {
-            lines.push('```text')
-            lines.push(entry.text)
-            lines.push('```')
-          }
-          if (entry.attachments) lines.push(entry.attachments.join(' '))
-          lines.push('')
-        }
-      } else if (entry.kind === 'turn_end') {
-        const errText = entry.error ? ` — ${entry.error.code}: ${entry.error.message}` : ''
-        lines.push(`> **[TURN_END: ${entry.reason_kind}]** (turn=${entry.turn ?? '?'}${errText})`)
-        lines.push('')
-      } else if (entry.kind === 'compaction') {
-        lines.push(`> **[${entry.event_type}]**${entry.error ? ' ERROR: ' + entry.error : ''}`)
-        lines.push('')
-      }
-    }
-  }
-
-  return `${lines.join('\n').trimEnd()}\n`
+  return Buffer.concat([...localParts, centralDirBuf, eocd])
 }

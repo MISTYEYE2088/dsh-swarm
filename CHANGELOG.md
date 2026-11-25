@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0 (2026-11-25)
+
+- **AI-First Programmatic JSONL Forensic Bundle + Automatic Compaction Epoch File Splitting**:
+  - Replaced monolithic Markdown dumps with a machine-addressable JSONL directory layout packaged as a zero-dependency standard PKZIP (`node:zlib` `crc32` + `deflateRawSync`):
+    - `manifest.json`: self-describing AI entrypoint (`ai_guide`, totals, anomaly radar, Swarm roster/rejections, and exact `sessions -> epochs -> {file, lines, bytes, peak_context_pct}` map).
+    - `timeline.jsonl`: unified chronological timeline across all agents, Swarm lifecycle/board communication (`swarm.spawn`, `board.post`, `swarm.model_switch`, `swarm.kill`), `session.start`/`session.end`, `compaction`, `human.prompt`, `error.turn`, and `error.tool` — every line carries exact `{file, line}` jump pointers for O(1) programmatic addressing.
+    - `swarm/board.jsonl`: full Swarm blackboard posts and lifecycle events (1 JSON per line, checkpoints stripped).
+    - `sessions/<key>/epoch-00.jsonl`, `epoch-01.jsonl`, ...: every session (main conversation, Swarm coordinator, AND every subagent/member) automatically splits into a **new file whenever compaction triggers** so each file stays bounded to one context window.
+  - **Strict Noise Separation & Slim Defaults**: classified `user/message` into `human`, `relay`, `swarm_notice`, `compaction_checkpoint`, and `harness_inject` (`skill-catalog`, `runtime-context`, `tool-jobs`, etc.); `includeReasoning` and `includeInjections` now default to `false` (opt-in toggles in the UI menu).
+  - Updated `/api/dsh-swarm/export` (`format=zip|timeline|manifest|json`) and the native `Export Log` header/rightbar dropdown menu (`Download Forensic ZIP (.zip)`, `Download Timeline (.jsonl)`, `Copy Timeline JSONL`).
+
 ## 0.4.1 (2026-11-25)
 
 - **Compact Diagnostic Digest Mode by Default (`detail=compact|full`)**:

@@ -2685,7 +2685,8 @@ async function test_verifier_review_rules_heterogeneous_model_keywords_and_kill_
   assert.equal(runtime.store.readMembers('sess-v0313')['impl-live'].killed, true)
 }
 
-async function test_log_export_normal_conversation_with_subagents_and_usage() {
+async function test_log_export_normal_conversation_epochs_zip_and_timeline() {
+  const { execFileSync } = await import('node:child_process')
   const { createSwarmWebRoutes } = await import('../index.js')
   const storedSessions = new Map([
     [
@@ -2695,16 +2696,29 @@ async function test_log_export_normal_conversation_with_subagents_and_usage() {
         events: [
           { type: 'request/context', seq: 0, time: 1732500001000, data: { provider: 'corp', model: 'deepseek-r1', contextWindow: 128000 } },
           { type: 'turn/start', seq: 1, time: 1732500001100, data: { turn: 1 } },
+          // Repetitive harness injections must be filtered by default and NEVER classified as human prompts
           {
             type: 'user/message',
             seq: 2,
+            time: 1732500001150,
+            data: { id: 'inj1', role: 'user', source: { kind: 'skill-catalog', form: 'catalog' }, content: [{ type: 'text', text: 'NOISY_SKILL_CATALOG_TEXT' }] },
+          },
+          {
+            type: 'user/message',
+            seq: 3,
+            time: 1732500001180,
+            data: { id: 'inj2', role: 'user', source: { kind: 'runtime-context', form: 'snapshot' }, content: [{ type: 'text', text: 'NOISY_RUNTIME_SNAPSHOT' }] },
+          },
+          {
+            type: 'user/message',
+            seq: 4,
             time: 1732500001200,
             data: { id: 'u1', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Diagnose why my grep check returns 0.' }] },
           },
-          { type: 'step/start', seq: 3, time: 1732500001300, data: { turn: 1, step: 1 } },
+          { type: 'step/start', seq: 5, time: 1732500001300, data: { turn: 1, step: 1 } },
           {
             type: 'assistant/message',
-            seq: 4,
+            seq: 6,
             time: 1732500002000,
             data: {
               turn: 1,
@@ -2718,15 +2732,14 @@ async function test_log_export_normal_conversation_with_subagents_and_usage() {
                 content: [
                   { type: 'reasoning', text: 'SECRET_CHAIN_OF_THOUGHT_CHECK' },
                   { type: 'text', text: 'Inspecting the script now.' },
-                  { type: 'tool-call', id: 'tc-1', name: 'bash', arguments: '{"cmd":"cat run_llt.sh"}' },
                 ],
               },
             },
           },
-          { type: 'tool/call', seq: 5, time: 1732500002100, data: { turn: 1, step: 1, callId: 'tc-1', name: 'bash', arguments: '{"cmd":"cat run_llt.sh"}' } },
+          { type: 'tool/call', seq: 7, time: 1732500002100, data: { turn: 1, step: 1, callId: 'tc-1', name: 'bash', arguments: '{"cmd":"cat run_llt.sh"}' } },
           {
             type: 'tool/result',
-            seq: 6,
+            seq: 8,
             time: 1732500002200,
             data: {
               turn: 1,
@@ -2735,7 +2748,30 @@ async function test_log_export_normal_conversation_with_subagents_and_usage() {
               message: { id: 'tr1', role: 'tool', toolCallId: 'tc-1', isError: true, content: [{ type: 'text', text: 'ERROR_LINE_' + 'x'.repeat(200) }] },
             },
           },
-          { type: 'turn/end', seq: 7, time: 1732500002500, data: { turn: 1, reason: { kind: 'completed' } } },
+          { type: 'turn/end', seq: 9, time: 1732500002500, data: { turn: 1, reason: { kind: 'completed' } } },
+          // Compaction boundary -> MUST split into a brand-new `epoch-01.jsonl` file!
+          { type: 'compaction/start', seq: 10, time: 1732500010000, data: { compactionId: 'cmp-1', turn: 2 } },
+          {
+            type: 'compaction/summary',
+            seq: 11,
+            time: 1732500010500,
+            data: { compactionId: 'cmp-1', shadowedTokenCount: 41000, summary: [{ type: 'text', text: 'Compacted Epoch 0: investigated run_llt.sh.' }] },
+          },
+          {
+            type: 'user/message',
+            seq: 12,
+            time: 1732500010600,
+            data: { id: 'cp1', role: 'user', source: { kind: 'compact-checkpoint' }, content: [{ type: 'text', text: 'Checkpoint summary carried into Epoch 1.' }] },
+          },
+          { type: 'compaction/end', seq: 13, time: 1732500010700, data: { compactionId: 'cmp-1', turn: 2 } },
+          { type: 'turn/start', seq: 14, time: 1732500011000, data: { turn: 2 } },
+          {
+            type: 'user/message',
+            seq: 15,
+            time: 1732500011100,
+            data: { id: 'u2', role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text: 'Why are there still hardcoded numbers after compaction?' }] },
+          },
+          { type: 'turn/end', seq: 16, time: 1732500011500, data: { turn: 2, reason: { kind: 'completed' } } },
         ],
       },
     ],
@@ -2814,7 +2850,7 @@ async function test_log_export_normal_conversation_with_subagents_and_usage() {
   }
 
   const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-export-normal') }, { log: () => {}, warn: () => {} })
-  // Create an UNRELATED Swarm on disk to verify normal conversation export NEVER leaks or falls back to it!
+  // Create an UNRELATED Swarm on disk to prove normal conversation export NEVER leaks or falls back to it!
   runtime.store.initSwarm('unrelated-swarm-99', { title: 'Unrelated Swarm Must Not Leak', concurrency_confirmed: true })
 
   const routes = createSwarmWebRoutes(runtime)
@@ -2823,52 +2859,110 @@ async function test_log_export_normal_conversation_with_subagents_and_usage() {
 
   async function callExport(query, method = 'GET') {
     const headers = {}
-    let body = ''
+    let body = null
     const res = {
       statusCode: 0,
       setHeader(k, v) { headers[k.toLowerCase()] = v },
-      end(chunk) { body = String(chunk ?? '') },
+      end(chunk) { body = chunk },
     }
     await exportRoute.handler({ method, url: `/api/dsh-swarm/export?${query}` }, res)
     return { statusCode: res.statusCode, headers, body }
   }
 
-  // 1. Markdown export of normal conversation + native subagent
-  const mdRes = await callExport('sessionId=normal-chat-1&format=md&download=1&maxToolResultChars=60')
-  assert.equal(mdRes.statusCode, 200)
-  assert.equal(mdRes.headers['x-dsh-export-mode'], 'session')
-  assert.match(mdRes.headers['content-type'], /text\/markdown/)
-  assert.match(mdRes.headers['content-disposition'], /attachment; filename="dsh-session-log-normal-chat-1-.*\.md"/)
+  // 1. Default ZIP bundle: real PKZIP verified via Python `zipfile.ZipFile.testzip()`!
+  const zipRes = await callExport('sessionId=normal-chat-1&format=zip&download=1&maxToolResultChars=60')
+  assert.equal(zipRes.statusCode, 200)
+  assert.equal(zipRes.headers['x-dsh-export-mode'], 'session')
+  assert.match(zipRes.headers['content-type'], /application\/zip/)
+  assert.match(zipRes.headers['content-disposition'], /attachment; filename="dsh-session-log-normal-chat-1-.*\.zip"/)
+  assert.ok(Buffer.isBuffer(zipRes.body) && zipRes.body.length > 100)
   assert.ok(flushCalls >= 2, 'Live sessions must be flushed before reading persistence')
-  assert.match(mdRes.body, /Session Diagnostic Log: normal-chat-1/)
-  assert.match(mdRes.body, /Diagnose why my grep check returns 0/)
-  assert.match(mdRes.body, /SECRET_CHAIN_OF_THOUGHT_CHECK/)
-  assert.match(mdRes.body, /Red Team Auditor/)
-  assert.match(mdRes.body, /Found fake grep command returning constant 0/)
-  assert.match(mdRes.body, /42\.0k\/128\.0k \(32\.8%\)/)
-  assert.match(mdRes.body, /truncated/)
-  assert.equal(mdRes.body.includes('RAW_STREAM_NOISE_SHOULD_BE_STRIPPED'), false, 'Raw SSE stream chunks must be stripped')
-  assert.equal(mdRes.body.includes('Unrelated Swarm Must Not Leak'), false, 'Normal conversation export must NEVER fall back to an unrelated Swarm')
 
-  // 2. JSON export with reasoning & subagents toggled OFF
-  const jsonRes = await callExport('sessionId=normal-chat-1&format=json&includeReasoning=false&includeSubagents=false')
-  assert.equal(jsonRes.statusCode, 200)
-  const parsed = JSON.parse(jsonRes.body)
-  assert.equal(parsed.mode, 'session')
-  assert.equal(parsed.sessions.length, 1, 'includeSubagents=false must omit subagent sessions')
-  assert.equal(parsed.sessions[0].stats.context_pct, 32.8)
-  assert.equal(parsed.sessions[0].stats.tool_errors, 1)
-  assert.equal(jsonRes.body.includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), false, 'includeReasoning=false must omit reasoning blocks')
+  const zipPath = path.join(tempRoot, 'normal-export.zip')
+  fs.writeFileSync(zipPath, zipRes.body)
+  const pyInspect = execFileSync('python3', [
+    '-c',
+    `import zipfile, json, sys
+z = zipfile.ZipFile(sys.argv[1])
+assert z.testzip() is None, "ZIP CRC check failed"
+names = z.namelist()
+out = {}
+for n in names:
+    rel = n.split("/", 1)[1]
+    out[rel] = z.read(n).decode("utf-8")
+print(json.dumps(out))`,
+    zipPath,
+  ], { encoding: 'utf8' })
+  const extracted = JSON.parse(pyInspect)
 
-  // 3. HEAD request & 404 on unknown session
-  const headRes = await callExport('sessionId=normal-chat-1&format=md', 'HEAD')
+  // Verify exact epoch-split file structure inside the ZIP
+  assert.ok(extracted['manifest.json'], 'ZIP must contain manifest.json')
+  assert.ok(extracted['timeline.jsonl'], 'ZIP must contain timeline.jsonl')
+  assert.ok(extracted['sessions/main/epoch-00.jsonl'], 'ZIP must contain sessions/main/epoch-00.jsonl')
+  assert.ok(extracted['sessions/main/epoch-01.jsonl'], 'ZIP must contain sessions/main/epoch-01.jsonl after compaction')
+  assert.ok(extracted['sessions/S001-red-team-auditor/epoch-00.jsonl'], 'ZIP must isolate subagent in its own directory')
+
+  const manifest = JSON.parse(extracted['manifest.json'])
+  assert.equal(manifest.mode, 'session')
+  assert.equal(manifest.totals.epochs, 3, '2 main epochs + 1 subagent epoch')
+  assert.equal(manifest.totals.omitted_injections, 2, 'skill-catalog + runtime-context must be omitted by default')
+  assert.equal(manifest.sessions[0].stats.context_pct, 32.8)
+  assert.equal(manifest.sessions[0].epochs.length, 2, 'Main session must split into 2 epoch files on compaction')
+  assert.equal(extracted['manifest.json'].includes('Unrelated Swarm Must Not Leak'), false)
+
+  // Verify reasoning, stream noise, and harness injections are absent by default
+  const ep0Lines = extracted['sessions/main/epoch-00.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  const ep1Lines = extracted['sessions/main/epoch-01.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), false, 'Reasoning must be omitted by default')
+  assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('NOISY_SKILL_CATALOG_TEXT'), false, 'Harness injections must be omitted by default')
+  assert.equal(extracted['sessions/main/epoch-00.jsonl'].includes('RAW_STREAM_NOISE_SHOULD_BE_STRIPPED'), false, 'Raw stream deltas must be stripped')
+  assert.equal(ep1Lines[0].kind, 'compaction', 'Epoch 1 must open with the compaction summary record')
+  assert.equal(ep1Lines[1].kind, 'compaction_checkpoint', 'Compact checkpoint joins Epoch 1 without double-splitting')
+
+  // Verify programmatic `{file, line}` jump pointers in timeline.jsonl resolve to the EXACT matching JSONL line!
+  const timelineRows = extracted['timeline.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  const humanPrompt2 = timelineRows.find(r => r.type === 'human.prompt' && r.epoch === 1)
+  assert.ok(humanPrompt2, 'timeline.jsonl must index human prompts in epoch 1')
+  assert.equal(humanPrompt2.file, 'sessions/main/epoch-01.jsonl')
+  const jumpedRecord = extracted[humanPrompt2.file].trim().split('\n').map(l => JSON.parse(l))[humanPrompt2.line - 1]
+  assert.equal(jumpedRecord.kind, 'human')
+  assert.match(jumpedRecord.text, /hardcoded numbers after compaction/)
+
+  const compTimeline = timelineRows.find(r => r.type === 'compaction')
+  assert.ok(compTimeline && compTimeline.from_epoch === 0 && compTimeline.to_epoch === 1 && compTimeline.file === 'sessions/main/epoch-01.jsonl')
+
+  // 2. Opt-in `includeReasoning=true&includeInjections=true` + standalone `format=timeline` & `format=manifest`
+  const tlRes = await callExport('sessionId=normal-chat-1&format=timeline')
+  assert.equal(tlRes.statusCode, 200)
+  assert.match(tlRes.headers['content-type'], /application\/x-ndjson/)
+  assert.ok(String(tlRes.body).includes('"type":"compaction"'))
+
+  const optZip = await callExport('sessionId=normal-chat-1&format=zip&includeReasoning=true&includeInjections=true&includeSubagents=false')
+  assert.equal(optZip.statusCode, 200)
+  const optZipPath = path.join(tempRoot, 'normal-opt.zip')
+  fs.writeFileSync(optZipPath, optZip.body)
+  const optOut = JSON.parse(execFileSync('python3', [
+    '-c',
+    `import zipfile, json, sys
+z = zipfile.ZipFile(sys.argv[1])
+assert z.testzip() is None
+print(json.dumps({n.split("/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}))`,
+    optZipPath,
+  ], { encoding: 'utf8' }))
+  assert.equal(Boolean(optOut['sessions/S001-red-team-auditor/epoch-00.jsonl']), false, 'includeSubagents=false must omit subagents')
+  assert.ok(optOut['sessions/main/epoch-00.jsonl'].includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), 'includeReasoning=true must restore reasoning')
+  assert.ok(optOut['sessions/main/epoch-00.jsonl'].includes('NOISY_SKILL_CATALOG_TEXT'), 'includeInjections=true must restore harness injections')
+
+  // 3. HEAD & 404
+  const headRes = await callExport('sessionId=normal-chat-1&format=zip', 'HEAD')
   assert.equal(headRes.statusCode, 200)
-  assert.equal(headRes.body, '')
-  const notFound = await callExport('sessionId=does-not-exist-xyz&format=md')
+  assert.equal(String(headRes.body), '')
+  const notFound = await callExport('sessionId=does-not-exist-xyz&format=zip')
   assert.equal(notFound.statusCode, 404)
 }
 
 async function test_log_export_swarm_blackboard_members_and_context_telemetry() {
+  const { execFileSync } = await import('node:child_process')
   const { createSwarmWebRoutes } = await import('../index.js')
   const listeners = new Map()
   const registeredTools = new Map()
@@ -2900,6 +2994,10 @@ async function test_log_export_swarm_blackboard_members_and_context_telemetry() 
     { title: 'QA reject: log scan failed', kind: 'review', verdict: 'reject', mentions: ['impl-tx'], text: '@impl-tx Found FAIL in log' },
     { agent: { id: 'sw-exp__qa-gate' } },
   )
+  await registeredTools.get('swarm_kill').execute(
+    { name: 'impl-tx', reason: 'Replace with clean session' },
+    { agent: coordAgent },
+  )
 
   // Emit real `request/context` and `assistant/message` usage events for `@impl-tx`
   const onSessionEvent = listeners.get('session/event')
@@ -2922,24 +3020,45 @@ async function test_log_export_swarm_blackboard_members_and_context_telemetry() 
   assert.equal(statusRes.ok, true)
   assert.match(statusRes.text, /ctx=64\.0k\/128\.0k\(50%\)/)
 
-  // 2. Exporting from a MEMBER session ID resolves the owning Swarm and bundles Blackboard + Roster + Member transcripts!
+  // 2. Exporting from a MEMBER session ID resolves the owning Swarm and builds a ZIP with `swarm/board.jsonl`, chronological `timeline.jsonl`, and member epoch files!
   const routes = createSwarmWebRoutes(runtime)
   const exportRoute = routes.find(r => r.path === '/api/dsh-swarm/export')
   const stateRoute = routes.find(r => r.path === '/api/dsh-swarm/state')
 
   const headers = {}
-  let body = ''
+  let zipBuf = null
   await exportRoute.handler(
-    { method: 'GET', url: '/api/dsh-swarm/export?sessionId=sw-exp__impl-tx&format=md&download=1' },
-    { statusCode: 0, setHeader(k, v) { headers[k.toLowerCase()] = v }, end(c) { body = String(c ?? '') } },
+    { method: 'GET', url: '/api/dsh-swarm/export?sessionId=sw-exp__impl-tx&format=zip&download=1' },
+    { statusCode: 0, setHeader(k, v) { headers[k.toLowerCase()] = v }, end(c) { zipBuf = c } },
   )
   assert.equal(headers['x-dsh-export-mode'], 'swarm')
-  assert.match(headers['content-disposition'], /dsh-swarm-log-sw-exp-.*\.md/)
-  assert.match(body, /Swarm Diagnostic Log: NIC Firmware Audit Swarm/)
-  assert.match(body, /Swarm Blackboard Timeline/)
-  assert.match(body, /QA reject: log scan failed/)
-  assert.match(body, /Implemented TX ring buffer/)
-  assert.match(body, /64\.0k\/128\.0k \(50%\)/)
+  assert.match(headers['content-disposition'], /dsh-swarm-log-sw-exp-.*\.zip/)
+
+  const swZipPath = path.join(tempRoot, 'swarm-export.zip')
+  fs.writeFileSync(swZipPath, zipBuf)
+  const swExtracted = JSON.parse(execFileSync('python3', [
+    '-c',
+    `import zipfile, json, sys
+z = zipfile.ZipFile(sys.argv[1])
+assert z.testzip() is None
+print(json.dumps({n.split("/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}))`,
+    swZipPath,
+  ], { encoding: 'utf8' }))
+
+  assert.ok(swExtracted['swarm/board.jsonl'], 'Swarm ZIP must contain swarm/board.jsonl')
+  assert.ok(swExtracted['sessions/S001-impl-tx/epoch-00.jsonl'], 'Swarm ZIP must contain per-member epoch JSONL')
+  const swTimeline = swExtracted['timeline.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  const tlTypes = swTimeline.map(r => r.type)
+  assert.ok(tlTypes.includes('swarm.spawn'), 'Swarm timeline must include swarm.spawn')
+  assert.ok(tlTypes.includes('board.post'), 'Swarm timeline must include board.post')
+  assert.ok(tlTypes.includes('swarm.kill'), 'Swarm timeline must include swarm.kill')
+
+  // Programmatic jump from timeline `board.post` reject directly into `swarm/board.jsonl`!
+  const rejTl = swTimeline.find(r => r.type === 'board.post' && r.verdict === 'reject')
+  assert.ok(rejTl && rejTl.board_file === 'swarm/board.jsonl' && rejTl.board_line >= 1)
+  const boardLines = swExtracted['swarm/board.jsonl'].trim().split('\n').map(l => JSON.parse(l))
+  assert.match(boardLines[rejTl.board_line - 1].title, /QA reject: log scan failed/)
+  assert.ok(swExtracted['sessions/S001-impl-tx/epoch-00.jsonl'].includes('Implemented TX ring buffer'))
 
   // 3. `/api/dsh-swarm/state` distinguishes `exactSwarmId` (non-null for Swarm, null for normal chat)
   let swarmStateBody = ''
@@ -2974,14 +3093,14 @@ async function test_client_registers_export_header_utility_slot_and_builds_urls(
   assert.ok(loadedModule && typeof loadedModule.factory === 'function')
   const mod = loadedModule.factory(() => null)
 
-  // Verify URL builder for both normal session and explicit Swarm modes
+  // Verify URL builder defaults (AI-first zip + compact + reasoning/injections off)
   assert.equal(
-    mod.buildExportUrl({ sessionId: 'chat-42', format: 'md', includeSubagents: true, includeReasoning: false, download: true }),
-    '/api/dsh-swarm/export?sessionId=chat-42&format=md&detail=compact&includeSubagents=true&includeReasoning=false&download=1',
+    mod.buildExportUrl({ sessionId: 'chat-42', download: true }),
+    '/api/dsh-swarm/export?sessionId=chat-42&format=zip&detail=compact&includeSubagents=true&includeReasoning=false&includeInjections=false&download=1',
   )
   assert.equal(
-    mod.buildExportUrl({ swarmId: 'sw-9', format: 'json', detail: 'full', includeSubagents: true, includeReasoning: true }),
-    '/api/dsh-swarm/export?swarmId=sw-9&format=json&detail=full&includeSubagents=true&includeReasoning=true',
+    mod.buildExportUrl({ swarmId: 'sw-9', format: 'timeline', detail: 'full', includeReasoning: true, includeInjections: true }),
+    '/api/dsh-swarm/export?swarmId=sw-9&format=timeline&detail=full&includeSubagents=true&includeReasoning=true&includeInjections=true',
   )
 
   // Verify `conversation.session.header.utilities` registers `dsh-swarm-export-log`
@@ -3081,7 +3200,7 @@ try {
   await runTest('test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup', test_review_meta_rules_2d_array_drives_prompt_and_user_wakeup)
   await runTest('test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip', test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip)
   await runTest('test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake', test_verifier_review_rules_heterogeneous_model_keywords_and_kill_brake)
-  await runTest('test_log_export_normal_conversation_with_subagents_and_usage', test_log_export_normal_conversation_with_subagents_and_usage)
+  await runTest('test_log_export_normal_conversation_epochs_zip_and_timeline', test_log_export_normal_conversation_epochs_zip_and_timeline)
   await runTest('test_log_export_swarm_blackboard_members_and_context_telemetry', test_log_export_swarm_blackboard_members_and_context_telemetry)
   await runTest('test_client_registers_export_header_utility_slot_and_builds_urls', test_client_registers_export_header_utility_slot_and_builds_urls)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)

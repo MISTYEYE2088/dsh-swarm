@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.4.1'
+    var VERSION = '0.5.0'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -890,10 +890,12 @@ window.__ModuleLoader__.load({
       var params = []
       if (o.sessionId) params.push('sessionId=' + encodeURIComponent(String(o.sessionId)))
       if (o.swarmId) params.push('swarmId=' + encodeURIComponent(String(o.swarmId)))
-      params.push('format=' + encodeURIComponent(o.format === 'json' ? 'json' : 'md'))
+      var fmt = (o.format === 'timeline' || o.format === 'manifest' || o.format === 'json') ? o.format : 'zip'
+      params.push('format=' + encodeURIComponent(fmt))
       params.push('detail=' + encodeURIComponent(o.detail === 'full' ? 'full' : 'compact'))
       params.push('includeSubagents=' + (o.includeSubagents === false ? 'false' : 'true'))
-      params.push('includeReasoning=' + (o.includeReasoning === false ? 'false' : 'true'))
+      params.push('includeReasoning=' + (o.includeReasoning === true ? 'true' : 'false'))
+      params.push('includeInjections=' + (o.includeInjections === true ? 'true' : 'false'))
       if (o.download) params.push('download=1')
       return '/api/dsh-swarm/export?' + params.join('&')
     }
@@ -938,8 +940,8 @@ window.__ModuleLoader__.load({
               return { ok: false, error: (j && j.error) || ('HTTP ' + res.status) }
             })
           }
-          var filename = res.headers.get('x-dsh-export-filename')
-            || ('dsh-log.' + (opts && opts.format === 'json' ? 'json' : 'md'))
+          var fallbackExt = opts && opts.format === 'timeline' ? 'jsonl' : (opts && opts.format === 'manifest' ? 'json' : 'zip')
+          var filename = res.headers.get('x-dsh-export-filename') || ('dsh-log.' + fallbackExt)
           return res.blob().then(function (blob) {
             if (typeof URL !== 'undefined' && typeof document !== 'undefined' && document.body) {
               var objUrl = URL.createObjectURL(blob)
@@ -959,9 +961,9 @@ window.__ModuleLoader__.load({
         })
     }
 
-    function copyExportMarkdown(opts) {
+    function copyExportTimeline(opts) {
       if (typeof fetch !== 'function') return Promise.resolve({ ok: false, error: 'Fetch unavailable' })
-      var url = buildExportUrl(Object.assign({}, opts, { format: 'md', download: false }))
+      var url = buildExportUrl(Object.assign({}, opts, { format: 'timeline', download: false }))
       return fetch(url, { method: 'GET' })
         .then(function (res) {
           if (!res.ok) {
@@ -1015,12 +1017,15 @@ window.__ModuleLoader__.load({
       var subPair = React.useState(true)
       var includeSubagents = subPair[0]
       var setIncludeSubagents = subPair[1]
-      var reasPair = React.useState(true)
+      var reasPair = React.useState(false)
       var includeReasoning = reasPair[0]
       var setIncludeReasoning = reasPair[1]
       var fullPair = React.useState(false)
       var fullToolOutputs = fullPair[0]
       var setFullToolOutputs = fullPair[1]
+      var injPair = React.useState(false)
+      var includeInjections = injPair[0]
+      var setIncludeInjections = injPair[1]
       var busyPair = React.useState(false)
       var busy = busyPair[0]
       var setBusy = busyPair[1]
@@ -1076,6 +1081,7 @@ window.__ModuleLoader__.load({
           detail: fullToolOutputs ? 'full' : 'compact',
           includeSubagents: includeSubagents,
           includeReasoning: includeReasoning,
+          includeInjections: includeInjections,
         }
       }
 
@@ -1086,21 +1092,22 @@ window.__ModuleLoader__.load({
         triggerExportDownload(buildPayload(format)).then(function (res) {
           setBusy(false)
           if (res && res.ok) {
-            flashStatus('ok', 'Downloaded ' + (format === 'json' ? '.json' : '.md'))
+            var extLabel = format === 'timeline' ? '.jsonl' : (format === 'manifest' ? '.json' : '.zip')
+            flashStatus('ok', 'Downloaded ' + extLabel)
           } else {
             flashStatus('err', (res && res.error) || 'Export failed')
           }
         })
       }
 
-      function handleCopyMarkdown() {
+      function handleCopyTimeline() {
         if (busy) return
         setBusy(true)
         setStatusMsg({ kind: 'info', text: 'Copying...' })
-        copyExportMarkdown(buildPayload('md')).then(function (res) {
+        copyExportTimeline(buildPayload('timeline')).then(function (res) {
           setBusy(false)
           if (res && res.ok) {
-            flashStatus('ok', 'Copied Markdown (' + Math.round((res.chars || 0) / 1024) + ' KB)')
+            flashStatus('ok', 'Copied timeline (' + Math.max(1, Math.round((res.chars || 0) / 1024)) + ' KB)')
           } else {
             flashStatus('err', (res && res.error) || 'Copy failed')
           }
@@ -1276,10 +1283,9 @@ window.__ModuleLoader__.load({
                     display: 'flex',
                     alignItems: 'center',
                     gap: '6px',
-                    padding: '3px 6px 6px',
+                    padding: '3px 6px',
                     fontSize: '11.5px',
                     color: 'var(--dsw-alias-label-secondary)',
-                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
                     cursor: 'pointer',
                   },
                 },
@@ -1291,16 +1297,25 @@ window.__ModuleLoader__.load({
                 'Full tool outputs (verbose)',
               ),
               React.createElement(
-                'button',
+                'label',
                 {
-                  type: 'button',
-                  role: 'menuitem',
-                  disabled: busy,
-                  onClick: function () { handleDownload('md') },
-                  style: menuBtnStyle,
+                  style: {
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    padding: '3px 6px 6px',
+                    fontSize: '11.5px',
+                    color: 'var(--dsw-alias-label-secondary)',
+                    borderBottom: '0.5px solid var(--dsw-alias-border-l3)',
+                    cursor: 'pointer',
+                  },
                 },
-                React.createElement('span', { style: { fontWeight: 500 } }, 'Download Markdown (.md)'),
-                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Clean report for review & AI diagnosis'),
+                React.createElement('input', {
+                  type: 'checkbox',
+                  checked: includeInjections,
+                  onChange: function (e) { setIncludeInjections(Boolean(e && e.target && e.target.checked)) },
+                }),
+                'Include harness injections',
               ),
               React.createElement(
                 'button',
@@ -1308,11 +1323,11 @@ window.__ModuleLoader__.load({
                   type: 'button',
                   role: 'menuitem',
                   disabled: busy,
-                  onClick: function () { handleDownload('json') },
+                  onClick: function () { handleDownload('zip') },
                   style: menuBtnStyle,
                 },
-                React.createElement('span', { style: { fontWeight: 500 } }, 'Download JSON (.json)'),
-                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Structured bundle (stream-stripped)'),
+                React.createElement('span', { style: { fontWeight: 600 } }, 'Download Forensic ZIP (.zip)'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'manifest + timeline + epoch-split .jsonl'),
               ),
               React.createElement(
                 'button',
@@ -1320,11 +1335,23 @@ window.__ModuleLoader__.load({
                   type: 'button',
                   role: 'menuitem',
                   disabled: busy,
-                  onClick: handleCopyMarkdown,
+                  onClick: function () { handleDownload('timeline') },
                   style: menuBtnStyle,
                 },
-                React.createElement('span', { style: { fontWeight: 500 } }, 'Copy Markdown to Clipboard'),
-                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Paste straight into another AI chat'),
+                React.createElement('span', { style: { fontWeight: 500 } }, 'Download Timeline (.jsonl)'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Chronological index with file:line jumps'),
+              ),
+              React.createElement(
+                'button',
+                {
+                  type: 'button',
+                  role: 'menuitem',
+                  disabled: busy,
+                  onClick: handleCopyTimeline,
+                  style: menuBtnStyle,
+                },
+                React.createElement('span', { style: { fontWeight: 500 } }, 'Copy Timeline JSONL'),
+                React.createElement('span', { style: { fontSize: '10.5px', color: 'var(--dsw-alias-label-tertiary)' } }, 'Paste compact timeline directly into AI'),
               ),
               statusMsg
                 ? React.createElement(
