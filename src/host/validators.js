@@ -58,6 +58,18 @@ export function normalizeAnchors(raw) {
   return out
 }
 
+/** Normalize optional deterministic host gate commands (up to 10 non-empty commands). */
+export function normalizeGateCommands(raw) {
+  const items = Array.isArray(raw) ? raw : []
+  const out = []
+  for (const item of items) {
+    const cleaned = String(item ?? '').trim()
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned.slice(0, 300))
+    if (out.length >= 10) break
+  }
+  return out
+}
+
 /** Normalize explicit path/glob patterns to forward-slash relative form. */
 export function normalizePathPatterns(raw) {
   const items = Array.isArray(raw) ? raw : []
@@ -158,6 +170,7 @@ export function validateSwarmInit(args) {
     ? args.project_root.trim()
     : null
   const anchors = normalizeAnchors(args.anchors)
+  const gateCommands = normalizeGateCommands(args.gate_commands)
   return {
     ok: true,
     value: {
@@ -165,6 +178,7 @@ export function validateSwarmInit(args) {
       concurrency_limit: limit,
       project_root: projectRoot,
       anchors,
+      gate_commands: gateCommands,
       default_provider: typeof args.default_provider === 'string' && args.default_provider.trim()
         ? args.default_provider.trim()
         : 'inherit',
@@ -437,6 +451,7 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       workspaceExplicit,
       brief,
       owned_paths: ownedPaths,
+      brief_owned_paths: parsedScopes.owned,
       forbidden_paths: forbiddenPaths,
       adopt_worktree_from: adoptWorktreeFrom,
       review_target: reviewTarget,
@@ -711,6 +726,33 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
     ? args.override_reason.trim()
     : null
 
+  let blindGroup = null
+  let blindQuorum = null
+  if (args.blind_group !== undefined && args.blind_group !== null && String(args.blind_group).trim() !== '') {
+    const bg = String(args.blind_group).trim()
+    if (bg.length > 48 || !/^[a-z0-9][a-z0-9_.-]*$/i.test(bg)) {
+      return formatError('post_board', `Invalid blind_group "${bg}". Must be 1..48 alphanumeric/dot/hyphen/underscore characters.`, {
+        title,
+        mentions: memberMentions.length > 0 ? memberMentions : ['coordinator'],
+        blind_group: 'arch-r1',
+        blind_quorum: 2,
+        text,
+      })
+    }
+    blindGroup = bg
+    const q = args.blind_quorum !== undefined && args.blind_quorum !== null ? Number(args.blind_quorum) : 2
+    if (!Number.isInteger(q) || q < 2 || q > 20) {
+      return formatError('post_board', `Invalid blind_quorum (${args.blind_quorum}). Must be an integer between 2 and 20.`, {
+        title,
+        mentions: memberMentions.length > 0 ? memberMentions : ['coordinator'],
+        blind_group: bg,
+        blind_quorum: 2,
+        text,
+      })
+    }
+    blindQuorum = q
+  }
+
   return {
     ok: true,
     value: {
@@ -728,6 +770,8 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
       silent,
       idempotency_key: idempotencyKey,
       override_reason: overrideReason,
+      blind_group: blindGroup,
+      blind_quorum: blindQuorum,
       text,
     },
   }
@@ -830,6 +874,7 @@ export function validateSwarmPlan(args) {
       goal,
       current_wave: Number.isInteger(args.current_wave) ? args.current_wave : 1,
       anchors: normalizeAnchors(args.anchors),
+      gate_commands: normalizeGateCommands(args.gate_commands),
       waves: Array.isArray(args.waves) ? args.waves : [],
       tracks: Array.isArray(args.tracks) ? args.tracks : [],
     },

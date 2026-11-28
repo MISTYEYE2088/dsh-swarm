@@ -18,7 +18,7 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    var VERSION = '0.5.1'
+    var VERSION = '0.7.0'
     var LOG = '[dsh-swarm]'
     var SWARM_TAB_ID = 'dsh-swarm'
     var SWARM_TAB_KIND = 'swarm'
@@ -1495,6 +1495,17 @@ window.__ModuleLoader__.load({
       var activeRejections = snap && Array.isArray(snap.activeRejections) ? snap.activeRejections : []
       var watchdog = snap && snap.watchdog ? snap.watchdog : null
       var memberSummary = snap && snap.memberSummary ? snap.memberSummary : null
+      var swarmAnchors = snap && snap.swarm && Array.isArray(snap.swarm.anchors) ? snap.swarm.anchors : []
+      var planAnchors = plan && Array.isArray(plan.anchors) ? plan.anchors : []
+      var combinedAnchors = []
+      for (var ai = 0; ai < swarmAnchors.length; ai += 1) {
+        if (combinedAnchors.indexOf(swarmAnchors[ai]) === -1) combinedAnchors.push(swarmAnchors[ai])
+      }
+      for (var pi = 0; pi < planAnchors.length; pi += 1) {
+        if (combinedAnchors.indexOf(planAnchors[pi]) === -1) combinedAnchors.push(planAnchors[pi])
+      }
+      var gateCommands = snap && Array.isArray(snap.gate_commands) ? snap.gate_commands : []
+      var lastHostGate = snap && snap.swarm && snap.swarm.last_host_gate ? snap.swarm.last_host_gate : null
 
       return React.createElement(
         'div',
@@ -1514,6 +1525,9 @@ window.__ModuleLoader__.load({
               },
               React.createElement('div', { style: { fontWeight: 600, marginBottom: '4px' } }, 'Merge/Done Gate Blocked (' + activeRejections.length + ' open [REJECT])'),
               activeRejections.map(function (rej, idx) {
+                var targetTag = rej.target_member && rej.target_member !== '*' ? ' -> @' + rej.target_member : ''
+                var retiredTag = rej.reviewer_killed ? ' [RETIRED REVIEWER]' : ''
+                var streakTag = rej.consecutive_rejects >= 2 ? ' [x' + rej.consecutive_rejects + ' ESCALATE]' : ''
                 return React.createElement(
                   'div',
                   {
@@ -1521,7 +1535,72 @@ window.__ModuleLoader__.load({
                     onClick: function () { jumpToPost(rej.seq) },
                     style: { fontSize: '11px', color: 'var(--dsw-alias-label-secondary)', marginTop: '2px', cursor: 'pointer' },
                   },
-                  '#' + rej.seq + ' @' + rej.reviewer + ' (' + rej.role + '): ' + (rej.title || ''),
+                  '#' + rej.seq + ' @' + rej.reviewer + targetTag + ' (' + rej.role + ')' + retiredTag + streakTag + ': ' + (rej.title || ''),
+                )
+              }),
+            )
+          : null,
+        combinedAnchors.length > 0
+          ? React.createElement(
+              'div',
+              {
+                style: {
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  border: '0.5px solid var(--dsw-alias-border-l2)',
+                  background: 'var(--dsw-alias-bg-layer-2)',
+                  fontSize: '11px',
+                },
+              },
+              React.createElement('div', { style: { fontWeight: 600, fontSize: '12px', marginBottom: '4px', color: 'var(--dsw-alias-label-primary)' } }, 'Ground-Truth Anchors (' + combinedAnchors.length + ')'),
+              combinedAnchors.map(function (anc, idx) {
+                return React.createElement(
+                  'div',
+                  { key: idx, style: { color: 'var(--dsw-alias-label-secondary)', marginTop: '2px', wordBreak: 'break-word' } },
+                  '- ' + anc,
+                )
+              }),
+            )
+          : null,
+        gateCommands.length > 0
+          ? React.createElement(
+              'div',
+              {
+                style: {
+                  padding: '8px 10px',
+                  borderRadius: '8px',
+                  border: lastHostGate && !lastHostGate.ok
+                    ? '1px solid var(--dsw-alias-state-danger-primary, #ef4444)'
+                    : '0.5px solid var(--dsw-alias-border-l2)',
+                  background: 'var(--dsw-alias-bg-layer-2)',
+                  fontSize: '11px',
+                },
+              },
+              React.createElement(
+                'div',
+                { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' } },
+                React.createElement('span', { style: { fontWeight: 600, fontSize: '12px', color: 'var(--dsw-alias-label-primary)' } }, 'Host Gate Commands (' + gateCommands.length + ')'),
+                lastHostGate
+                  ? React.createElement(
+                      'span',
+                      {
+                        style: {
+                          fontSize: '10.5px',
+                          fontWeight: 600,
+                          color: lastHostGate.ok
+                            ? 'var(--dsw-alias-state-success-primary, #10b981)'
+                            : 'var(--dsw-alias-state-danger-primary, #ef4444)',
+                        },
+                      },
+                      (lastHostGate.ok ? 'PASS' : 'FAIL') + ' (' + (lastHostGate.ran - lastHostGate.failed_count) + '/' + lastHostGate.ran + ' · ' + (lastHostGate.target || 'main') + ')',
+                    )
+                  : null,
+              ),
+              gateCommands.map(function (cmd, idx) {
+                return React.createElement(
+                  'div',
+                  { key: idx, style: { fontFamily: 'monospace', color: 'var(--dsw-alias-label-secondary)', marginTop: '2px', wordBreak: 'break-all' } },
+                  '$ ' + cmd,
                 )
               }),
             )
@@ -1655,6 +1734,11 @@ window.__ModuleLoader__.load({
               )
             : members.map(function (m) {
                 var isRunning = m.status === 'working' || m.status === 'queued'
+                var ctxPct = m.context_window > 0 && m.last_input_tokens > 0
+                  ? Math.round((m.last_input_tokens / m.context_window) * 100)
+                  : 0
+                var hasCtxPressure = !m.killed && ctxPct >= 80
+                var hasToolLoop = !m.killed && (m.consecutive_tool_errors || 0) >= 3
                 return React.createElement(
                   'div',
                   {
@@ -1662,7 +1746,11 @@ window.__ModuleLoader__.load({
                     style: {
                       padding: '8px 10px',
                       borderRadius: '8px',
-                      border: '0.5px solid var(--dsw-alias-border-l2)',
+                      border: hasToolLoop
+                        ? '1px solid var(--dsw-alias-state-danger-primary, #ef4444)'
+                        : hasCtxPressure
+                          ? '1px solid #f59e0b'
+                          : '0.5px solid var(--dsw-alias-border-l2)',
                       background: 'var(--dsw-alias-bg-layer-2)',
                       opacity: m.killed ? 0.55 : 1,
                       fontSize: '12px',
@@ -1673,7 +1761,7 @@ window.__ModuleLoader__.load({
                     { style: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '6px' } },
                     React.createElement(
                       'div',
-                      { style: { display: 'flex', alignItems: 'center', gap: '6px', fontWeight: 600 } },
+                      { style: { display: 'flex', alignItems: 'center', gap: '5px', flexWrap: 'wrap', fontWeight: 600 } },
                       renderDot(isRunning),
                       React.createElement('span', { style: { color: 'var(--dsw-alias-label-primary)' } }, '@' + m.name),
                       React.createElement(
@@ -1685,11 +1773,60 @@ window.__ModuleLoader__.load({
                             padding: '0 6px',
                             borderRadius: '4px',
                             background: 'var(--dsw-alias-bg-layer-3)',
-                            color: 'var(--dsw-alias-label-secondary)',
+                            color: m.role === 'red_team' ? '#f43f5e' : 'var(--dsw-alias-label-secondary)',
                           },
                         },
                         m.role + (m.can_block_merge ? ':gate' : ''),
                       ),
+                      m.blind_to_worker_prose
+                        ? React.createElement(
+                            'span',
+                            {
+                              title: 'Blind to worker prose: sees commits/diffs + coordinator anchors only',
+                              style: {
+                                fontSize: '10px',
+                                fontWeight: 600,
+                                padding: '0 5px',
+                                borderRadius: '4px',
+                                background: 'rgba(16, 185, 129, 0.14)',
+                                color: '#10b981',
+                              },
+                            },
+                            'BLIND',
+                          )
+                        : null,
+                      hasCtxPressure
+                        ? React.createElement(
+                            'span',
+                            {
+                              style: {
+                                fontSize: '10px',
+                                fontWeight: 600,
+                                padding: '0 5px',
+                                borderRadius: '4px',
+                                background: 'rgba(245, 158, 11, 0.16)',
+                                color: '#f59e0b',
+                              },
+                            },
+                            'CTX ' + ctxPct + '%',
+                          )
+                        : null,
+                      hasToolLoop
+                        ? React.createElement(
+                            'span',
+                            {
+                              style: {
+                                fontSize: '10px',
+                                fontWeight: 600,
+                                padding: '0 5px',
+                                borderRadius: '4px',
+                                background: 'rgba(239, 68, 68, 0.16)',
+                                color: '#ef4444',
+                              },
+                            },
+                            'LOOP ' + m.consecutive_tool_errors + 'x',
+                          )
+                        : null,
                     ),
                     React.createElement(
                       'span',
@@ -1705,8 +1842,10 @@ window.__ModuleLoader__.load({
                       + ' wait:#' + m.wait_since
                       + ' post:#' + m.last_post_seq
                       + (m.last_park_blocked_seq ? ' blocked:#' + m.last_park_blocked_seq : '')
+                      + (m.adopted_from ? ' · adopted<-@' + m.adopted_from : '')
+                      + (m.review_target ? ' · review->@' + m.review_target : '')
                       + (m.context_window > 0 && m.last_input_tokens > 0
-                        ? ' · ctx:' + Math.round(m.last_input_tokens / 1000) + 'k/' + Math.round(m.context_window / 1000) + 'k (' + Math.round((m.last_input_tokens / m.context_window) * 100) + '%)'
+                        ? ' · ctx:' + Math.round(m.last_input_tokens / 1000) + 'k/' + Math.round(m.context_window / 1000) + 'k (' + ctxPct + '%)'
                         : ''),
                   ),
                   React.createElement(
@@ -1900,9 +2039,23 @@ window.__ModuleLoader__.load({
               var badges = []
               if (p.kind) badges.push(p.kind)
               if (p.verdict) badges.push('verdict:' + p.verdict)
+              if (p.artifact && p.artifact.commit_sha) {
+                var fc = Array.isArray(p.artifact.changed_files) ? p.artifact.changed_files.length : 0
+                badges.push('commit:' + p.artifact.commit_sha + '(' + fc + 'f)')
+              }
+              if (p.witness) {
+                var wf = Array.isArray(p.witness.output_flags) && p.witness.output_flags.length > 0
+                  ? ',flags:' + p.witness.output_flags.join('|')
+                  : ''
+                badges.push('witness:exec=' + (p.witness.exec_calls || 0) + ',err=' + (p.witness.tool_errors || 0) + wf)
+              }
+              if (p.blind_group) {
+                badges.push('blind:' + p.blind_group + '(' + (p.blind_group_status || 'sealed') + ')')
+              }
               if (p.escalate) badges.push('ESCALATE')
               if (p.silent) badges.push('SILENT')
               if (isSuperseded) badges.push('superseded->#' + p.superseded_by)
+              var hygieneFlags = p.artifact && Array.isArray(p.artifact.diff_hygiene_flags) ? p.artifact.diff_hygiene_flags : []
               var shortTime = p.time ? String(p.time).slice(11, 19) || String(p.time) : ''
 
               return React.createElement(
@@ -1998,6 +2151,21 @@ window.__ModuleLoader__.load({
                         : null,
                       badges.length > 0
                         ? React.createElement('span', null, '[' + badges.join(' | ') + ']')
+                        : null,
+                      hygieneFlags.length > 0
+                        ? React.createElement(
+                            'span',
+                            {
+                              style: {
+                                padding: '0 5px',
+                                borderRadius: '4px',
+                                background: 'rgba(239, 68, 68, 0.16)',
+                                color: '#ef4444',
+                                fontWeight: 600,
+                              },
+                            },
+                            'HYGIENE: ' + hygieneFlags.join(', '),
+                          )
                         : null,
                     ),
                   ),
@@ -2148,6 +2316,8 @@ window.__ModuleLoader__.load({
       if (role === 'coordinator') return '#3b82f6'
       if (role === 'architect') return '#a855f7'
       if (role === 'verifier') return '#10b981'
+      if (role === 'red_team') return '#f43f5e'
+      if (role === 'lore_master') return '#06b6d4'
       return '#64748b'
     }
 

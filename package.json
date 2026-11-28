@@ -1,6 +1,6 @@
 {
   "name": "dsh-swarm",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Out-of-tree Multi-Agent Swarm (/swarm) plugin for DeepSeek Harness (dsh): 2-file SSOT event-sourced blackboard (events.jsonl + offsets.json) with 50-event checkpoints, scoped lazy tool unlocking, zero-token swarm_wait + Stop-Hook race lock, Git worktree isolation, and live Board / Control / Round Table UI.",
   "license": "MIT",
   "repository": {

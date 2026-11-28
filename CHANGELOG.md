@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.0 (2026-11-28)
+
+- **`supersedes` Privilege-Escalation Fix (Anti-Fake-Pushback Gate Hardening)**:
+  - Hardened both `post_board` and `computeActiveRejections` (`canSupersedeReject` / `isMergeGateRejectPost`) so only the **original rejecting reviewer**, its explicit `handover_to` successor, or `@coordinator` with `verdict="override"` may supersede a blocking `[REJECT]` floor. Workers attempting to erase a reviewer's `[REJECT]` via `post_board(supersedes)` are now rejected with `[PERMISSION_ERROR]`.
+- **Objective Reviewer Transcript Witness & Optional Host-Run `gate_commands`**:
+  - Tracked per-cycle shell/command execution counts, tool errors, and output failure/skip keyword hits (`scanOutputForGateFlags`) from live `session/event` streams in `index.js`.
+  - Attached objective `witness` metadata (`exec_calls`, `tool_calls`, `tool_errors`, `output_flags`, `turn_count`) to review/approval posts, rendered `[WITNESS: ...]` badges in `post_board`/`read_board`, and hard-blocked live `verifier`/`red_team` rubber-stamp `verdict="approve"` attempts with 0 command executions (`[WITNESS_BLOCKED]`).
+  - Added optional `gate_commands` on `swarm_init` / `swarm_plan` and `swarm_land(action="gate")`, executed deterministically by the Host (`runHostGateCommands`, `shell: false`) before `swarm_land(action="apply")` and `post_board(kind="done")`—blocking both non-zero exit codes AND silent `rc=0` failure/skip keywords (`[HOST_GATE_BLOCKED]`).
+- **Pre-Spawn Static `[OWNERSHIP]` Overlap Warning**:
+  - Added `patternsMayOverlap` / `findOwnershipOverlaps` in `src/host/worktree.js` and wired static pre-spawn scope conflict detection into `swarm_add` (`[OWNERSHIP_OVERLAP_WARN]`), warning Coordinator before concurrent workers collide.
+- **Host-Side `blind_group` / `blind_quorum` Sealed Proposal Barrier**:
+  - Added optional `blind_group` and `blind_quorum` (`2..20`, default `2`) on `post_board` (`computeBlindGroupState` + `orderUnsealedBlindGroupPosts`).
+  - All posts land verbatim on `events.jsonl` while peers see `[BLIND_SEALED]` placeholders until quorum distinct authors submit; on quorum completion, the barrier atomically unseals, wakes participants with `[BLIND_GROUP_UNSEALED]`, and displays proposals in deterministic hash-shuffled order to eliminate first-mover anchoring.
+- **Read-Only Rightbar UI (`client.js`) Upgrade & Docs Sync**:
+  - Updated `client.js` (`VERSION = '0.7.0'`) to render Ground-Truth Anchors, Host Gate Commands + last pass/fail status, `red_team` / `lore_master` role colors, `BLIND` / `CTX >= 80%` / `LOOP >= 3x` / `adopted<-` / `review->` roster signals, retired-reviewer / target-scoped `[REJECT]` details, and Board `HYGIENE` / `witness` / `commit` / `blind_group` badges.
+
 ## 0.6.0 (2026-11-27)
 
 - **Blind Blackboard Projection for `verifier` / `red_team` (`blindToWorkerProse`) & Immutable Worker Submission Snapshots**:

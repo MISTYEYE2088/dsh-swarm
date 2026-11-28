@@ -14,7 +14,8 @@ import path from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
 
-import { SwarmStore, defaultSwarmRoot, formatTime } from './src/host/store.js'
+import { SwarmStore, defaultSwarmRoot, formatTime, computeBlindGroupState } from './src/host/store.js'
+import { scanOutputForGateFlags } from './src/host/worktree.js'
 import { ConcurrencyGate, PRIORITY, isConcurrencyFailure } from './src/host/concurrency-gate.js'
 import { handleTurnStopping, statusOf, buildSwarmSystemMessage } from './src/host/stop-hook.js'
 import { SwarmMonitorDaemon } from './src/host/monitor.js'
@@ -38,14 +39,14 @@ import {
   safeExportFilename,
 } from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.6.0'
+export const PLUGIN_VERSION = '0.7.0'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.6.0'
+    if (!fs.existsSync(headFile)) return 'release-0.7.0'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -53,7 +54,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.6.0'
+    return 'release-0.7.0'
   }
 }
 
@@ -366,6 +367,33 @@ export function applyWith(ctx, config, deps = {}) {
         ...(t.context_window > 0 ? { context_window: t.context_window } : {}),
         ...(t.consecutive_tool_errors > 0 ? { consecutive_tool_errors: t.consecutive_tool_errors } : {}),
         ...(t.last_tool_error_name ? { last_tool_error_name: t.last_tool_error_name } : {}),
+      }
+    },
+
+    getMemberWitness(sessionId) {
+      if (!sessionId) return null
+      const t = memberTelemetry.get(sessionId)
+      if (!t) return null
+      return {
+        turn_count: t.turn_count ?? 0,
+        cycle_exec_calls: t.cycle_exec_calls ?? 0,
+        cycle_tool_calls: t.cycle_tool_calls ?? 0,
+        cycle_tool_errors: t.cycle_tool_errors ?? 0,
+        cycle_output_flags: Array.from(t.cycle_output_flags ?? []),
+      }
+    },
+
+    resetMemberWitness(sessionId) {
+      if (!sessionId) return
+      const t = memberTelemetry.get(sessionId)
+      if (!t) return
+      t.cycle_exec_calls = 0
+      t.cycle_tool_calls = 0
+      t.cycle_tool_errors = 0
+      if (t.cycle_output_flags && typeof t.cycle_output_flags.clear === 'function') {
+        t.cycle_output_flags.clear()
+      } else {
+        t.cycle_output_flags = new Set()
       }
     },
 
@@ -992,6 +1020,23 @@ export function applyWith(ctx, config, deps = {}) {
       const unreachable = []
       const silentMentions = [...silentTargets]
 
+      let blindGroupInfo = null
+      let justUnsealed = false
+      if (typeof postRecord.blind_group === 'string' && postRecord.blind_group.trim()) {
+        const bgMap = computeBlindGroupState(store.readBoard(swarmId))
+        blindGroupInfo = bgMap.get(postRecord.blind_group.trim()) ?? null
+        justUnsealed = Boolean(blindGroupInfo && blindGroupInfo.unsealed && blindGroupInfo.unsealed_at_seq === postRecord.seq)
+      }
+
+      const effectiveWakeTargets = [...wakeTargets]
+      if (justUnsealed && blindGroupInfo) {
+        for (const participant of [...blindGroupInfo.authors, 'coordinator']) {
+          if (participant !== postRecord.agent && members[participant] && !members[participant].killed && !effectiveWakeTargets.includes(participant)) {
+            effectiveWakeTargets.push(participant)
+          }
+        }
+      }
+
       if ((postRecord.mentions ?? []).includes('monitor')) {
         const daemon = monitorDaemons.get(swarmId)
         if (daemon) {
@@ -1001,7 +1046,7 @@ export function applyWith(ctx, config, deps = {}) {
         woken.push('monitor')
       }
 
-      for (const targetName of wakeTargets) {
+      for (const targetName of effectiveWakeTargets) {
         if (targetName === 'monitor') continue
         const m = members[targetName]
         if (!m || m.killed) {
@@ -1033,11 +1078,13 @@ export function applyWith(ctx, config, deps = {}) {
           const titlePart = postRecord.title ? `: ${postRecord.title}` : ''
           const targetRoleSpec = getRoleSpec(m.role)
           const authorRole = members[postRecord.agent]?.role ?? 'worker'
-          const isBlindWorkerPost = targetRoleSpec.blindToWorkerProse === true && authorRole === 'worker' && postRecord.kind !== 'done'
+          const isSealedForTarget = Boolean(blindGroupInfo && !blindGroupInfo.unsealed && targetName !== 'coordinator' && targetName !== postRecord.agent)
+          const isBlindWorkerPost = !isSealedForTarget && targetRoleSpec.blindToWorkerProse === true && authorRole === 'worker' && postRecord.kind !== 'done'
           const rulesAnchor = formatReviewRules(targetRoleSpec.reviewRules, 'anchor')
           const anchorPart = rulesAnchor && postRecord.kind !== 'done' ? `\n${rulesAnchor}` : ''
           const blindAuditPart = (
-            !isBlindWorkerPost
+            !isSealedForTarget
+            && !isBlindWorkerPost
             && targetRoleSpec.canBlockMerge
             && postRecord.agent !== targetName
             && postRecord.kind !== 'done'
@@ -1055,15 +1102,20 @@ export function applyWith(ctx, config, deps = {}) {
               escalatePart = `\n[ESCALATE_TO_HUMAN] @${postRecord.agent} rejected ${maxStreak} consecutive rounds—stop local patching and ask the user to arbitrate architecture/scope.`
             }
           }
+          const unsealPart = justUnsealed && blindGroupInfo
+            ? `\n[BLIND_GROUP_UNSEALED] blind_group "${blindGroupInfo.group}" reached quorum (${blindGroupInfo.submitted_count}/${blindGroupInfo.quorum}); all proposals are now visible in shuffled order via read_board.`
+            : ''
           let wakeText
-          if (isBlindWorkerPost) {
+          if (isSealedForTarget) {
+            wakeText = `[board] #${postRecord.seq} @${postRecord.agent} submitted to sealed blind_group "${blindGroupInfo.group}" (${blindGroupInfo.submitted_count}/${blindGroupInfo.quorum}; body sealed until quorum) -> read_board(since=${m.last_read_seq ?? 0})`
+          } else if (isBlindWorkerPost) {
             const art = postRecord.artifact
             const artSummary = art
               ? `${art.commit_sha ? 'commit ' + art.commit_sha : 'diff=' + (art.diff_hash || 'none')}, ${(art.changed_files ?? []).length} file(s)`
               : 'new submission'
             wakeText = `[board] #${postRecord.seq} @${postRecord.agent} submitted (${artSummary}; blind review: worker prose hidden, inspect commit/diff + coordinator background) -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}`
           } else {
-            wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}${blindAuditPart}${escalatePart}`
+            wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}${blindAuditPart}${escalatePart}${unsealPart}`
           }
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
@@ -1329,6 +1381,10 @@ export function applyWith(ctx, config, deps = {}) {
           context_window: 0,
           consecutive_tool_errors: 0,
           last_tool_error_name: null,
+          cycle_exec_calls: 0,
+          cycle_tool_calls: 0,
+          cycle_tool_errors: 0,
+          cycle_output_flags: new Set(),
         }
         memberTelemetry.set(sid, t)
       }
@@ -1338,20 +1394,44 @@ export function applyWith(ctx, config, deps = {}) {
         t.last_turn_at = formatTime()
         scheduleTelemetryFlush(swarmId, false)
       } else if (event.type === 'tool/call') {
+        const toolName = String(event.data?.name ?? 'tool')
         t.tool_call_count += 1
         t.last_tool_call_at = formatTime()
-        t.last_tool_name = event.data?.name ?? 'tool'
+        t.last_tool_name = toolName
         t.last_error = null
         t.phase = 'RUNNING'
+        if (!/^(?:post_board|read_board|swarm_wait|swarm_status|swarm_model|swarm_plan|swarm_init|swarm_add|swarm_kill|swarm_concurrency)$/.test(toolName)) {
+          t.cycle_tool_calls = (t.cycle_tool_calls ?? 0) + 1
+        }
+        if (/(?:^|_)(?:bash|shell|pwsh|powershell|exec|run_command|terminal|cmd)(?:$|_)/i.test(toolName)) {
+          t.cycle_exec_calls = (t.cycle_exec_calls ?? 0) + 1
+        }
         scheduleTelemetryFlush(swarmId, false)
       } else if (event.type === 'tool/result') {
         const failed = event.data?.isError === true || Boolean(event.data?.error)
         if (failed) {
           t.consecutive_tool_errors = (t.consecutive_tool_errors ?? 0) + 1
           t.last_tool_error_name = event.data?.name ?? t.last_tool_name ?? 'tool'
+          t.cycle_tool_errors = (t.cycle_tool_errors ?? 0) + 1
         } else {
           t.consecutive_tool_errors = 0
           t.last_tool_error_name = null
+        }
+        const rawOut = typeof event.data?.text === 'string'
+          ? event.data.text
+          : (typeof event.data?.output === 'string'
+              ? event.data.output
+              : (typeof event.data?.content === 'string'
+                  ? event.data.content
+                  : (Array.isArray(event.data?.content)
+                      ? event.data.content.map(c => (typeof c === 'string' ? c : (c?.text ?? ''))).join('\n')
+                      : (event.data?.result && typeof event.data.result.text === 'string' ? event.data.result.text : ''))))
+        if (rawOut) {
+          const hitFlags = scanOutputForGateFlags(rawOut)
+          if (hitFlags.length > 0) {
+            if (!t.cycle_output_flags) t.cycle_output_flags = new Set()
+            for (const f of hitFlags) t.cycle_output_flags.add(f)
+          }
         }
       } else if (event.type === 'request/context') {
         if (typeof event.data?.contextWindow === 'number' && event.data.contextWindow > 0) {

@@ -64,14 +64,14 @@ dsh plugin --profile web remove dsh-swarm
 
 | 工具名 | 作用域 / 角色 | 职责 |
 | --- | --- | --- |
-| `swarm_init` | **全局常驻入口**（Coordinator） | 初始化 Swarm、探测 Git 仓库/子目录仓库，并动态解锁当前会话的其余 10 个 Swarm 工具 |
-| `swarm_plan` | Coordinator（init 后解锁） | 发布/更新 Wave 与 Track 计划（≤ 64 KB） |
-| `swarm_add` | Coordinator（init 后解锁） | 原子创建 `worker` / `architect` / `verifier` / `lore_master`（Git 可用时 `worker` 默认自动启用 `share` 隔离 worktree） |
+| `swarm_init` | **全局常驻入口**（Coordinator） | 初始化 Swarm、固化不可变 `anchors` 与可选宿主 `gate_commands`、探测 Git 仓库并动态解锁当前会话其余 10 个工具 |
+| `swarm_plan` | Coordinator（init 后解锁） | 发布/更新 Wave 与 Track 计划（≤ 64 KB）、`anchors` 及可选宿主 `gate_commands` |
+| `swarm_add` | Coordinator（init 后解锁） | 原子创建 `worker` / `architect` / `verifier` / `red_team` / `lore_master`（支持开工前 `[OWNERSHIP]` 静态重叠预警、`adopt_worktree_from` 无损接管与 `review_target` 独立快照审查） |
 | `swarm_concurrency` | Coordinator（init 后解锁） | 动态调整在途 LLM 并发请求槽位上限（`limit >= 1`） |
-| `swarm_land` | Coordinator（init 后解锁） | 对隔离 worktree 执行 `diff` 或 `apply` 合入主工作区（受 `[REJECT]` 门禁保护） |
-| `swarm_kill` | Coordinator（init 后解锁） | 退役成员并清理 worktree（未开工时释放名字复用，已发言则墓碑化保留历史） |
-| `post_board` | Coordinator + 子成员 | 发带标题黑板帖，支持 `@mentions`、`kind`、`verdict`（`approve`/`reject`/`override`）、`supersedes`、`escalate`、`silent` |
-| `read_board` | Coordinator + 子成员 | 按 `since` / `channel` / `mentions_only` / `kinds` / `include_superseded` / `limit` 读帖并推进游标 |
+| `swarm_land` | Coordinator（init 后解锁） | 执行 `diff`、`gate`（宿主直跑 `gate_commands`）、`preflight_all` 或 `apply` 合入主工作区（受 `[REJECT]`、`reviewed_diff_hash`、越界/敏感文件及宿主门禁保护） |
+| `swarm_kill` | Coordinator（init 后解锁） | 退役成员（支持 `keep_worktree: true` 留存工作区供接管，以及 `handover_to` 审查权交接） |
+| `post_board` | Coordinator + 子成员 | 发带标题黑板帖，支持 `@mentions`、`kind`、`verdict`、防越权 `supersedes`、`blind_group`/`blind_quorum` 盲封提案栅栏、Worker 不可变提交快照与审查者客观 `witness` 取证 |
+| `read_board` | Coordinator + 子成员 | 按 `since` / `channel` / `mentions_only` / `kinds` / `hide_superseded` / `limit` 读帖（支持盲审裁剪、盲封解封乱序及只读 `seance_member` 交接胶囊） |
 | `swarm_wait` | Coordinator + 子成员 | 调用 DSH 原生 `exec.concludeTurn()` 实现 0 Token 待机，配合 Stop-Hook 竞态锁防漏消息 |
 | `swarm_status` | Coordinator + 子成员 | 查看成员真实活性（`working`/`waiting`/`starting`/`zombie`/`error`）、轮次/工具计数、并发槽位与门禁 |
 | `swarm_model` | Coordinator + 子成员 | 原地热切成员 `provider/model` 并保留完整上下文 |
@@ -95,7 +95,7 @@ dsh plugin --profile web remove dsh-swarm
 
 ```bash
 node --check index.js && node --check client.js
-npm test               # 51 项端到端回归测试（SSOT、Checkpoint、作用域懒加载、UI 防闪烁等）
+npm test               # 70 项端到端回归测试（SSOT、盲审投影、宿主门禁、取证、盲封栅栏与 UI 等）
 npm run verify:install # npm pack 打包 + 独立干净目录安装门禁
 npm run test:boot      # 真实 @deepseek-ai/cordis 挂载验证（可按需设 DSH_CORDIS_PATH）
 ```

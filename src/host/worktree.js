@@ -169,6 +169,184 @@ export function scanPatchHygiene(patch) {
   return [...flags]
 }
 
+const OUTPUT_GATE_CHECKS = Object.freeze([
+  Object.freeze(['output_fail_keyword', /\b(?:FAILED|FAIL:|AssertionError|Traceback \(most recent call last\)|Segmentation fault|panic:|npm ERR!|ERR!|compilation terminated|build failed)\b|\u65ad\u8a00\u5931\u8d25|\u7f16\u8bd1\u5931\u8d25|\u6d4b\u8bd5\u5931\u8d25/i]),
+  Object.freeze(['output_error_keyword', /(?:^|\s)(?:ERROR:|FATAL:|Exception:|SyntaxError:|TypeError:|ReferenceError:)|\u62a5\u9519|\u6267\u884c\u5931\u8d25/im]),
+  Object.freeze(['output_skip_keyword', /\b(?:GTEST_SKIP|SKIPPED|pytest\.mark\.skip|unittest\.skip)\b|\[SKIP\]/i]),
+])
+
+// #FUNC Scan command or tool output text for objective failure, error, and skip signals beyond exit code 0.
+// #NOT  Never embeds literal CJK characters (uses ASCII Unicode escapes) so runtime zero-CJK invariants stay intact.
+// #EDGE-IN A command returning exit code 0 while printing `GTEST_SKIP` or `FAILED` is flagged non-empty → test_host_gate_commands_and_witness_enforcement
+// #WHY  Legacy scripts frequently exit 0 after printing failures or skipping tests; scanning `OUTPUT_GATE_CHECKS` catches silent green lies.
+export function scanOutputForGateFlags(text) {
+  if (typeof text !== 'string' || text.length === 0) return []
+  const flags = new Set()
+  for (const [flagName, regex] of OUTPUT_GATE_CHECKS) {
+    if (regex.test(text)) flags.add(flagName)
+  }
+  return [...flags]
+}
+
+/** Run one deterministic host verification command without `shell: true`, returning exit code, output flags, and bounded excerpt. */
+function runSingleGateCommand(command, { cwd, timeoutMs = 120_000, maxExcerptChars = 600 } = {}) {
+  return new Promise((resolve) => {
+    const startMs = Date.now()
+    const bin = process.platform === 'win32' ? 'cmd.exe' : 'sh'
+    const argv = process.platform === 'win32' ? ['/d', '/s', '/c', command] : ['-c', command]
+    let child
+    try {
+      child = spawn(bin, argv, {
+        cwd,
+        shell: false,
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (error) {
+      resolve({
+        command,
+        exit_code: -1,
+        duration_ms: Date.now() - startMs,
+        output_flags: ['spawn_error'],
+        passed: false,
+        excerpt: String(error).slice(0, maxExcerptChars),
+      })
+      return
+    }
+
+    const chunks = []
+    let timedOut = false
+    const timer = setTimeout(() => {
+      timedOut = true
+      try { child.kill('SIGKILL') } catch {}
+    }, timeoutMs)
+
+    const pushChunk = (buf) => {
+      chunks.push(buf)
+      if (chunks.length > 256) chunks.splice(0, chunks.length - 256)
+    }
+    child.stdout.on('data', pushChunk)
+    child.stderr.on('data', pushChunk)
+    child.on('error', (error) => {
+      clearTimeout(timer)
+      resolve({
+        command,
+        exit_code: -1,
+        duration_ms: Date.now() - startMs,
+        output_flags: ['spawn_error'],
+        passed: false,
+        excerpt: String(error).slice(0, maxExcerptChars),
+      })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      const combined = Buffer.concat(chunks).toString('utf8')
+      const flags = scanOutputForGateFlags(combined)
+      if (timedOut) flags.push('timeout')
+      const exitCode = code ?? -1
+      const passed = !timedOut && exitCode === 0 && flags.length === 0
+      const trimmed = combined.trim()
+      const excerpt = trimmed.length > maxExcerptChars
+        ? `...${trimmed.slice(-maxExcerptChars)}`
+        : trimmed
+      resolve({
+        command,
+        exit_code: exitCode,
+        duration_ms: Date.now() - startMs,
+        output_flags: flags,
+        passed,
+        excerpt,
+      })
+    })
+  })
+}
+
+// #FUNC Execute deterministic host `gate_commands` in `cwd`, requiring both `exit_code === 0` and zero failure/skip keyword hits.
+// #NOT  Never trusts agent self-reported exit codes or runs commands via `shell: true`.
+// #EDGE-IN A gate command exiting 0 while emitting `GTEST_SKIP` fails host verification and blocks landing → test_host_gate_commands_and_witness_enforcement
+// #WHY  Host-executed `runHostGateCommands` with `scanOutputForGateFlags` eliminates circular self-proof and silent `rc=0` script lies.
+export async function runHostGateCommands(cwd, commands = [], options = {}) {
+  const list = Array.isArray(commands)
+    ? commands.map(c => String(c ?? '').trim()).filter(Boolean)
+    : []
+  const results = []
+  for (const cmd of list) {
+    results.push(await runSingleGateCommand(cmd, { cwd, ...options }))
+  }
+  const failedCount = results.filter(r => !r.passed).length
+  return {
+    ok: failedCount === 0,
+    cwd,
+    ran: results.length,
+    failed_count: failedCount,
+    results,
+  }
+}
+
+/** Check whether two normalized path/glob patterns can statically match at least one common file path. */
+export function patternsMayOverlap(patA, patB) {
+  const a = String(patA ?? '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').trim()
+  const b = String(patB ?? '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').trim()
+  if (!a || !b) return false
+  if (a === b) return true
+  if (matchPathPattern(a, b) || matchPathPattern(b, a)) return true
+  const stripWildcard = (p) => {
+    const idx = p.indexOf('*')
+    if (idx === -1) return p
+    const prefix = p.slice(0, idx)
+    const lastSlash = prefix.lastIndexOf('/')
+    return lastSlash === -1 ? '' : prefix.slice(0, lastSlash)
+  }
+  const aHasWild = a.includes('*')
+  const bHasWild = b.includes('*')
+  const prefA = stripWildcard(a)
+  const prefB = stripWildcard(b)
+  if (aHasWild && bHasWild) {
+    if (!prefA || !prefB) return true
+    return prefA === prefB || prefA.startsWith(`${prefB}/`) || prefB.startsWith(`${prefA}/`)
+  }
+  if (aHasWild) {
+    if (!prefA) return a.includes('**') || !b.includes('/')
+    return b === prefA || b.startsWith(`${prefA}/`)
+  }
+  if (bHasWild) {
+    if (!prefB) return b.includes('**') || !a.includes('/')
+    return a === prefB || a.startsWith(`${prefB}/`)
+  }
+  return a.startsWith(`${b}/`) || b.startsWith(`${a}/`)
+}
+
+// #FUNC Detect static `[OWNERSHIP]` path/glob overlaps between a newly spawned worker and existing active workers before work begins.
+// #NOT  Never flags retired (`killed`) members, reviewers, or the predecessor being replaced via `adopt_worktree_from`.
+// #EDGE-IN Spawning `@worker-b` owning `src/auth/login.js` while `@worker-a` owns `src/auth/*` reports the exact overlapping pair → test_prespawn_ownership_overlap_and_supersedes_auth
+// #WHY  Checking `patternsMayOverlap` at `swarm_add` time warns Coordinator before parallel workers waste turns creating merge conflicts.
+export function findOwnershipOverlaps(candidatePatterns = [], existingMembers = {}, excludeNames = []) {
+  const patterns = Array.isArray(candidatePatterns) ? candidatePatterns.filter(Boolean) : []
+  if (patterns.length === 0) return []
+  const excluded = new Set((excludeNames || []).filter(Boolean))
+  const overlaps = []
+  for (const [mName, m] of Object.entries(existingMembers || {})) {
+    if (!m || m.killed || m.role !== 'worker' || excluded.has(mName)) continue
+    const otherPatterns = Array.isArray(m.owned_paths) && m.owned_paths.length > 0
+      ? m.owned_paths
+      : (Array.isArray(m.brief_owned_paths) ? m.brief_owned_paths : [])
+    for (const cand of patterns) {
+      for (const other of otherPatterns) {
+        if (patternsMayOverlap(cand, other)) {
+          overlaps.push({
+            member: mName,
+            pattern: cand,
+            other_pattern: other,
+            workspace_mode: m.workspace_mode ?? 'inherit',
+          })
+          break
+        }
+      }
+    }
+  }
+  return overlaps
+}
+
 /** Selectively copy gitignored files matching `<mainCwd>/.worktreeinclude` into `targetDir` after `baselineCommit` (never committed). */
 async function syncWorktreeIncludeFiles(mainCwd, targetDir) {
   const includeFile = path.join(mainCwd, '.worktreeinclude')

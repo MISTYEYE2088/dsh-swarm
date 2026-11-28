@@ -217,6 +217,9 @@ export function registerRole(name, spec = {}) {
     blindToWorkerProse: spec.blindToWorkerProse !== undefined
       ? Boolean(spec.blindToWorkerProse)
       : (prev ? prev.blindToWorkerProse : false),
+    requireExecWitness: spec.requireExecWitness !== undefined
+      ? Boolean(spec.requireExecWitness)
+      : (prev ? prev.requireExecWitness : false),
     defaultProvider: spec.defaultProvider !== undefined
       ? String(spec.defaultProvider ?? '').trim()
       : (prev ? prev.defaultProvider : ''),
@@ -256,6 +259,7 @@ export function getRoleSpec(role) {
     requireParkOnStop: key !== 'coordinator' && key !== 'monitor',
     requireRecipientOnPost: key !== 'coordinator' && key !== 'monitor',
     blindToWorkerProse: false,
+    requireExecWitness: false,
     defaultProvider: '',
     defaultModel: '',
     preferredModelKeywords: Object.freeze([]),
@@ -306,6 +310,7 @@ registerRole('verifier', {
   canBlockMerge: true,
   autoShareInGit: false,
   blindToWorkerProse: true,
+  requireExecWitness: true,
   priorityTier: 'high',
   requireParkOnStop: true,
   preferredModelKeywords: ['glm', 'auto'],
@@ -317,6 +322,7 @@ registerRole('red_team', {
   canBlockMerge: true,
   autoShareInGit: false,
   blindToWorkerProse: true,
+  requireExecWitness: true,
   priorityTier: 'high',
   requireParkOnStop: true,
   preferredModelKeywords: ['glm', 'auto'],

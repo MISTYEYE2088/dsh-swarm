@@ -3987,6 +3987,383 @@ async function test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_
   assert.equal(pfGood.overlaps.length, 0)
 }
 
+async function test_prespawn_ownership_overlap_and_supersedes_auth() {
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(
+    fakeCtx,
+    { swarmDir: path.join(tempRoot, 'e2e-overlap-sup'), worktreesDir: path.join(tempRoot, 'wt-overlap-sup') },
+    { log: () => {}, warn: () => {} },
+  )
+  const coordAgent = { id: 'sess-ov', session: { header: { id: 'sess-ov', cwd: tempRoot } } }
+  await registeredTools.get('swarm_init').execute({ title: 'Overlap & Supersedes Auth', concurrency_limit: 4 }, { agent: coordAgent })
+  const addTool = registeredTools.get('swarm_add')
+  const postTool = registeredTools.get('post_board')
+  const killTool = registeredTools.get('swarm_kill')
+  await addTool.execute({
+    name: 'w-auth',
+    role: 'worker',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\nsrc/auth/*\n[FORBIDDEN]\nsrc/billing/\n[DONE_CRITERIA]\nImplement auth',
+  }, { agent: coordAgent })
+
+  // Disjoint worker -> zero overlap warnings
+  const disjointRes = await addTool.execute({
+    name: 'w-billing',
+    role: 'worker',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\nsrc/billing/*\n[FORBIDDEN]\nsrc/auth/\n[DONE_CRITERIA]\nImplement billing',
+  }, { agent: coordAgent })
+  assert.equal(disjointRes.ok, true)
+  assert.equal(disjointRes.ownership_overlaps, undefined)
+
+  // Overlapping worker -> static pre-spawn [OWNERSHIP_OVERLAP_WARN]
+  const overlapRes = await addTool.execute({
+    name: 'w-login',
+    role: 'worker',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\nsrc/auth/login.js\n[FORBIDDEN]\nsrc/billing/\n[DONE_CRITERIA]\nImplement login',
+  }, { agent: coordAgent })
+  assert.equal(overlapRes.ok, true)
+  assert.ok(Array.isArray(overlapRes.ownership_overlaps) && overlapRes.ownership_overlaps.length === 1)
+  assert.equal(overlapRes.ownership_overlaps[0].member, 'w-auth')
+  assert.match(overlapRes.text, /\[OWNERSHIP_OVERLAP_WARN\]/)
+
+  // Reviewer rejects w-auth
+  await addTool.execute({
+    name: 'qa-sup',
+    role: 'verifier',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\ntests/\n[FORBIDDEN]\nsrc/\n[DONE_CRITERIA]\nVerify auth',
+  }, { agent: coordAgent })
+  const qaAgent = { id: 'sess-ov__qa-sup' }
+  const authAgent = { id: 'sess-ov__w-auth' }
+
+  const rej = await postTool.execute({
+    title: 'REJECT w-auth: missing token expiry check',
+    kind: 'review',
+    verdict: 'reject',
+    target_member: 'w-auth',
+    mentions: ['w-auth', 'coordinator'],
+    text: '@w-auth @coordinator [REJECT] Token expiry check missing',
+  }, { agent: qaAgent })
+  assert.equal(rej.ok, true)
+
+  // Rogue worker tries to unilaterally erase the rejection via supersedes -> HARD BLOCKED!
+  const rogueSup = await postTool.execute({
+    title: 'Claiming fixed and superseding QA reject',
+    kind: 'report',
+    mentions: ['coordinator'],
+    supersedes: [rej.seq],
+    text: '@coordinator I decided to supersede the QA rejection myself.',
+  }, { agent: authAgent })
+  assert.equal(rogueSup.ok, false)
+  assert.equal(rogueSup.blocked_supersedes, rej.seq)
+  assert.match(rogueSup.text, /\[PERMISSION_ERROR: post_board\]/)
+
+  // Even if an unauthorized supersedes event were injected directly into store, computeActiveRejections still keeps the reject alive!
+  runtime.store.appendBoardRecord('sess-ov', {
+    type: 'post',
+    agent: 'w-auth',
+    kind: 'report',
+    title: 'Forged direct supersedes attempt',
+    mentions: ['coordinator'],
+    supersedes: [rej.seq],
+    text: '@coordinator forged direct supersedes',
+  })
+  assert.equal(runtime.store.computeActiveRejections('sess-ov', { targetMember: 'w-auth' }).length, 1)
+
+  // Kill qa-sup handing over to qa-sup-2 -> successor CAN supersede the open reject!
+  await addTool.execute({
+    name: 'qa-sup-2',
+    role: 'verifier',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\ntests/\n[FORBIDDEN]\nsrc/\n[DONE_CRITERIA]\nTake over QA',
+  }, { agent: coordAgent })
+  await killTool.execute({ name: 'qa-sup', force: true, handover_to: 'qa-sup-2', reason: 'Shift change' }, { agent: coordAgent })
+  const succSup = await postTool.execute({
+    title: 'Successor re-verified and superseded reject',
+    kind: 'review',
+    verdict: 'approve',
+    target_member: 'w-auth',
+    mentions: ['coordinator'],
+    supersedes: [rej.seq],
+    text: '@coordinator Verified token expiry fix and superseding prior reject.',
+  }, { agent: { id: 'sess-ov__qa-sup-2' } })
+  assert.equal(succSup.ok, true)
+  assert.equal(runtime.store.computeActiveRejections('sess-ov', { targetMember: 'w-auth' }).length, 0)
+}
+
+async function test_host_gate_commands_and_witness_enforcement() {
+  const repoDir = path.join(tempRoot, 'host-gate-repo')
+  fs.mkdirSync(repoDir, { recursive: true })
+  await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
+  fs.writeFileSync(path.join(repoDir, 'check.mjs'), 'console.log("BASE_OK")\n')
+  await runGit(['add', '.'], { cwd: repoDir })
+  await runGit(['commit', '-m', 'init'], { cwd: repoDir })
+
+  const registeredTools = new Map()
+  const listeners = new Map()
+  const fakeCtx = {
+    on(event, fn) {
+      if (!listeners.has(event)) listeners.set(event, [])
+      listeners.get(event).push(fn)
+      return () => {}
+    },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const emitSessionEvent = (sid, ev) => {
+    for (const fn of (listeners.get('session/event') || [])) {
+      fn({ id: sid }, ev)
+    }
+  }
+
+  const runtime = applyWith(
+    fakeCtx,
+    { swarmDir: path.join(tempRoot, 'e2e-host-gate'), worktreesDir: path.join(tempRoot, 'wt-host-gate') },
+    { log: () => {}, warn: () => {} },
+  )
+  const coordAgent = { id: 'sess-hg', session: { header: { id: 'sess-hg', cwd: repoDir } } }
+  await registeredTools.get('swarm_init').execute({
+    title: 'Host Gate & Witness Swarm',
+    concurrency_limit: 4,
+    gate_commands: ['node check.mjs'],
+  }, { agent: coordAgent })
+  const addTool = registeredTools.get('swarm_add')
+  const postTool = registeredTools.get('post_board')
+  const readTool = registeredTools.get('read_board')
+  const landTool = registeredTools.get('swarm_land')
+  const statusTool = registeredTools.get('swarm_status')
+
+  await addTool.execute({
+    name: 'w-gate',
+    role: 'worker',
+    workspace: 'share',
+    brief: '[OWNERSHIP]\ncheck.mjs\n[FORBIDDEN]\nREADME.md\n[DONE_CRITERIA]\nImplement check',
+  }, { agent: coordAgent })
+  await addTool.execute({
+    name: 'qa-wit',
+    role: 'verifier',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\ntests/\n[FORBIDDEN]\ncheck.mjs\n[DONE_CRITERIA]\nRun check.mjs',
+  }, { agent: coordAgent })
+
+  const qaSid = 'sess-hg__qa-wit'
+  const qaAgent = { id: qaSid }
+
+  // 1. Live verifier starts a turn and tries to rubber-stamp approve with 0 bash/exec calls -> WITNESS_BLOCKED!
+  emitSessionEvent(qaSid, { type: 'turn/start', data: { turn: 1 } })
+  const rubberStamp = await postTool.execute({
+    title: 'Rubber stamp approve without running commands',
+    kind: 'review',
+    verdict: 'approve',
+    target_member: 'w-gate',
+    mentions: ['coordinator'],
+    text: '@coordinator Looks good to me!',
+  }, { agent: qaAgent })
+  assert.equal(rubberStamp.ok, false)
+  assert.match(rubberStamp.text, /\[WITNESS_BLOCKED: post_board\]/)
+
+  // 2. Verifier runs bash whose output contains GTEST_SKIP -> allowed to post, witness flags recorded on board!
+  emitSessionEvent(qaSid, { type: 'tool/call', data: { name: 'wsl_bash', args: { command: 'node check.mjs' } } })
+  emitSessionEvent(qaSid, { type: 'tool/result', data: { name: 'wsl_bash', isError: false, text: 'GTEST_SKIP: skipped check' } })
+  const approvedWithWitness = await postTool.execute({
+    title: 'QA review after executing command',
+    kind: 'review',
+    verdict: 'approve',
+    target_member: 'w-gate',
+    mentions: ['coordinator'],
+    text: '@coordinator Ran node check.mjs and observed output.',
+  }, { agent: qaAgent })
+  assert.equal(approvedWithWitness.ok, true)
+  assert.equal(approvedWithWitness.witness.exec_calls, 1)
+  assert.ok(approvedWithWitness.witness.output_flags.includes('output_skip_keyword'))
+  assert.match(approvedWithWitness.text, /witness:exec=1/)
+
+  const coordRead = await readTool.execute({ since: 0 }, { agent: coordAgent })
+  assert.match(coordRead.text, /WITNESS:exec=1,err=0,flags=output_skip_keyword/)
+
+  // 3. Worker writes a fake-green rc=0 script that prints GTEST_SKIP -> Host gate_commands catches it and blocks landing!
+  const wtPath = runtime.store.readMembers('sess-hg')['w-gate'].worktree_path
+  fs.writeFileSync(path.join(wtPath, 'check.mjs'), 'console.log("GTEST_SKIP: bypassed assertions")\nprocess.exit(0)\n')
+
+  const gateCheckFail = await landTool.execute({ action: 'gate', name: 'w-gate' }, { agent: coordAgent })
+  assert.equal(gateCheckFail.ok, false)
+  assert.equal(gateCheckFail.host_gate.results[0].exit_code, 0)
+  assert.ok(gateCheckFail.host_gate.results[0].output_flags.includes('output_skip_keyword'))
+
+  const landBlocked = await landTool.execute({ action: 'apply', name: 'w-gate' }, { agent: coordAgent })
+  assert.equal(landBlocked.ok, false)
+  assert.match(landBlocked.text, /HOST_GATE_BLOCKED/)
+
+  // 4. Worker fixes check.mjs to real clean pass, QA re-approves updated diff_hash, land + done pass!
+  fs.writeFileSync(path.join(wtPath, 'check.mjs'), 'console.log("REAL_PASS_OK")\n')
+  emitSessionEvent(qaSid, { type: 'tool/call', data: { name: 'bash', args: { command: 'node check.mjs' } } })
+  emitSessionEvent(qaSid, { type: 'tool/result', data: { name: 'bash', isError: false, text: 'REAL_PASS_OK' } })
+  const reApp = await postTool.execute({
+    title: 'QA re-approved clean check.mjs',
+    kind: 'review',
+    verdict: 'approve',
+    target_member: 'w-gate',
+    mentions: ['coordinator'],
+    text: '@coordinator REAL_PASS_OK verified cleanly.',
+  }, { agent: qaAgent })
+  assert.equal(reApp.ok, true)
+  assert.equal(reApp.witness.output_flags.length, 0)
+
+  const landOk = await landTool.execute({ action: 'apply', name: 'w-gate' }, { agent: coordAgent })
+  assert.equal(landOk.ok, true, `Expected host gate apply to succeed: ${landOk.text}`)
+
+  const st = await statusTool.execute({}, { agent: coordAgent })
+  assert.match(st.text, /Host Gate Commands \(1\): node check\.mjs \[last=PASS@w-gate\]/)
+
+  const doneOk = await postTool.execute({
+    title: 'Swarm verified and closed cleanly',
+    kind: 'done',
+    mentions: ['coordinator'],
+    text: '[done] Host gate commands green on main.',
+  }, { agent: coordAgent })
+  assert.equal(doneOk.ok, true, `Expected done host gate to succeed: ${doneOk.text}`)
+}
+
+async function test_blind_group_sealed_barrier_and_shuffled_unseal() {
+  const registeredTools = new Map()
+  const steeredByAgent = new Map()
+  const fakeAgentsSvc = {
+    map: new Map(),
+    get(id) { return this.map.get(id) },
+    async create({ sessionId }) {
+      const id = sessionId
+      const agent = {
+        id,
+        status: 'idle',
+        steer(msg) {
+          if (!steeredByAgent.has(id)) steeredByAgent.set(id, [])
+          steeredByAgent.get(id).push(msg)
+        },
+        inject(msg) {
+          if (!steeredByAgent.has(id)) steeredByAgent.set(id, [])
+          steeredByAgent.get(id).push(msg)
+        },
+      }
+      this.map.set(id, agent)
+      return { agent, dispose: async () => { this.map.delete(id) } }
+    },
+  }
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') return fakeAgentsSvc
+      return undefined
+    },
+  }
+  const runtime = applyWith(
+    fakeCtx,
+    { swarmDir: path.join(tempRoot, 'e2e-blind-group') },
+    { log: () => {}, warn: () => {} },
+  )
+  const coordAgent = {
+    id: 'sess-bg',
+    status: 'idle',
+    session: { header: { id: 'sess-bg', cwd: tempRoot } },
+    steer(msg) {
+      if (!steeredByAgent.has('sess-bg')) steeredByAgent.set('sess-bg', [])
+      steeredByAgent.get('sess-bg').push(msg)
+    },
+  }
+  fakeAgentsSvc.map.set('sess-bg', coordAgent)
+
+  await registeredTools.get('swarm_init').execute({ title: 'Blind Group Quorum Test', concurrency_limit: 4 }, { agent: coordAgent })
+  const addTool = registeredTools.get('swarm_add')
+  const postTool = registeredTools.get('post_board')
+  const readTool = registeredTools.get('read_board')
+  await addTool.execute({
+    name: 'arch-a',
+    role: 'architect',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\ndesign-a\n[FORBIDDEN]\ncode\n[DONE_CRITERIA]\nIndependent proposal A',
+  }, { agent: coordAgent })
+  await addTool.execute({
+    name: 'arch-b',
+    role: 'architect',
+    workspace: 'inherit',
+    brief: '[OWNERSHIP]\ndesign-b\n[FORBIDDEN]\ncode\n[DONE_CRITERIA]\nIndependent proposal B',
+  }, { agent: coordAgent })
+
+  const archA = { id: 'sess-bg__arch-a' }
+  const archB = { id: 'sess-bg__arch-b' }
+
+  // 1. arch-a submits proposal 1 of 2 to blind_group "arch-r1"
+  const subA = await postTool.execute({
+    title: 'Proposal A: Ring Buffer Zero-Copy',
+    kind: 'report',
+    mentions: ['arch-b', 'coordinator'],
+    blind_group: 'arch-r1',
+    blind_quorum: 2,
+    text: '@arch-b @coordinator SECRET_PROPOSAL_ALPHA_DETAILS',
+  }, { agent: archA })
+  assert.equal(subA.ok, true)
+  assert.equal(subA.blind_group.unsealed, false)
+  assert.equal(subA.blind_group.submitted_count, 1)
+
+  // Peer arch-b reading board BEFORE quorum must NOT see Proposal A's title or body!
+  const readBSealed = await readTool.execute({ since: 0 }, { agent: archB })
+  const postAForB = readBSealed.posts.find(p => p.seq === subA.seq)
+  assert.ok(postAForB)
+  assert.equal(postAForB.sealed_for_blind_group, true)
+  assert.ok(!postAForB.text.includes('SECRET_PROPOSAL_ALPHA_DETAILS'), 'Sealed peer must not see proposal body')
+  assert.ok(!postAForB.title.includes('Ring Buffer Zero-Copy'), 'Sealed peer must not see proposal title')
+
+  // Wakeup delivered to arch-b while sealed must also redact title
+  const bWakeups = (steeredByAgent.get('sess-bg__arch-b') || []).map(m => JSON.stringify(m)).join('\n')
+  assert.ok(!bWakeups.includes('Ring Buffer Zero-Copy'), 'Sealed wakeup must not leak proposal title')
+
+  // Coordinator and author arch-a still see full text (SSOT intact)
+  const readCoordSealed = await readTool.execute({ since: 0 }, { agent: coordAgent })
+  assert.ok(readCoordSealed.posts.find(p => p.seq === subA.seq).text.includes('SECRET_PROPOSAL_ALPHA_DETAILS'))
+
+  // 2. arch-b submits proposal 2 of 2 -> quorum reached -> barrier unseals atomically!
+  const subB = await postTool.execute({
+    title: 'Proposal B: Event-Sourced Queue',
+    kind: 'report',
+    mentions: ['coordinator'],
+    blind_group: 'arch-r1',
+    blind_quorum: 2,
+    text: '@coordinator SECRET_PROPOSAL_BETA_DETAILS',
+  }, { agent: archB })
+  assert.equal(subB.ok, true)
+  assert.equal(subB.blind_group.unsealed, true)
+  assert.equal(subB.blind_group.submitted_count, 2)
+  assert.match(subB.text, /UNSEALED\(2\/2\)/)
+
+  // arch-a was woken with [BLIND_GROUP_UNSEALED] and now both peers see both proposals cleanly!
+  const aWakeups = (steeredByAgent.get('sess-bg__arch-a') || []).map(m => JSON.stringify(m)).join('\n')
+  assert.match(aWakeups, /\[BLIND_GROUP_UNSEALED\]/)
+
+  const readBUnsealed = await readTool.execute({ since: 0 }, { agent: archB })
+  const unsealedA = readBUnsealed.posts.find(p => p.seq === subA.seq)
+  const unsealedB = readBUnsealed.posts.find(p => p.seq === subB.seq)
+  assert.ok(unsealedA.text.includes('SECRET_PROPOSAL_ALPHA_DETAILS'))
+  assert.ok(unsealedB.text.includes('SECRET_PROPOSAL_BETA_DETAILS'))
+  assert.equal(unsealedA.blind_group_status, 'unsealed')
+  assert.equal(unsealedB.blind_group_status, 'unsealed')
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -4079,6 +4456,9 @@ try {
   await runTest('test_isolated_review_worktree_catches_rogue_writes_and_blind_projection', test_isolated_review_worktree_catches_rogue_writes_and_blind_projection)
   await runTest('test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff', test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff)
   await runTest('test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all', test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all)
+  await runTest('test_prespawn_ownership_overlap_and_supersedes_auth', test_prespawn_ownership_overlap_and_supersedes_auth)
+  await runTest('test_host_gate_commands_and_witness_enforcement', test_host_gate_commands_and_witness_enforcement)
+  await runTest('test_blind_group_sealed_barrier_and_shuffled_unseal', test_blind_group_sealed_barrier_and_shuffled_unseal)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

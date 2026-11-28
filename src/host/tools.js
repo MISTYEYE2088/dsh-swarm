@@ -4,6 +4,7 @@
 // languages. All tool return payloads pass through `toLosslessJson()` so DSH's
 // lossless JSON validation can never fail after a write commits.
 
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -13,6 +14,9 @@ import {
   resolveVerdictTargets,
   extractScreenshotsFromPosts,
   computeSupersededMap,
+  isMergeGateRejectPost,
+  canSupersedeReject,
+  computeBlindGroupState,
   deriveFallbackTitle,
   VALID_POST_KINDS,
   VALID_VERDICTS,
@@ -33,6 +37,8 @@ import {
   diffWorktree,
   snapshotWorktreeCommit,
   scanPatchHygiene,
+  runHostGateCommands,
+  findOwnershipOverlaps,
   auditChangedPaths,
   landWorktree,
   removeIsolatedWorktree,
@@ -124,18 +130,76 @@ function discoverChildGitRepos(baseDir) {
   return found
 }
 
-/** Project a board post for `callerRole`, replacing worker prose with an objective commit/diff envelope when `blindToWorkerProse` is enabled. */
-export function projectPostForCaller(post, callerRole, members = {}) {
-  if (!post || post.type === 'control') return post
-  const callerSpec = getRoleSpec(callerRole)
-  if (callerSpec.blindToWorkerProse !== true) return post
-  const authorRole = members[post.agent]?.role ?? 'worker'
-  if (authorRole !== 'worker') return post
+/** Collect deduplicated host `gate_commands` configured on Swarm metadata and active plan. */
+function collectEffectiveGateCommands(swarmMeta, planMeta) {
+  return [...new Set([
+    ...(Array.isArray(swarmMeta?.gate_commands) ? swarmMeta.gate_commands : []),
+    ...(Array.isArray(planMeta?.gate_commands) ? planMeta.gate_commands : []),
+  ].map(c => String(c ?? '').trim()).filter(Boolean))]
+}
 
-  const art = post.artifact && typeof post.artifact === 'object' ? post.artifact : null
+/** Deterministically shuffle posts within each unsealed `blind_group` across their occupied slots to break first-mover anchoring. */
+export function orderUnsealedBlindGroupPosts(posts, swarmId, blindGroups) {
+  if (!Array.isArray(posts) || posts.length < 2 || !blindGroups || blindGroups.size === 0) return posts
+  const out = [...posts]
+  const indicesByGroup = new Map()
+  for (let i = 0; i < out.length; i += 1) {
+    const p = out[i]
+    if (!p || p.type === 'control' || !p.blind_group) continue
+    const g = blindGroups.get(p.blind_group)
+    if (!g || !g.unsealed) continue
+    if (!indicesByGroup.has(p.blind_group)) indicesByGroup.set(p.blind_group, [])
+    indicesByGroup.get(p.blind_group).push(i)
+  }
+  for (const [group, slotIndices] of indicesByGroup.entries()) {
+    if (slotIndices.length < 2) continue
+    const items = slotIndices.map(idx => ({
+      post: out[idx],
+      sortKey: createHash('sha256').update(`${swarmId}:${group}:${out[idx].seq}`, 'utf8').digest('hex'),
+    }))
+    items.sort((a, b) => a.sortKey.localeCompare(b.sortKey))
+    for (let k = 0; k < slotIndices.length; k += 1) {
+      out[slotIndices[k]] = items[k].post
+    }
+  }
+  return out
+}
+
+/** Project a board post for `callerRole`, enforcing `blind_group` sealing until quorum and replacing worker prose with an objective commit/diff envelope when `blindToWorkerProse` is enabled. */
+export function projectPostForCaller(post, callerRole, members = {}, options = {}) {
+  if (!post || post.type === 'control') return post
+  const callerName = options.callerName ?? null
+  const blindGroups = options.blindGroups ?? null
+  let basePost = post
+
+  if (typeof post.blind_group === 'string' && post.blind_group.trim() && blindGroups instanceof Map) {
+    const bg = blindGroups.get(post.blind_group.trim())
+    if (bg) {
+      if (!bg.unsealed && callerName !== 'coordinator' && callerName !== post.agent) {
+        return {
+          ...post,
+          title: `[BLIND_SEALED] blind_group "${bg.group}" (${bg.submitted_count}/${bg.quorum} submitted)`,
+          text: `[BLIND_SEALED] Submission #${post.seq} by @${post.agent} in blind_group "${bg.group}" (${bg.submitted_count}/${bg.quorum} submitted). Body stays sealed until quorum (${bg.quorum}) is reached.`,
+          sealed_for_blind_group: true,
+          blind_group_status: 'sealed',
+        }
+      }
+      basePost = {
+        ...post,
+        blind_group_status: bg.unsealed ? 'unsealed' : 'sealed',
+      }
+    }
+  }
+
+  const callerSpec = getRoleSpec(callerRole)
+  if (callerSpec.blindToWorkerProse !== true) return basePost
+  const authorRole = members[basePost.agent]?.role ?? 'worker'
+  if (authorRole !== 'worker') return basePost
+
+  const art = basePost.artifact && typeof basePost.artifact === 'object' ? basePost.artifact : null
   const commitPart = art?.commit_sha ? ` (${art.commit_sha})` : ''
   const lines = [
-    `[BLIND_REVIEW_ENVELOPE] Worker prose intentionally redacted for @${post.agent} (#${post.seq}). Audit strictly from raw commit/diff and @coordinator background/anchors.`,
+    `[BLIND_REVIEW_ENVELOPE] Worker prose intentionally redacted for @${basePost.agent} (#${basePost.seq}). Audit strictly from raw commit/diff and @coordinator background/anchors.`,
   ]
   if (art) {
     if (art.worktree_path) lines.push(`Worktree: ${art.worktree_path}`)
@@ -159,8 +223,8 @@ export function projectPostForCaller(post, callerRole, members = {}) {
   }
 
   return {
-    ...post,
-    title: `[BLIND_REVIEW] @${post.agent} submission #${post.seq}${commitPart}`,
+    ...basePost,
+    title: `[BLIND_REVIEW] @${basePost.agent} submission #${basePost.seq}${commitPart}`,
     text: lines.join('\n'),
     redacted_for_blind_review: true,
   }
@@ -222,6 +286,11 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       session_id: m.session_id,
       role: m.role,
       can_block_merge: m.can_block_merge === true || getRoleSpec(m.role).canBlockMerge,
+      blind_to_worker_prose: getRoleSpec(m.role).blindToWorkerProse === true,
+      adopted_from: m.adopted_from ?? null,
+      review_target: m.review_target ?? null,
+      owned_paths: Array.isArray(m.owned_paths) ? m.owned_paths : [],
+      forbidden_paths: Array.isArray(m.forbidden_paths) ? m.forbidden_paths : [],
       group: m.group ?? null,
       parent: m.parent ?? null,
       phase: m.last_error ? 'ERROR' : m.phase,
@@ -261,18 +330,29 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
     })
   }
 
+  const blindGroupsMap = computeBlindGroupState(records)
+  const blindGroups = {}
+  for (const [gName, gVal] of blindGroupsMap.entries()) {
+    blindGroups[gName] = gVal
+  }
+  const effectiveGateCommands = collectEffectiveGateCommands(swarm, plan)
+
   const annotatedPosts = records.slice(-250).map((rec) => {
     if (!rec || rec.type === 'control') return rec
     const withTitle = rec.title ? rec : { ...rec, title: deriveFallbackTitle(rec.text, rec.kind || 'post') }
+    const bgInfo = withTitle.blind_group ? blindGroups[withTitle.blind_group] : null
+    const withBg = bgInfo ? { ...withTitle, blind_group_status: bgInfo.unsealed ? 'unsealed' : 'sealed' } : withTitle
     return supersededMap.has(rec.seq)
-      ? { ...withTitle, superseded_by: supersededMap.get(rec.seq) }
-      : withTitle
+      ? { ...withBg, superseded_by: supersededMap.get(rec.seq) }
+      : withBg
   })
 
   return {
     runtime: typeof runtime.getRuntimeFingerprint === 'function' ? runtime.getRuntimeFingerprint() : null,
     swarm,
     plan,
+    gate_commands: effectiveGateCommands,
+    blindGroups,
     headSeq,
     headOffset: projection.offset,
     channels: projection.channels,
@@ -314,6 +394,7 @@ export function createSwarmTools(runtime) {
         concurrency_limit: { type: 'integer', description: 'Positive integer in-flight LLM request slot limit (NOT a cap on member count; e.g. 2, 4, 6, 8).' },
         project_root: { type: 'string', description: 'Optional project directory (absolute or relative to session cwd) containing `.git` for isolated worktrees.' },
         anchors: { type: 'array', items: { type: 'string' }, description: 'Optional immutable ground-truth anchors (verbatim user paths, verification commands, hard constraints) auto-injected into every spawned brief.' },
+        gate_commands: { type: 'array', items: { type: 'string' }, description: 'Optional deterministic host verification commands run automatically on `swarm_land(apply)` and `post_board(kind="done")` (requiring rc=0 and zero fail/error/skip keywords).' },
         default_provider: { type: 'string', description: 'Optional registered LLM provider id (default: "inherit" from current session).' },
         default_model: { type: 'string', description: 'Optional model id or "provider/model" (default: "inherit" from current session).' },
         coordinator_model: { type: 'string', description: 'Optional coordinator model id (default: "inherit" from current session).' },
@@ -360,7 +441,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.6.0', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.7.0', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -429,6 +510,7 @@ export function createSwarmTools(runtime) {
         goal: { type: 'string', description: 'Overarching goal of the swarm.' },
         current_wave: { type: 'integer', description: 'Current wave number (1, 2, ...).' },
         anchors: { type: 'array', items: { type: 'string' }, description: 'Optional ground-truth anchors (verbatim paths, commands, constraints) auto-injected into spawned briefs.' },
+        gate_commands: { type: 'array', items: { type: 'string' }, description: 'Optional deterministic host verification commands enforced on `swarm_land(apply)` and `post_board(kind="done")`.' },
         waves: {
           type: 'array',
           description: 'List of wave descriptors.',
@@ -709,6 +791,7 @@ export function createSwarmTools(runtime) {
               base_commit: worktreeInfo.base_commit,
               baseline_tree: worktreeInfo.baseline_commit,
               owned_paths: effectiveOwnedPaths,
+              brief_owned_paths: spec.brief_owned_paths,
               forbidden_paths: effectiveForbiddenPaths,
               adopted_from: adoptedFromMember,
               review_target: spec.review_target,
@@ -797,6 +880,18 @@ export function createSwarmTools(runtime) {
         const activeCount = Object.values(allMembersAfter).filter(m => !m.killed && !m.system_builtin).length
         const llmSlots = swarmMeta.concurrency_limit ?? 4
 
+        const checkOwnedPatterns = spec.owned_paths.length > 0 ? spec.owned_paths : spec.brief_owned_paths
+        const ownershipOverlaps = spec.role === 'worker' && checkOwnedPatterns.length > 0
+          ? findOwnershipOverlaps(
+              checkOwnedPatterns,
+              existingMembers,
+              [...(spec.adopt_worktree_from ? [spec.adopt_worktree_from] : []), ...spec.targetNames],
+            )
+          : []
+        const overlapNote = ownershipOverlaps.length > 0
+          ? `\n[OWNERSHIP_OVERLAP_WARN] Static [OWNERSHIP] overlap detected with active worker(s): ${ownershipOverlaps.map(o => `${o.pattern} <-> @${o.member}:${o.other_pattern} (${o.workspace_mode})`).join('; ')}. Split write scopes or serialize waves to avoid merge conflicts.`
+          : ''
+
         runtime.notifyProjectionChanged(swarmId)
         const summary = createdRows.map(r => `@${r.name} (role=${r.role}, gate=${r.can_block_merge}, route=${r.provider}/${r.model}, workspace=${r.workspace}, brief=#${r.brief_seq}, live=${r.spawned_live_agent})`).join(', ')
         return {
@@ -804,7 +899,8 @@ export function createSwarmTools(runtime) {
           active_members: activeCount,
           llm_slots: llmSlots,
           created: createdRows,
-          text: `[swarm_add OK] Spawned and briefed: ${summary}. (active_members=${activeCount} / llm_slots=${llmSlots})`,
+          ...(ownershipOverlaps.length > 0 ? { ownership_overlaps: ownershipOverlaps } : {}),
+          text: `[swarm_add OK] Spawned and briefed: ${summary}. (active_members=${activeCount} / llm_slots=${llmSlots})${overlapNote}`,
         }
       })
     },
@@ -825,6 +921,8 @@ export function createSwarmTools(runtime) {
         verdict: { type: 'string', enum: [...VALID_VERDICTS], description: 'reject (blocks merge/done), approve, or override.' },
         target_member: { type: 'string', description: 'Optional target member name for scoped review verdicts (e.g. "worker-a", or "*" for swarm-wide).' },
         supersedes: { type: 'array', items: { type: 'integer' }, description: 'Earlier floor numbers obsoleted by this post.' },
+        blind_group: { type: 'string', description: 'Optional sealed proposal group id (e.g. "arch-r1"). Peers cannot read each other\'s submissions until `blind_quorum` distinct authors submit.' },
+        blind_quorum: { type: 'integer', description: 'Optional unique-author quorum (2..20, default: 2) required to unseal `blind_group` in shuffled order.' },
         escalate: { type: 'boolean', description: 'Bypass recipients\' wake_kinds filter.' },
         silent: { type: 'boolean', description: 'Log without waking anyone.' },
         idempotency_key: { type: 'string', description: 'Optional dedup key.' },
@@ -867,6 +965,24 @@ export function createSwarmTools(runtime) {
         const val = check.value
         const isDonePost = val.kind === 'done' || val.text.includes('[done]')
 
+        // Supersedes authorization: prevent workers or unauthorized peers from erasing a reviewer's [REJECT] gate
+        if (val.supersedes.length > 0) {
+          const recBySeq = new Map()
+          for (const r of records) {
+            if (r && r.type !== 'control') recBySeq.set(r.seq, r)
+          }
+          for (const oldSeq of val.supersedes) {
+            const oldRec = recBySeq.get(oldSeq)
+            if (oldRec && isMergeGateRejectPost(oldRec, existingMembers) && !canSupersedeReject(oldRec, callerName, val.verdict, existingMembers)) {
+              return {
+                ok: false,
+                blocked_supersedes: oldSeq,
+                text: `[PERMISSION_ERROR: post_board] @${callerName} cannot supersede [REJECT] floor #${oldSeq} authored by @${oldRec.agent}. Only the original reviewer, its explicit handover_to successor, or @coordinator with verdict="override" may supersede a rejection. Address @${oldRec.agent} on the board and wait for their CONCEDE or approve.`,
+              }
+            }
+          }
+        }
+
         if (isDonePost) {
           const activeRejections = store.computeActiveRejections(swarmId)
           if (activeRejections.length > 0 && !val.override_reason) {
@@ -875,6 +991,39 @@ export function createSwarmTools(runtime) {
               ok: false,
               blocked_by_rejections: activeRejections,
               text: `[GATE_BLOCKED: post_board] Closing blocked by ${activeRejections.length} unresolved rejection(s): [${list}]. Have the reviewer re-verify and post verdict="approve" (or supersede the rejection), or pass override_reason to explicitly override.`,
+            }
+          }
+          const swarmMetaForDone = store.readSwarm(swarmId)
+          const planMetaForDone = store.readPlan(swarmId)
+          const effectiveGates = collectEffectiveGateCommands(swarmMetaForDone, planMetaForDone)
+          if (effectiveGates.length > 0) {
+            const gateCwd = swarmMetaForDone?.project_root || process.cwd()
+            const gateRes = await runHostGateCommands(gateCwd, effectiveGates)
+            store.updateSwarm(swarmId, {
+              last_host_gate: {
+                ok: gateRes.ok,
+                target: 'main',
+                ran: gateRes.ran,
+                failed_count: gateRes.failed_count,
+                at: new Date().toISOString(),
+                results: gateRes.results.map(r => ({
+                  command: r.command,
+                  exit_code: r.exit_code,
+                  output_flags: r.output_flags,
+                  passed: r.passed,
+                })),
+              },
+            })
+            if (!gateRes.ok && !val.override_reason) {
+              const failedLines = gateRes.results
+                .filter(r => !r.passed)
+                .map(r => `\`${r.command}\` (rc=${r.exit_code}${r.output_flags.length > 0 ? ', flags=' + r.output_flags.join('|') : ''}): ${r.excerpt}`)
+                .join('\n')
+              return {
+                ok: false,
+                host_gate: gateRes,
+                text: `[HOST_GATE_BLOCKED: post_board] Host gate_commands failed (${gateRes.failed_count}/${gateRes.ran}) before closing:\n${failedLines}\nFix the failing checks or pass override_reason with explicit user approval.`,
+              }
             }
           }
         }
@@ -906,8 +1055,33 @@ export function createSwarmTools(runtime) {
         let reviewedDiffHash = null
         let reviewedDiffHashes = null
         let postArtifact = null
+        let postWitness = null
         const callerRecord = existingMembers[callerName]
         const callerCanBlock = Boolean(callerRecord && (callerRecord.can_block_merge === true || getRoleSpec(callerRecord.role).canBlockMerge))
+
+        // Objective reviewer transcript witness: attach real exec/tool/error/flag counts and block live rubber-stamp approvals with 0 exec calls
+        if (callerCanBlock && (val.verdict === 'approve' || val.kind === 'review')) {
+          const w = typeof runtime.getMemberWitness === 'function'
+            ? runtime.getMemberWitness(callerRecord.session_id)
+            : null
+          if (w) {
+            postWitness = {
+              exec_calls: w.cycle_exec_calls,
+              tool_calls: w.cycle_tool_calls,
+              tool_errors: w.cycle_tool_errors,
+              output_flags: w.cycle_output_flags,
+              turn_count: w.turn_count,
+            }
+            const needsExec = getRoleSpec(callerRecord.role).requireExecWitness === true
+            if (val.verdict === 'approve' && needsExec && w.turn_count > 0 && w.cycle_exec_calls === 0 && !val.override_reason) {
+              return {
+                ok: false,
+                witness: postWitness,
+                text: `[WITNESS_BLOCKED: post_board] Reviewer @${callerName} (${callerRecord.role}) attempted verdict="approve" after ${w.turn_count} turn(s) with 0 shell/command executions in this cycle. Run real verification commands first, or pass override_reason only for non-executable audits.`,
+              }
+            }
+          }
+        }
 
         // Zero-dirty-write gate: a reviewer running in an isolated review worktree must not mutate repo files (even via bash redirection)
         if (val.verdict === 'approve' && callerCanBlock && callerRecord.workspace_mode !== 'inherit' && callerRecord.worktree_path) {
@@ -1016,12 +1190,25 @@ export function createSwarmTools(runtime) {
           reviewed_diff_hash: reviewedDiffHash,
           reviewed_diff_hashes: reviewedDiffHashes,
           artifact: postArtifact,
+          witness: postWitness,
+          blind_group: val.blind_group,
+          blind_quorum: val.blind_quorum,
           supersedes: val.supersedes,
           escalate: val.escalate,
           silent: val.silent,
           idempotency_key: val.idempotency_key,
           text: finalText,
         })
+
+        if (callerCanBlock && postWitness && typeof runtime.resetMemberWitness === 'function') {
+          runtime.resetMemberWitness(callerRecord.session_id)
+        }
+
+        let blindGroupSummary = null
+        if (postRecord.blind_group) {
+          const bgAfter = computeBlindGroupState(store.readBoard(swarmId))
+          blindGroupSummary = bgAfter.get(postRecord.blind_group) ?? null
+        }
 
         let archivePath = null
         let releaseHygiene = null
@@ -1077,6 +1264,15 @@ export function createSwarmTools(runtime) {
         if (postRecord.verdict) {
           notes.push(`verdict=${postRecord.verdict}`)
         }
+        if (postWitness) {
+          const flagSuffix = postWitness.output_flags.length > 0 ? `,flags=${postWitness.output_flags.join('|')}` : ''
+          notes.push(`witness:exec=${postWitness.exec_calls},err=${postWitness.tool_errors}${flagSuffix}`)
+        }
+        if (blindGroupSummary) {
+          notes.push(blindGroupSummary.unsealed
+            ? `blind_group:${blindGroupSummary.group}=UNSEALED(${blindGroupSummary.submitted_count}/${blindGroupSummary.quorum})`
+            : `blind_group:${blindGroupSummary.group}=SEALED(${blindGroupSummary.submitted_count}/${blindGroupSummary.quorum})`)
+        }
 
         let consecutiveRejects = 0
         if (postRecord.verdict === 'reject') {
@@ -1108,6 +1304,8 @@ export function createSwarmTools(runtime) {
           unreachable: unreachableTargets,
           ignored_prose_mentions: val.ignored_prose_mentions,
           ...(consecutiveRejects > 0 ? { consecutive_rejects: consecutiveRejects } : {}),
+          ...(postWitness ? { witness: postWitness } : {}),
+          ...(blindGroupSummary ? { blind_group: blindGroupSummary } : {}),
           ...(archivePath ? { archive_path: archivePath } : {}),
           ...(releaseHygiene ? { release_hygiene: releaseHygiene } : {}),
           text: `OK #${postRecord.seq} (read=#${postRecord.seq}${notesSuffix})${escalateHumanNote}${hygieneNote}${archiveNote}${fpNote}`,
@@ -1167,6 +1365,7 @@ export function createSwarmTools(runtime) {
 
         const allRecords = store.readBoard(swarmId)
         const supersededMap = computeSupersededMap(allRecords)
+        const blindGroups = computeBlindGroupState(allRecords)
 
         let posts = store.queryVisiblePosts(swarmId, callerName, sinceSeq, {
           mentionsOnly: args?.mentions_only === true,
@@ -1200,9 +1399,10 @@ export function createSwarmTools(runtime) {
           posts = posts.slice(-limitNum)
         }
 
-        const annotatedPosts = posts.map((p) => {
+        const orderedPosts = orderUnsealedBlindGroupPosts(posts, swarmId, blindGroups)
+        const annotatedPosts = orderedPosts.map((p) => {
           if (!p || p.type === 'control') return p
-          const projected = projectPostForCaller(p, callerRole, members)
+          const projected = projectPostForCaller(p, callerRole, members, { callerName, blindGroups })
           const withTitle = projected.title ? projected : { ...projected, title: deriveFallbackTitle(projected.text, projected.kind || 'post') }
           return supersededMap.has(p.seq)
             ? { ...withTitle, superseded_by: supersededMap.get(p.seq) }
@@ -1231,6 +1431,21 @@ export function createSwarmTools(runtime) {
               }
               const badges = []
               if (p.verdict) badges.push(`verdict=${p.verdict}`)
+              if (p.witness) {
+                const wf = Array.isArray(p.witness.output_flags) && p.witness.output_flags.length > 0
+                  ? `,flags=${p.witness.output_flags.join('|')}`
+                  : ''
+                badges.push(`WITNESS:exec=${p.witness.exec_calls},err=${p.witness.tool_errors}${wf}`)
+              }
+              if (p.artifact && Array.isArray(p.artifact.diff_hygiene_flags) && p.artifact.diff_hygiene_flags.length > 0) {
+                badges.push(`HYGIENE:${p.artifact.diff_hygiene_flags.join('|')}`)
+              }
+              if (p.blind_group) {
+                const bgInfo = blindGroups.get(p.blind_group)
+                badges.push(bgInfo?.unsealed
+                  ? `BLIND_UNSEALED:${p.blind_group}`
+                  : `BLIND_SEALED:${p.blind_group}(${bgInfo?.submitted_count ?? 1}/${bgInfo?.quorum ?? 2})`)
+              }
               if (p.escalate) badges.push('ESCALATE')
               if (p.silent) badges.push('SILENT')
               if (p.superseded_by) badges.push(`SUPERSEDED by #${p.superseded_by}`)
@@ -1299,7 +1514,8 @@ export function createSwarmTools(runtime) {
             }))
           }
           runtime.notifyProjectionChanged(swarmId)
-          const projectedPending = pending.map(p => projectPostForCaller(p, member?.role ?? 'worker', members))
+          const blindGroupsForWait = computeBlindGroupState(store.readBoard(swarmId))
+          const projectedPending = pending.map(p => projectPostForCaller(p, member?.role ?? 'worker', members, { callerName, blindGroups: blindGroupsForWait }))
           const preview = projectedPending.map(p => `#${p.seq} @${p.agent} (${p.kind}) ${p.title || deriveFallbackTitle(p.text)}\n${p.text}`).join('\n---\n')
           return {
             ok: true,
@@ -1347,7 +1563,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.6.0', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.7.0', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1370,6 +1586,9 @@ export function createSwarmTools(runtime) {
         `Runtime: dsh-swarm v${fp.version} (${fp.commit}) | "${snap.swarm.title}" ${snap.swarm.status} head=#${snap.headSeq}${snap.swarm.project_root ? ' root=' + snap.swarm.project_root : ''}`,
         `LLM In-Flight Slots: ${snap.concurrency.active}/${snap.concurrency.effectiveLimit} (cfg=${snap.concurrency.configuredLimit}, q=${snap.concurrency.queued}, 429=${snap.concurrency.rateLimitHits}) | Members: ${ms.totalActive} active (${ms.working}w/${ms.waiting}idle/${ms.starting}start${ms.unparked_idle ? '/' + ms.unparked_idle + 'unparked' : ''}${ms.zombie ? '/' + ms.zombie + 'zmb' : ''}${ms.error ? '/' + ms.error + 'err' : ''}, ${ms.killed} killed)`,
         wdLine,
+        ...(Array.isArray(snap.gate_commands) && snap.gate_commands.length > 0
+          ? [`Host Gate Commands (${snap.gate_commands.length}): ${snap.gate_commands.join(' ; ')}${snap.swarm?.last_host_gate ? ` [last=${snap.swarm.last_host_gate.ok ? 'PASS' : 'FAIL'}@${snap.swarm.last_host_gate.target}]` : ''}`]
+          : []),
         ...(snap.activeRejections.length > 0 ? [rejLine] : []),
         ...snap.members.map(m => {
           const shortLastAt = m.last_tool_call_at ? String(m.last_tool_call_at).slice(11, 19) || m.last_tool_call_at : ''
@@ -1457,12 +1676,12 @@ export function createSwarmTools(runtime) {
 
   const swarmLandTool = makeTool({
     name: 'swarm_land',
-    description: 'Inspect (`action: "diff"`), batch-preflight (`action: "preflight_all"`), or merge (`action: "apply"`) isolated worktree changes into `project_root` / main workspace. Enforces merge gates, diff-hash approval freshness, `[OWNERSHIP]`/`[FORBIDDEN]` scope, and sensitive-file blacklists unless `override_reason` is provided.',
+    description: 'Inspect (`action: "diff"`), run host `gate_commands` (`action: "gate"`), batch-preflight (`action: "preflight_all"`), or merge (`action: "apply"`) isolated worktree changes into `project_root` / main workspace. Enforces merge gates, host `gate_commands`, diff-hash approval freshness, `[OWNERSHIP]`/`[FORBIDDEN]` scope, and sensitive-file blacklists unless `override_reason` is provided.',
     parameters: {
       properties: {
-        name: { type: 'string', description: 'Member name whose worktree to diff or land (omit for action="preflight_all").' },
-        action: { type: 'string', enum: ['diff', 'apply', 'preflight_all'], description: '"diff" to inspect changes, "preflight_all" to check all unlanded worktrees for main & cross-member conflicts, "apply" to verify and apply onto main workspace.' },
-        override_reason: { type: 'string', description: 'Optional PM reason to override an active merge gate or scope/sensitive block.' },
+        name: { type: 'string', description: 'Member name whose worktree to diff, gate-check, or land (omit for action="preflight_all" or action="gate" on main workspace).' },
+        action: { type: 'string', enum: ['diff', 'apply', 'preflight_all', 'gate'], description: '"diff" to inspect changes, "gate" to run host gate_commands objectively, "preflight_all" to check all unlanded worktrees for main & cross-member conflicts, "apply" to verify and apply onto main workspace.' },
+        override_reason: { type: 'string', description: 'Optional PM reason to override an active merge gate, host gate failure, or scope/sensitive block.' },
       },
       required: ['action'],
     },
@@ -1470,8 +1689,50 @@ export function createSwarmTools(runtime) {
       const { swarmId, callerName, rootAgent } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         const swarmMeta = store.readSwarm(swarmId)
+        const planMeta = store.readPlan(swarmId)
         const members = store.readMembers(swarmId)
         const mainCwd = swarmMeta?.project_root || rootAgent?.session?.header?.cwd || process.cwd()
+        const effectiveGates = collectEffectiveGateCommands(swarmMeta, planMeta)
+
+        if (args.action === 'gate') {
+          const targetName = typeof args?.name === 'string' && args.name.trim() ? args.name.trim() : null
+          const targetMember = targetName ? members[targetName] : null
+          if (targetName && !targetMember) {
+            return { ok: false, text: `[FORMAT_ERROR: swarm_land] Member "@${targetName}" does not exist.` }
+          }
+          if (effectiveGates.length === 0) {
+            return { ok: true, ran: 0, results: [], text: '[swarm_land GATE] No host gate_commands configured on swarm_init or swarm_plan.' }
+          }
+          const runCwd = (targetMember && targetMember.workspace_mode !== 'inherit' && targetMember.worktree_path)
+            ? targetMember.worktree_path
+            : mainCwd
+          const gateRes = await runHostGateCommands(runCwd, effectiveGates)
+          store.updateSwarm(swarmId, {
+            last_host_gate: {
+              ok: gateRes.ok,
+              target: targetName || 'main',
+              ran: gateRes.ran,
+              failed_count: gateRes.failed_count,
+              at: new Date().toISOString(),
+              results: gateRes.results.map(r => ({
+                command: r.command,
+                exit_code: r.exit_code,
+                output_flags: r.output_flags,
+                passed: r.passed,
+              })),
+            },
+          })
+          runtime.notifyProjectionChanged(swarmId)
+          const lines = [
+            `[swarm_land GATE ${gateRes.ok ? 'PASS' : 'FAIL'}] target=${targetName ? '@' + targetName : 'main'} (${gateRes.ran - gateRes.failed_count}/${gateRes.ran} passed)`,
+            ...gateRes.results.map(r => `  - [${r.passed ? 'PASS' : 'FAIL'}] \`${r.command}\` rc=${r.exit_code} (${r.duration_ms}ms${r.output_flags.length > 0 ? ', flags=' + r.output_flags.join('|') : ''})${!r.passed && r.excerpt ? '\n    ' + r.excerpt : ''}`),
+          ]
+          return {
+            ok: gateRes.ok,
+            host_gate: gateRes,
+            text: lines.join('\n'),
+          }
+        }
 
         if (args.action === 'preflight_all') {
           const candidates = Object.entries(members)
@@ -1569,7 +1830,27 @@ export function createSwarmTools(runtime) {
           const overrideReason = typeof args.override_reason === 'string' && args.override_reason.trim()
             ? args.override_reason.trim()
             : null
-          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok) && !overrideReason) {
+          let hostGateRes = null
+          if (effectiveGates.length > 0) {
+            hostGateRes = await runHostGateCommands(member.worktree_path, effectiveGates)
+            store.updateSwarm(swarmId, {
+              last_host_gate: {
+                ok: hostGateRes.ok,
+                target: targetName,
+                ran: hostGateRes.ran,
+                failed_count: hostGateRes.failed_count,
+                at: new Date().toISOString(),
+                results: hostGateRes.results.map(r => ({
+                  command: r.command,
+                  exit_code: r.exit_code,
+                  output_flags: r.output_flags,
+                  passed: r.passed,
+                })),
+              },
+            })
+          }
+          const hostGateFailed = Boolean(hostGateRes && !hostGateRes.ok)
+          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok || hostGateFailed) && !overrideReason) {
             const parts = []
             if (activeRejections.length > 0) {
               const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
@@ -1586,19 +1867,28 @@ export function createSwarmTools(runtime) {
               if (scopeAudit.outOfScope.length > 0) scopeParts.push(`out_of_ownership=[${scopeAudit.outOfScope.join(', ')}]`)
               parts.push(`scope violation(s): ${scopeParts.join('; ')}`)
             }
+            if (hostGateFailed) {
+              const failStr = hostGateRes.results
+                .filter(r => !r.passed)
+                .map(r => `\`${r.command}\` (rc=${r.exit_code}${r.output_flags.length > 0 ? ', flags=' + r.output_flags.join('|') : ''})`)
+                .join('; ')
+              parts.push(`host gate_commands failed: [${failStr}]`)
+            }
             return {
               ok: false,
               ...(activeRejections.length > 0 ? { blocked_by_rejections: activeRejections } : {}),
               ...(staleApprovals.length > 0 ? { stale_approvals: staleApprovals } : {}),
               ...(!scopeAudit.ok ? { scope_violations: scopeAudit } : {}),
-              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by ${parts.join(' and ')}. Resolve or pass override_reason to override.`,
+              ...(hostGateFailed ? { host_gate: hostGateRes } : {}),
+              text: `[${hostGateFailed ? 'HOST_GATE_BLOCKED' : 'GATE_BLOCKED'}: swarm_land] Landing @${targetName} blocked by ${parts.join(' and ')}. Resolve or pass override_reason to override.`,
             }
           }
-          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok) && overrideReason) {
+          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok || hostGateFailed) && overrideReason) {
             const refsList = [
               ...activeRejections.map(r => '#' + r.seq),
               ...staleApprovals.map(a => '#' + a.seq + '(stale)'),
               ...(!scopeAudit.ok ? ['scope_audit'] : []),
+              ...(hostGateFailed ? ['host_gate'] : []),
             ].join(', ')
             store.appendBoardRecord(swarmId, {
               type: 'post',

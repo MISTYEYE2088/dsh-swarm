@@ -64,14 +64,14 @@ dsh plugin --profile web remove dsh-swarm
 
 | Tool | Scope / Role | Purpose |
 | --- | --- | --- |
-| `swarm_init` | **Global entry tool** (Coordinator) | Initialize Swarm, probe Git worktree / subdirectory repos, and dynamically unlock the other 10 tools for this session |
-| `swarm_plan` | Coordinator (unlocked after init) | Publish/update Wave & Track plan (≤ 64 KB) |
-| `swarm_add` | Coordinator (unlocked after init) | Atomically spawn a `worker`, `architect`, `verifier`, or `lore_master` (defaults `worker` to isolated `share` Git worktree when available) |
+| `swarm_init` | **Global entry tool** (Coordinator) | Initialize Swarm, pin immutable `anchors` & optional host `gate_commands`, probe Git worktrees, and dynamically unlock the other 10 tools |
+| `swarm_plan` | Coordinator (unlocked after init) | Publish/update Wave & Track plan (≤ 64 KB), `anchors`, and optional host `gate_commands` |
+| `swarm_add` | Coordinator (unlocked after init) | Atomically spawn `worker`, `architect`, `verifier`, `red_team`, or `lore_master` with pre-spawn `[OWNERSHIP]` overlap detection, lossless `adopt_worktree_from` takeover, and isolated `review_target` snapshot worktrees |
 | `swarm_concurrency` | Coordinator (unlocked after init) | Adjust in-flight LLM request slots dynamically (`limit >= 1`) |
-| `swarm_land` | Coordinator (unlocked after init) | `diff` or `apply` a member's isolated worktree back to main workspace (enforces `[REJECT]` merge gate) |
-| `swarm_kill` | Coordinator (unlocked after init) | Retire a member and clean up worktree (releases name if 0 turns & 0 posts, otherwise tombstones to preserve history) |
-| `post_board` | Coordinator + Workers | Post titled message with explicit `@mentions`, `kind`, optional `verdict` (`approve`/`reject`/`override`), `supersedes`, `escalate`, `silent` |
-| `read_board` | Coordinator + Workers | Read board posts with `since`, `channel`, `mentions_only`, `kinds`, `include_superseded`, `limit` |
+| `swarm_land` | Coordinator (unlocked after init) | `diff`, `gate` (host `gate_commands`), `preflight_all`, or `apply` isolated worktree edits (enforces `[REJECT]` gates, `reviewed_diff_hash`, scope/sensitive blacklists, and host gates) |
+| `swarm_kill` | Coordinator (unlocked after init) | Retire a member (with optional `keep_worktree: true` for takeover and `handover_to` successor transfer) |
+| `post_board` | Coordinator + Workers | Post titled message with `@mentions`, `kind`, `verdict`, authorized `supersedes`, `blind_group`/`blind_quorum` sealed barriers, automatic worker commit snapshots, and objective reviewer `witness` telemetry |
+| `read_board` | Coordinator + Workers | Read board posts with `since`, `channel`, `mentions_only`, `kinds`, `hide_superseded`, `limit`, blind-review/sealed-group projection, and read-only `seance_member` handover capsules |
 | `swarm_wait` | Coordinator + Workers | Park at 0 idle token cost (`exec.concludeTurn()`) until matching board activity arrives; Stop-Hook prevents missed-message races |
 | `swarm_status` | Coordinator + Workers | Inspect live member liveness (`working`/`waiting`/`starting`/`zombie`/`error`), turn/tool counts, slots, Watchdog, and merge gate |
 | `swarm_model` | Coordinator + Workers | Hot-swap a member's `provider/model` in place while preserving conversation history |
@@ -96,7 +96,7 @@ Verified against DeepSeek Harness **`0.2.0-rc.2`** (zero build step, zero `prepa
 
 ```bash
 node --check index.js && node --check client.js
-npm test               # 51 end-to-end smoke, SSOT, checkpoint, scoped-tool, and UI tests
+npm test               # 70 end-to-end smoke, SSOT, blind-review, witness, host-gate, and UI tests
 npm run verify:install # Tarball pack + isolated clean install gate
 npm run test:boot      # Real @deepseek-ai/cordis mount check (set DSH_CORDIS_PATH if needed)
 ```

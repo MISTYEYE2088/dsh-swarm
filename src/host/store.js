@@ -288,6 +288,76 @@ export function computeSupersededMap(records) {
   return supersededBy
 }
 
+/** Determine whether a board post represents a merge-gate `[REJECT]` authored by a blocking reviewer. */
+export function isMergeGateRejectPost(rec, members = {}) {
+  if (!rec || rec.type === 'control') return false
+  const author = members[rec.agent]
+  if (!author) return false
+  const canBlock = author.can_block_merge === true || getRoleSpec(author.role).canBlockMerge
+  if (!canBlock) return false
+  const text = String(rec.text ?? '')
+  return rec.verdict === 'reject'
+    || (rec.kind === 'review' && /\[REJECT\b/i.test(text) && rec.verdict !== 'approve')
+}
+
+// #FUNC Authorize whether `supersederAgent` may supersede a blocking `[REJECT]` post (`rejectRec`).
+// #NOT  Never lets a worker or unrelated peer unilaterally erase a reviewer's `[REJECT]` via `post_board(supersedes)`.
+// #EDGE-IN A worker passing `supersedes: [rejectSeq]` is denied while the original reviewer, its `handover_to` successor, or Coordinator with `verdict="override"` is allowed → test_prespawn_ownership_overlap_and_supersedes_auth
+// #WHY  Enforcing `canSupersedeReject` in both `post_board` and `computeActiveRejections` closes unilateral fake-pushback gate bypasses.
+export function canSupersedeReject(rejectRec, supersederAgent, supersederVerdict, members = {}) {
+  if (!rejectRec || !supersederAgent) return false
+  if (supersederAgent === rejectRec.agent) return true
+  const origAuthor = members[rejectRec.agent]
+  if (origAuthor?.killed === true && origAuthor.handover_to === supersederAgent) return true
+  if (supersederAgent === 'coordinator' && supersederVerdict === 'override') return true
+  return false
+}
+
+// #FUNC Derive sealed/unsealed quorum state for every `blind_group` present on the board.
+// #NOT  Never mutates `events.jsonl` or drops sealed records; sealing is strictly a read-time projection until quorum is met.
+// #EDGE-IN A `blind_group` with quorum 2 stays sealed after 1 author submits and atomically unseals on the 2nd distinct author's post → test_blind_group_sealed_barrier_and_shuffled_unseal
+// #WHY  Counting unique authors per `blind_group` guarantees independent parallel proposals without first-mover anchoring bias.
+export function computeBlindGroupState(records = []) {
+  const groups = new Map()
+  for (const rec of records) {
+    if (!rec || rec.type === 'control' || typeof rec.blind_group !== 'string' || !rec.blind_group.trim()) continue
+    const group = rec.blind_group.trim()
+    let entry = groups.get(group)
+    if (!entry) {
+      entry = {
+        group,
+        quorum: Number.isInteger(rec.blind_quorum) && rec.blind_quorum >= 2 ? rec.blind_quorum : 2,
+        authorsSet: new Set(),
+        seqs: [],
+        unsealed: false,
+        unsealed_at_seq: null,
+      }
+      groups.set(group, entry)
+    } else if (Number.isInteger(rec.blind_quorum) && rec.blind_quorum > entry.quorum) {
+      entry.quorum = rec.blind_quorum
+    }
+    entry.seqs.push(rec.seq)
+    if (rec.agent) entry.authorsSet.add(rec.agent)
+    if (!entry.unsealed && entry.authorsSet.size >= entry.quorum) {
+      entry.unsealed = true
+      entry.unsealed_at_seq = rec.seq
+    }
+  }
+  const out = new Map()
+  for (const [name, g] of groups.entries()) {
+    out.set(name, {
+      group: g.group,
+      quorum: g.quorum,
+      submitted_count: g.authorsSet.size,
+      authors: [...g.authorsSet],
+      seqs: g.seqs,
+      unsealed: g.unsealed,
+      unsealed_at_seq: g.unsealed_at_seq,
+    })
+  }
+  return out
+}
+
 /** Pick only consumer-offset / live-telemetry keys for `offsets.json` (zero domain facts!). */
 function extractOffsetFields(obj) {
   const out = {}
@@ -525,6 +595,9 @@ export class SwarmStore {
       anchors: Array.isArray(options.anchors) && options.anchors.length > 0
         ? options.anchors
         : (existing?.anchors ?? []),
+      gate_commands: Array.isArray(options.gate_commands) && options.gate_commands.length > 0
+        ? options.gate_commands
+        : (existing?.gate_commands ?? []),
       created_at: existing?.created_at ?? nowIso,
       updated_at: nowIso,
     }
@@ -779,6 +852,13 @@ export class SwarmStore {
           ? { reviewed_diff_hashes: entry.reviewed_diff_hashes }
           : {}),
         ...(entry.artifact && typeof entry.artifact === 'object' ? { artifact: entry.artifact } : {}),
+        ...(entry.witness && typeof entry.witness === 'object' ? { witness: entry.witness } : {}),
+        ...(typeof entry.blind_group === 'string' && entry.blind_group.trim()
+          ? {
+              blind_group: entry.blind_group.trim(),
+              blind_quorum: Number.isInteger(entry.blind_quorum) && entry.blind_quorum >= 2 ? entry.blind_quorum : 2,
+            }
+          : {}),
         ...(supersedes.length > 0 ? { supersedes } : {}),
         ...(entry.escalate === true ? { escalate: true } : {}),
         ...(entry.silent === true ? { silent: true } : {}),
@@ -849,6 +929,7 @@ export class SwarmStore {
         baseline_tree: spec.baseline_commit ?? spec.baseline_tree ?? null,
         last_snapshot_commit: spec.last_snapshot_commit ?? null,
         owned_paths: Array.isArray(spec.owned_paths) ? spec.owned_paths : [],
+        brief_owned_paths: Array.isArray(spec.brief_owned_paths) ? spec.brief_owned_paths : [],
         forbidden_paths: Array.isArray(spec.forbidden_paths) ? spec.forbidden_paths : [],
         adopted_from: spec.adopted_from ?? null,
         review_target: spec.review_target ?? null,
@@ -900,7 +981,20 @@ export class SwarmStore {
   computeActiveRejections(swarmId, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
-    const supersededBy = computeSupersededMap(records)
+    const recBySeq = new Map()
+    for (const rec of records) {
+      if (rec && rec.type !== 'control') recBySeq.set(rec.seq, rec)
+    }
+    const authorizedRejectSuperseded = new Set()
+    for (const rec of records) {
+      if (!rec || rec.type === 'control' || !Array.isArray(rec.supersedes)) continue
+      for (const oldSeq of rec.supersedes) {
+        const oldRec = recBySeq.get(Number(oldSeq))
+        if (oldRec && canSupersedeReject(oldRec, rec.agent, rec.verdict, members)) {
+          authorizedRejectSuperseded.add(oldRec.seq)
+        }
+      }
+    }
     const byKey = new Map()
     const rejectStreaks = new Map()
 
@@ -921,7 +1015,7 @@ export class SwarmStore {
       const targets = resolveVerdictTargets(rec, members)
 
       if (isReject) {
-        if (!supersededBy.has(rec.seq)) {
+        if (!authorizedRejectSuperseded.has(rec.seq)) {
           for (const target of targets) {
             const key = `${rec.agent}::${target}`
             const nextStreak = (rejectStreaks.get(key) ?? 0) + 1
