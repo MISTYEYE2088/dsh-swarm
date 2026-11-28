@@ -79,6 +79,132 @@ export function parsePorcelainZero(raw) {
   return entries
 }
 
+/** Match a relative slash-normalized path against a simple glob or directory prefix pattern. */
+export function matchPathPattern(relPath, pattern) {
+  const normPath = String(relPath ?? '').replace(/\\/g, '/').replace(/^\.\//, '')
+  const normPat = String(pattern ?? '').replace(/\\/g, '/').replace(/^\.\//, '').trim()
+  if (!normPath || !normPat) return false
+  if (normPat.endsWith('/')) {
+    return normPath.startsWith(normPat) || normPath === normPat.slice(0, -1)
+  }
+  if (!normPat.includes('*')) {
+    return normPath === normPat || normPath.startsWith(`${normPat}/`)
+  }
+  const escaped = normPat
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '::DOUBLE_STAR::')
+    .replace(/\*/g, '[^/]*')
+    .replace(/::DOUBLE_STAR::/g, '.*')
+  return new RegExp(`^${escaped}$`).test(normPath)
+}
+
+/** Extract clean relative file paths from `git diff --name-status` lines (e.g. `M\tsrc/a.js`). */
+export function extractPathsFromNameStatus(files = []) {
+  const out = []
+  for (const line of files) {
+    const parts = String(line ?? '').split('\t').map(s => s.trim()).filter(Boolean)
+    const p = parts.length >= 2 ? parts[parts.length - 1] : parts[0]
+    if (p) out.push(p.replace(/\\/g, '/'))
+  }
+  return out
+}
+
+const SENSITIVE_PATH_PATTERNS = Object.freeze([
+  /^\.env(?:\.(?!example$).+)?$/i,
+  /(?:^|\/)\.env(?:\.(?!example$).+)?$/i,
+  /\.(?:pem|key|p12|pfx)$/i,
+  /(?:^|\/)credentials(?:\.[^/]+)?$/i,
+  /(?:^|\/)(?:scratch|mutants)(?:\/|$)/i,
+])
+
+// #FUNC Audit changed worktree paths against `[OWNERSHIP]`, `[FORBIDDEN]`, and sensitive/scratch file blacklists before landing.
+// #NOT  Never enforces `[OWNERSHIP]` when `ownedPaths` is empty (avoiding false positives on prose-only briefs).
+// #EDGE-IN Modifying a forbidden path (`b.txt`) or sensitive file (`.env`) flags violations and blocks `swarm_land` unless overridden → test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all
+// #WHY  Checking `SENSITIVE_PATH_PATTERNS` and path scopes against Git diff paths catches both `write_file` and `bash` redirection writes mechanically.
+export function auditChangedPaths({ files = [], ownedPaths = [], forbiddenPaths = [] } = {}) {
+  const relPaths = extractPathsFromNameStatus(files)
+  const sensitive = []
+  const forbidden = []
+  const outOfScope = []
+
+  for (const p of relPaths) {
+    if (SENSITIVE_PATH_PATTERNS.some(re => re.test(p))) {
+      sensitive.push(p)
+    }
+    if (Array.isArray(forbiddenPaths) && forbiddenPaths.length > 0 && forbiddenPaths.some(pat => matchPathPattern(p, pat))) {
+      forbidden.push(p)
+    }
+    if (Array.isArray(ownedPaths) && ownedPaths.length > 0 && !ownedPaths.some(pat => matchPathPattern(p, pat))) {
+      outOfScope.push(p)
+    }
+  }
+
+  return {
+    ok: sensitive.length === 0 && forbidden.length === 0 && outOfScope.length === 0,
+    paths: relPaths,
+    sensitive,
+    forbidden,
+    outOfScope,
+  }
+}
+
+const PATCH_HYGIENE_CHECKS = Object.freeze([
+  Object.freeze(['added_skip_macro', /\b(?:GTEST_SKIP|pytest\.mark\.skip|unittest\.skip)\b|\b(?:test|it|describe)\.skip\s*\(|\[SKIP\]/i]),
+  Object.freeze(['added_shell_ignore_error', /\|\|\s*(?:true|:)\b/]),
+  Object.freeze(['added_trivial_assert', /\bassert(?:\.ok)?\s*\(\s*true\s*\)|expect\s*\(\s*true\s*\)\.toBe\s*\(\s*true\s*\)/i]),
+  Object.freeze(['added_empty_catch', /\bcatch\s*(?:\([^)]*\))?\s*\{\s*\}/]),
+])
+
+/** Scan added lines (`+`) in a unified diff for objective reward-hacking / test-downgrade signals. */
+export function scanPatchHygiene(patch) {
+  if (typeof patch !== 'string' || patch.length === 0) return []
+  const flags = new Set()
+  for (const line of patch.split(/\r?\n/)) {
+    if (!line.startsWith('+') || line.startsWith('+++ ')) continue
+    const added = line.slice(1)
+    for (const [flagName, regex] of PATCH_HYGIENE_CHECKS) {
+      if (regex.test(added)) flags.add(flagName)
+    }
+  }
+  return [...flags]
+}
+
+/** Selectively copy gitignored files matching `<mainCwd>/.worktreeinclude` into `targetDir` after `baselineCommit` (never committed). */
+async function syncWorktreeIncludeFiles(mainCwd, targetDir) {
+  const includeFile = path.join(mainCwd, '.worktreeinclude')
+  if (!fs.existsSync(includeFile)) return []
+  let patterns = []
+  try {
+    patterns = fs.readFileSync(includeFile, 'utf8')
+      .split(/\r?\n/)
+      .map(l => l.trim())
+      .filter(l => l.length > 0 && !l.startsWith('#'))
+  } catch {
+    return []
+  }
+  if (patterns.length === 0) return []
+
+  const ignoredRes = await runGit(['ls-files', '--others', '--ignored', '--exclude-standard', '-z'], { cwd: mainCwd })
+  if (!ignoredRes.ok || !ignoredRes.stdout) return []
+  const ignoredFiles = ignoredRes.stdout.split('\0').filter(Boolean)
+  const copied = []
+  for (const relPath of ignoredFiles) {
+    if (!patterns.some(pat => matchPathPattern(relPath, pat))) continue
+    const srcFile = path.join(mainCwd, relPath)
+    const dstFile = path.join(targetDir, relPath)
+    try {
+      if (fs.existsSync(srcFile) && fs.statSync(srcFile).isFile()) {
+        fs.mkdirSync(path.dirname(dstFile), { recursive: true })
+        fs.copyFileSync(srcFile, dstFile)
+        copied.push(relPath)
+      }
+    } catch {
+      // Best-effort copy of ignored local config
+    }
+  }
+  return copied
+}
+
 // dup-ok: worktree provisioning counterpart to removeIsolatedWorktree
 // #FUNC Provision an isolated worktree (`share` or `branch`) and sync uncommitted staged/unstaged/untracked changes from `mainCwd`.
 // #NOT  Does not lose the user's uncommitted work when creating a worktree from HEAD.
@@ -159,12 +285,113 @@ export async function createIsolatedWorktree({
     }
   }
 
+  const copiedIncluded = await syncWorktreeIncludeFiles(mainCwd, targetDir)
+
   return {
     ok: true,
     workspace_mode: mode,
     worktree_path: targetDir,
     base_commit: headSha,
     baseline_commit: baselineCommit,
+    included_ignored_files: copiedIncluded,
+  }
+}
+
+// dup-ok: reviewer snapshot worktree builder that overlays a worker patch as an immutable review baseline
+// #FUNC Provision an isolated review snapshot worktree pre-loaded with a target worker's incremental patch as its `baselineCommit`.
+// #NOT  Never shares `mainCwd` or the worker's live directory, so reviewer shell commands cannot mutate production files.
+// #EDGE-IN A reviewer mutating a repo file via shell inside its review worktree is caught by `diffWorktree` on `approve` → test_isolated_review_worktree_catches_rogue_writes_and_blind_projection
+// #WHY  Committing the target worker patch into the reviewer's `baselineCommit` makes any subsequent repo edit by the reviewer appear immediately as a non-empty `diffWorktree`.
+export async function createReviewSnapshotWorktree({
+  mainCwd,
+  worktreesRoot,
+  swarmId,
+  memberName,
+  targetWorktreePath = null,
+  targetBaselineCommit = null,
+}) {
+  const base = await createIsolatedWorktree({
+    mainCwd,
+    worktreesRoot,
+    swarmId,
+    memberName,
+    mode: 'share',
+  })
+  if (!base.ok) return base
+
+  let reviewBaseline = base.baseline_commit
+  if (targetWorktreePath && fs.existsSync(targetWorktreePath) && targetWorktreePath !== mainCwd) {
+    const targetDiff = await diffWorktree({
+      worktreePath: targetWorktreePath,
+      baselineCommit: targetBaselineCommit,
+    })
+    if (targetDiff.ok && targetDiff.hasChanges && targetDiff.patch) {
+      const applyRes = await runGit(['-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', '-'], {
+        cwd: base.worktree_path,
+        input: targetDiff.patch,
+      })
+      if (!applyRes.ok) {
+        return {
+          ok: false,
+          error: `Failed to overlay target worker diff into review worktree: ${applyRes.stderr.trim()}`,
+        }
+      }
+      await runGit(['add', '-A'], { cwd: base.worktree_path })
+      const snapRes = await runGit(
+        ['-c', 'user.name=dsh-swarm', '-c', 'user.email=swarm@local', 'commit', '-m', 'dsh-swarm: review-target-snapshot', '--no-verify'],
+        { cwd: base.worktree_path },
+      )
+      if (snapRes.ok) {
+        const rev = await runGit(['rev-parse', 'HEAD'], { cwd: base.worktree_path })
+        if (rev.ok) reviewBaseline = rev.stdout.trim()
+      }
+    }
+  }
+
+  return {
+    ...base,
+    baseline_commit: reviewBaseline,
+  }
+}
+
+// #FUNC Commit pending edits inside a worker's isolated worktree to produce an immutable `commitSha` per submission round without altering `baselineCommit`.
+// #NOT  Never commits to `mainCwd` (`inherit` mode) and never alters `baselineCommit` used by `swarm_land`.
+// #EDGE-IN Submitting a worker report creates a new `commitSha` while `diffWorktree` against `baselineCommit` still measures the full cumulative patch → test_isolated_review_worktree_catches_rogue_writes_and_blind_projection
+// #WHY  Giving each submission an immutable `commitSha` lets blind reviewers run `git diff prev..curr` and `git diff baseline..curr` without ever reading worker prose.
+export async function snapshotWorktreeCommit({ worktreePath, baselineCommit, label = 'worker' }) {
+  if (!worktreePath || !fs.existsSync(worktreePath)) {
+    return { ok: false, error: 'worktree path does not exist' }
+  }
+  const prevRes = await runGit(['rev-parse', '--short', 'HEAD'], { cwd: worktreePath })
+  const prevCommitSha = prevRes.ok ? prevRes.stdout.trim() : null
+
+  const statusRes = await runGit(['status', '--porcelain'], { cwd: worktreePath })
+  let commitSha = prevCommitSha
+  if (statusRes.ok && statusRes.stdout.trim().length > 0) {
+    await runGit(['add', '-A'], { cwd: worktreePath })
+    const commitRes = await runGit(
+      ['-c', 'user.name=dsh-swarm', '-c', 'user.email=swarm@local', 'commit', '-m', `dsh-swarm snapshot: ${label}`, '--no-verify'],
+      { cwd: worktreePath },
+    )
+    if (commitRes.ok) {
+      const nextRes = await runGit(['rev-parse', '--short', 'HEAD'], { cwd: worktreePath })
+      if (nextRes.ok) commitSha = nextRes.stdout.trim()
+    }
+  }
+
+  const diff = await diffWorktree({ worktreePath, baselineCommit })
+  const hygieneFlags = diff.ok ? scanPatchHygiene(diff.patch) : []
+  return {
+    ok: diff.ok,
+    commitSha,
+    prevCommitSha,
+    baselineCommit: baselineCommit || prevCommitSha,
+    diffHash: diff.diffHash,
+    hasChanges: diff.hasChanges,
+    files: diff.files,
+    patch: diff.patch,
+    hygieneFlags,
+    ...(diff.ok ? {} : { error: diff.error }),
   }
 }
 
@@ -231,12 +458,18 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
     input: diff.patch,
   })
   if (!checkRes.ok) {
+    const threeWayRes = await runGit(['-c', 'core.autocrlf=false', 'apply', '--3way', '--check', '--whitespace=nowarn', '-'], {
+      cwd: mainCwd,
+      input: diff.patch,
+    })
+    const diagText = `${checkRes.stderr.trim()}${threeWayRes.ok ? ' (3-way merge looks clean)' : (threeWayRes.stderr.trim() ? ' | 3-way: ' + threeWayRes.stderr.trim() : '')}`
     return {
       ok: false,
       action: 'apply',
       applied: false,
       files: diff.files,
-      error: `Merge preflight (git apply --check) detected conflicts; main workspace left untouched: ${checkRes.stderr.trim()}`,
+      threeWayClean: threeWayRes.ok,
+      error: `Merge preflight (git apply --check) detected conflicts; main workspace left untouched: ${diagText}`,
     }
   }
 

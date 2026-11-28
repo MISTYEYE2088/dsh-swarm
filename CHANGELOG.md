@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0 (2026-11-27)
+
+- **Blind Blackboard Projection for `verifier` / `red_team` (`blindToWorkerProse`) & Immutable Worker Submission Snapshots**:
+  - Worker posts continue landing verbatim on `events.jsonl` (100% visible to Coordinator, Human UI, `architect`, and forensic export) while the Host automatically snapshots an immutable commit (`snapshotWorktreeCommit`) and objective `artifact` metadata (`commit_sha`, `prev_commit`, `baseline_commit`, `diff_hash`, `changed_files`, `diff_hygiene_flags`).
+  - For roles with `blindToWorkerProse: true` (`verifier` and built-in post-consensus `red_team` by default), `dispatchPostWakeups`, `read_board`, and `swarm_wait` automatically redact worker `title`/`text` into a clean `[BLIND_REVIEW_ENVELOPE]` containing only the commit/diff metadata and Coordinator background/anchors.
+  - Added immutable ground-truth `anchors` on `swarm_init` / `swarm_plan` that are automatically prepended as `[GROUND_TRUTH_ANCHORS]` into every spawned brief.
+- **Expanded Terminate Scope, Lossless Worktree Adoption (`adopt_worktree_from`), Killed-Reviewer Gate Fix, Advisory Telemetry & Lightweight Seance**:
+  - Added `swarm_add(..., adopt_worktree_from)` and `swarm_kill(..., keep_worktree: true)` so Coordinator can promptly terminate low-efficiency, slacking, hallucinating, or context-polluted sessions and transfer their worktree edits + bounded predecessor capsule to a fresh replacement session.
+  - Fixed `computeActiveRejections` so killing a reviewer never silently erases its unresolved `[REJECT]` merge gate (remains active until superseded, overridden, or approved by an explicit `handover_to` successor).
+  - Tracked consecutive tool errors (`consecutive_tool_errors`) and context usage (`>= 80%`) in live telemetry, `swarm_status`, and non-spamming Watchdog advisory alerts (`[CONTEXT_PRESSURE_ALERT]`, `[TOOL_LOOP_ALERT]`).
+  - Added read-only `read_board(seance_member)` returning a bounded (`<= 1500` chars) capsule of recent decisions and tool errors from any retired/active member.
+- **Physical Bottom-Line Guardrails & Worktree Enhancements**:
+  - Added `swarm_add(..., review_target)` provisioning an isolated review snapshot worktree overlaid with the target worker's diff, paired with a zero-dirty-write gate (`[ROGUE_WRITE_BLOCKED]`) on `post_board(verdict="approve")` catching reviewer repo edits even via shell redirection.
+  - Added `swarm_land` `[OWNERSHIP]` / `[FORBIDDEN]` / sensitive-file (`.env`, `*.pem`, `*.key`, `credentials*`, `scratch/`) enforcement, `action="preflight_all"` batch conflict & cross-member overlap detection, `--3way` conflict diagnostics, and `.worktreeinclude` selective gitignored-file sync.
+  - Added built-in `red_team` Fresh-Eyes post-consensus role preset, Truthfulness Firewall (4000-char board truncation != source defect), and `[Error Catch]` vs `[Value Tension]` guidance in role prompts.
+- **Core Reliability Fixes (included from P0.1)**:
+  - Per-target `(reviewer, target_member)` merge gates with `reviewed_diff_hash` staleness invalidation; multi-member Watchdog `healthTick` zero-starvation loop + OS sleep-jump grace compensation; parameterized `requireRecipientOnPost` in `ROLE_REGISTRY`; restart recovery auto-restarting Watchdog and lazily resuming members via `agentsSvc.resume()`; single-pass $O(N)$ `queryVisiblePosts` channel replay.
+
 ## 0.5.1 (2026-11-25)
 
 - **Accurate Compaction Verbatim-Retained Tail Overlap Across Adjacent Epochs (`retained_from_epoch`)**:

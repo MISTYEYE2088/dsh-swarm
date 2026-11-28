@@ -1234,6 +1234,47 @@ export async function collectDiagnosticExport({
   }
 }
 
+/** Build a bounded read-only Seance handover capsule (<= maxChars) of recent decisions and tool errors from a member's session events. */
+export function extractMemberHandoverCapsule(sessionEvents = [], maxChars = 1500) {
+  const list = Array.isArray(sessionEvents) ? sessionEvents : []
+  const errors = []
+  const notes = []
+
+  for (const ev of list) {
+    if (!ev || typeof ev !== 'object') continue
+    if (ev.type === 'tool/result') {
+      const data = ev.data || {}
+      const failed = data.isError === true || Boolean(data.error)
+      if (failed) {
+        const name = data.name || data.toolName || 'tool'
+        const raw = typeof data.content === 'string'
+          ? data.content
+          : JSON.stringify(data.error ?? data.content ?? '')
+        errors.push(`- [ERR ${name}] ${String(raw).replace(/\s+/g, ' ').slice(0, 180)}`)
+      }
+    } else if (ev.type === 'assistant/message') {
+      const textParts = Array.isArray(ev.data?.content)
+        ? ev.data.content.filter(c => c?.type === 'text' && typeof c.text === 'string').map(c => c.text)
+        : (typeof ev.data?.text === 'string' ? [ev.data.text] : [])
+      const joined = textParts.join(' ').replace(/\s+/g, ' ').trim()
+      if (joined) notes.push(`- ${joined.slice(0, 220)}`)
+    }
+  }
+
+  const lines = []
+  if (errors.length > 0) {
+    lines.push('Recent Tool Errors / Dead Ends:')
+    lines.push(...errors.slice(-5))
+  }
+  if (notes.length > 0) {
+    lines.push('Recent Assistant Notes:')
+    lines.push(...notes.slice(-3))
+  }
+  if (lines.length === 0) return '(no captured session events available)'
+  const full = lines.join('\n')
+  return full.length <= maxChars ? full : `${full.slice(0, Math.max(0, maxChars - 16))}\n...(truncated)`
+}
+
 // #FUNC Build a standards-compliant PKZIP archive (`Buffer`) from `{ path, content }` entries using only Node built-in `zlib.crc32` and `zlib.deflateRawSync`.
 // #NOT  Requires zero external npm dependencies (`fflate`/`jszip` not needed) and never leaks unprefixed paths when `rootFolder` is supplied.
 // #EDGE-IN Generated ZIP archive passes Python `zipfile.ZipFile.testzip()` integrity verification with UTF-8 filenames and multiple epoch JSONL files → test_log_export_normal_conversation_epochs_zip_and_timeline

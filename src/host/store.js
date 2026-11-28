@@ -522,6 +522,9 @@ export class SwarmStore {
       default_provider: options.default_provider ?? existing?.default_provider ?? 'inherit',
       default_model: options.default_model ?? existing?.default_model ?? 'inherit',
       coordinator_model: options.coordinator_model ?? existing?.coordinator_model ?? 'inherit',
+      anchors: Array.isArray(options.anchors) && options.anchors.length > 0
+        ? options.anchors
+        : (existing?.anchors ?? []),
       created_at: existing?.created_at ?? nowIso,
       updated_at: nowIso,
     }
@@ -775,6 +778,7 @@ export class SwarmStore {
         ...(entry.reviewed_diff_hashes && typeof entry.reviewed_diff_hashes === 'object' && Object.keys(entry.reviewed_diff_hashes).length > 0
           ? { reviewed_diff_hashes: entry.reviewed_diff_hashes }
           : {}),
+        ...(entry.artifact && typeof entry.artifact === 'object' ? { artifact: entry.artifact } : {}),
         ...(supersedes.length > 0 ? { supersedes } : {}),
         ...(entry.escalate === true ? { escalate: true } : {}),
         ...(entry.silent === true ? { silent: true } : {}),
@@ -843,6 +847,11 @@ export class SwarmStore {
         worktree_path: spec.worktree_path ?? null,
         base_commit: spec.base_commit ?? null,
         baseline_tree: spec.baseline_commit ?? spec.baseline_tree ?? null,
+        last_snapshot_commit: spec.last_snapshot_commit ?? null,
+        owned_paths: Array.isArray(spec.owned_paths) ? spec.owned_paths : [],
+        forbidden_paths: Array.isArray(spec.forbidden_paths) ? spec.forbidden_paths : [],
+        adopted_from: spec.adopted_from ?? null,
+        review_target: spec.review_target ?? null,
         fork_from: spec.fork_from ?? null,
         spawned_live_agent: spec.spawned_live_agent === true,
         brief_seq: plannedBriefSeq,
@@ -883,10 +892,11 @@ export class SwarmStore {
     return { member: this.readMembers(swarmId)[spec.name], briefPost }
   }
 
-  // #FUNC Compute unresolved `[REJECT]` merge-gate blocks and consecutive reject streaks keyed by `(reviewer, target_member)`.
-  // #NOT  Never lets approving `@worker-b` clear an open rejection against `@worker-a`, and never blocks `@worker-b` from landing because of `@worker-a`.
+  // #FUNC Compute unresolved `[REJECT]` merge-gate blocks and consecutive reject streaks keyed by `(reviewer, target_member)`, preserving open rejections even if the rejecting reviewer is later killed.
+  // #NOT  Never lets approving `@worker-b` clear an open rejection against `@worker-a`, and never lets killing a reviewer silently erase its unresolved rejection.
   // #EDGE-IN Approving `@worker-b` preserves `@worker-a`'s active rejection and `targetMember` filtering lets `@worker-b` land cleanly → test_multi_worker_merge_gate_target_scoping_and_stale_approval_hash
-  // #WHY  Keying `byKey` by `${rec.agent}::${target}` isolates multi-worker review lifecycles while keeping global `'*'` verdicts backward-compatible.
+  // #EDGE-IN Killing a reviewer with an open rejection keeps the rejection active until superseded, overridden, or approved by an explicit `handover_to` successor → test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff
+  // #WHY  Keying `byKey` by `${rec.agent}::${target}` and keeping `author.killed` rejections alive blocks both multi-worker collisions and killing a strict reviewer to bypass merge gates.
   computeActiveRejections(swarmId, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
@@ -897,7 +907,7 @@ export class SwarmStore {
     for (const rec of records) {
       if (!rec || rec.type === 'control') continue
       const author = members[rec.agent]
-      if (!author || author.killed) continue
+      if (!author) continue
       const canBlock = author.can_block_merge === true || getRoleSpec(author.role).canBlockMerge
       if (!canBlock) continue
 
@@ -919,6 +929,7 @@ export class SwarmStore {
             byKey.set(key, {
               seq: rec.seq,
               reviewer: rec.agent,
+              reviewer_killed: author.killed === true,
               target_member: target,
               role: author.role,
               title: rec.title || deriveFallbackTitle(text, 'Rejection'),
@@ -930,19 +941,27 @@ export class SwarmStore {
           }
         }
       } else if (isApprove) {
-        if (targets.includes('*')) {
-          const prefix = `${rec.agent}::`
-          for (const k of [...byKey.keys()]) {
-            if (k.startsWith(prefix)) byKey.delete(k)
+        const clearableReviewers = new Set([rec.agent])
+        for (const [mName, mObj] of Object.entries(members)) {
+          if (mObj?.killed && mObj.handover_to === rec.agent) {
+            clearableReviewers.add(mName)
           }
-          for (const k of [...rejectStreaks.keys()]) {
-            if (k.startsWith(prefix)) rejectStreaks.set(k, 0)
-          }
-        } else {
-          for (const target of targets) {
-            const key = `${rec.agent}::${target}`
-            rejectStreaks.set(key, 0)
-            byKey.delete(key)
+        }
+        for (const revName of clearableReviewers) {
+          if (targets.includes('*')) {
+            const prefix = `${revName}::`
+            for (const k of [...byKey.keys()]) {
+              if (k.startsWith(prefix)) byKey.delete(k)
+            }
+            for (const k of [...rejectStreaks.keys()]) {
+              if (k.startsWith(prefix)) rejectStreaks.set(k, 0)
+            }
+          } else {
+            for (const target of targets) {
+              const key = `${revName}::${target}`
+              rejectStreaks.set(key, 0)
+              byKey.delete(key)
+            }
           }
         }
       }

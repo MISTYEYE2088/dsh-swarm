@@ -26,8 +26,18 @@ import {
 } from './validators.js'
 import { buildSwarmSystemMessage } from './stop-hook.js'
 import { getRoleSpec, getSpawnableRoles } from './prompts.js'
-import { runGit, createIsolatedWorktree, diffWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
-import { formatCompactTokens } from './log-export.js'
+import {
+  runGit,
+  createIsolatedWorktree,
+  createReviewSnapshotWorktree,
+  diffWorktree,
+  snapshotWorktreeCommit,
+  scanPatchHygiene,
+  auditChangedPaths,
+  landWorktree,
+  removeIsolatedWorktree,
+} from './worktree.js'
+import { formatCompactTokens, extractMemberHandoverCapsule } from './log-export.js'
 
 const TEXT_OUTPUT_SCHEMA = Object.freeze({
   type: 'object',
@@ -112,6 +122,48 @@ function discoverChildGitRepos(baseDir) {
     // Ignore unreadable directory
   }
   return found
+}
+
+/** Project a board post for `callerRole`, replacing worker prose with an objective commit/diff envelope when `blindToWorkerProse` is enabled. */
+export function projectPostForCaller(post, callerRole, members = {}) {
+  if (!post || post.type === 'control') return post
+  const callerSpec = getRoleSpec(callerRole)
+  if (callerSpec.blindToWorkerProse !== true) return post
+  const authorRole = members[post.agent]?.role ?? 'worker'
+  if (authorRole !== 'worker') return post
+
+  const art = post.artifact && typeof post.artifact === 'object' ? post.artifact : null
+  const commitPart = art?.commit_sha ? ` (${art.commit_sha})` : ''
+  const lines = [
+    `[BLIND_REVIEW_ENVELOPE] Worker prose intentionally redacted for @${post.agent} (#${post.seq}). Audit strictly from raw commit/diff and @coordinator background/anchors.`,
+  ]
+  if (art) {
+    if (art.worktree_path) lines.push(`Worktree: ${art.worktree_path}`)
+    if (art.baseline_commit) lines.push(`Baseline Commit: ${art.baseline_commit}`)
+    if (art.prev_commit && art.prev_commit !== art.commit_sha) lines.push(`Previous Commit: ${art.prev_commit}`)
+    if (art.commit_sha) lines.push(`Commit SHA: ${art.commit_sha}`)
+    if (art.diff_hash) lines.push(`Diff Hash: ${art.diff_hash}`)
+    const files = Array.isArray(art.changed_files) ? art.changed_files : []
+    lines.push(`Changed Files (${files.length}): ${files.join(', ') || 'none'}`)
+    if (art.worktree_path && art.baseline_commit && art.commit_sha) {
+      lines.push(`Inspect Cumulative Diff: git -C "${art.worktree_path}" diff ${art.baseline_commit}..${art.commit_sha}`)
+      if (art.prev_commit && art.prev_commit !== art.commit_sha && art.prev_commit !== art.baseline_commit) {
+        lines.push(`Inspect Round Delta: git -C "${art.worktree_path}" diff ${art.prev_commit}..${art.commit_sha}`)
+      }
+    }
+    if (Array.isArray(art.diff_hygiene_flags) && art.diff_hygiene_flags.length > 0) {
+      lines.push(`[DIFF_HYGIENE_FLAGS]: ${art.diff_hygiene_flags.join(', ')}`)
+    }
+  } else {
+    lines.push('No worktree artifact attached; inspect repository git diff / git status directly.')
+  }
+
+  return {
+    ...post,
+    title: `[BLIND_REVIEW] @${post.agent} submission #${post.seq}${commitPart}`,
+    text: lines.join('\n'),
+    redacted_for_blind_review: true,
+  }
 }
 
 /** Build the deterministic Overview / Board / Roster / Round-Table snapshot from the single `events.jsonl` projection. */
@@ -203,6 +255,8 @@ export function buildSwarmProjectionSnapshot({ store, swarmId, runtime }) {
       last_error: m.last_error ?? null,
       last_input_tokens: m.last_input_tokens ?? 0,
       context_window: m.context_window ?? 0,
+      consecutive_tool_errors: m.consecutive_tool_errors ?? 0,
+      last_tool_error_name: m.last_tool_error_name ?? null,
       queue_position: queuePos,
     })
   }
@@ -259,6 +313,7 @@ export function createSwarmTools(runtime) {
         title: { type: 'string', description: 'Short descriptive title for this Swarm.' },
         concurrency_limit: { type: 'integer', description: 'Positive integer in-flight LLM request slot limit (NOT a cap on member count; e.g. 2, 4, 6, 8).' },
         project_root: { type: 'string', description: 'Optional project directory (absolute or relative to session cwd) containing `.git` for isolated worktrees.' },
+        anchors: { type: 'array', items: { type: 'string' }, description: 'Optional immutable ground-truth anchors (verbatim user paths, verification commands, hard constraints) auto-injected into every spawned brief.' },
         default_provider: { type: 'string', description: 'Optional registered LLM provider id (default: "inherit" from current session).' },
         default_model: { type: 'string', description: 'Optional model id or "provider/model" (default: "inherit" from current session).' },
         coordinator_model: { type: 'string', description: 'Optional coordinator model id (default: "inherit" from current session).' },
@@ -305,7 +360,7 @@ export function createSwarmTools(runtime) {
       const isWslUnc = /^\\\\wsl(?:\.localhost|\$)\\/i.test(String(effectiveRoot))
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.5.1', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.6.0', commit: 'HEAD', loaded_at: '' }
 
       return await store.withLock(swarmId, async () => {
         if (store.exists(swarmId) && store.readSwarm(swarmId)?.status === 'DONE') {
@@ -373,6 +428,7 @@ export function createSwarmTools(runtime) {
       properties: {
         goal: { type: 'string', description: 'Overarching goal of the swarm.' },
         current_wave: { type: 'integer', description: 'Current wave number (1, 2, ...).' },
+        anchors: { type: 'array', items: { type: 'string' }, description: 'Optional ground-truth anchors (verbatim paths, commands, constraints) auto-injected into spawned briefs.' },
         waves: {
           type: 'array',
           description: 'List of wave descriptors.',
@@ -436,6 +492,10 @@ export function createSwarmTools(runtime) {
         can_block_merge: { type: 'boolean', description: 'Whether this member\'s `verdict:"reject"` blocks `swarm_land` and `[done]` (default: true for architect/verifier, false for worker/lore_master).' },
         workspace: { type: 'string', enum: ['inherit', 'share', 'branch'], description: 'Workspace mode: defaults to "share" for role="worker" when Git is available (isolated worktree with dirty sync), or "inherit" for read-only roles / non-Git dirs.' },
         brief: { type: 'string', description: 'Public brief MUST include literal [OWNERSHIP], [FORBIDDEN], and [DONE_CRITERIA] sections.' },
+        owned_paths: { type: 'array', items: { type: 'string' }, description: 'Optional explicit owned path/glob list enforced on `swarm_land`.' },
+        forbidden_paths: { type: 'array', items: { type: 'string' }, description: 'Optional explicit forbidden path/glob list enforced on `swarm_land` (defaults to path tokens parsed from `[FORBIDDEN]`).' },
+        adopt_worktree_from: { type: 'string', description: 'Optional member name whose isolated worktree is losslessly adopted by this replacement session (retiring the predecessor without deleting its edits).' },
+        review_target: { type: 'string', description: 'Optional target worker name for spawning a reviewer (`verifier`/`red_team`) in an isolated review snapshot worktree overlaid with that worker\'s diff.' },
         provider: { type: 'string', description: 'Optional provider override.' },
         model: { type: 'string', description: 'Optional model override (or "inherit").' },
         fork: { type: 'string', description: 'Optional existing member name (or "coordinator") to fork conversation history from.' },
@@ -477,10 +537,21 @@ export function createSwarmTools(runtime) {
           }
         }
 
+        const planMeta = store.readPlan(swarmId)
+        const combinedAnchors = [...new Set([
+          ...(Array.isArray(swarmMeta?.anchors) ? swarmMeta.anchors : []),
+          ...(Array.isArray(planMeta?.anchors) ? planMeta.anchors : []),
+        ])]
+        const anchorsPrefix = combinedAnchors.length > 0
+          ? `[GROUND_TRUTH_ANCHORS]\n${combinedAnchors.map(a => `- ${a}`).join('\n')}\n\n`
+          : ''
+
         for (let i = 0; i < spec.targetNames.length; i += 1) {
           const memberName = spec.targetNames[i]
           const sliceTask = spec.tasks && spec.tasks[i] ? `\n[SHARD_TASK]\n${spec.tasks[i]}` : ''
-          const fullBrief = spec.brief + sliceTask
+          let fullBrief = anchorsPrefix + spec.brief + sliceTask
+          let effectiveOwnedPaths = spec.owned_paths
+          let effectiveForbiddenPaths = spec.forbidden_paths
 
           let worktreeInfo = {
             workspace_mode: 'inherit',
@@ -488,7 +559,55 @@ export function createSwarmTools(runtime) {
             base_commit: null,
             baseline_commit: null,
           }
-          if (effectiveWorkspace === 'share' || effectiveWorkspace === 'branch') {
+          let adoptedFromMember = null
+          if (spec.adopt_worktree_from) {
+            const srcMember = existingMembers[spec.adopt_worktree_from]
+            if (!srcMember?.worktree_path || !fs.existsSync(srcMember.worktree_path)) {
+              return {
+                ok: false,
+                text: `[WORKTREE_ERROR: swarm_add] Cannot adopt worktree from @${spec.adopt_worktree_from}: directory "${srcMember?.worktree_path ?? 'none'}" does not exist.`,
+              }
+            }
+            adoptedFromMember = spec.adopt_worktree_from
+            worktreeInfo = {
+              workspace_mode: srcMember.workspace_mode,
+              worktree_path: srcMember.worktree_path,
+              base_commit: srcMember.base_commit ?? null,
+              baseline_commit: srcMember.baseline_tree ?? srcMember.base_commit ?? null,
+            }
+            if (effectiveOwnedPaths.length === 0 && Array.isArray(srcMember.owned_paths)) {
+              effectiveOwnedPaths = srcMember.owned_paths
+            }
+            if (effectiveForbiddenPaths.length === 0 && Array.isArray(srcMember.forbidden_paths)) {
+              effectiveForbiddenPaths = srcMember.forbidden_paths
+            }
+            const adoptedDiff = await diffWorktree({
+              worktreePath: worktreeInfo.worktree_path,
+              baselineCommit: worktreeInfo.baseline_commit,
+            })
+            const priorEvents = typeof runtime.getMemberSessionEvents === 'function'
+              ? runtime.getMemberSessionEvents(srcMember.session_id)
+              : []
+            const capsule = extractMemberHandoverCapsule(priorEvents, 900)
+            fullBrief += `\n\n[ADOPTED_WORKTREE from @${adoptedFromMember}]\nWorktree: ${worktreeInfo.worktree_path}\nDiff Hash: ${adoptedDiff.diffHash || 'none'}\nChanged Files (${adoptedDiff.files?.length ?? 0}): ${(adoptedDiff.files ?? []).join(', ') || 'none'}\nPredecessor Capsule:\n${capsule}`
+          } else if (spec.review_target) {
+            const rtMember = existingMembers[spec.review_target]
+            const gitProbe = await runGit(['rev-parse', '--show-toplevel'], { cwd: mainCwd, timeoutMs: 3_000 })
+            if (gitProbe.ok && gitProbe.stdout.trim().length > 0) {
+              const revWt = await createReviewSnapshotWorktree({
+                mainCwd,
+                worktreesRoot: runtime.worktreesRoot,
+                swarmId,
+                memberName,
+                targetWorktreePath: rtMember?.worktree_path ?? null,
+                targetBaselineCommit: rtMember?.baseline_tree ?? rtMember?.base_commit ?? null,
+              })
+              if (!revWt.ok) {
+                return { ok: false, text: `[WORKTREE_ERROR: swarm_add] Failed to provision isolated review snapshot worktree for @${memberName}: ${revWt.error}` }
+              }
+              worktreeInfo = revWt
+            }
+          } else if (effectiveWorkspace === 'share' || effectiveWorkspace === 'branch') {
             const wtRes = await createIsolatedWorktree({
               mainCwd,
               worktreesRoot: runtime.worktreesRoot,
@@ -533,7 +652,7 @@ export function createSwarmTools(runtime) {
               })
             }
           } catch (spawnErr) {
-            if (worktreeInfo.workspace_mode !== 'inherit' && worktreeInfo.worktree_path) {
+            if (!adoptedFromMember && worktreeInfo.workspace_mode !== 'inherit' && worktreeInfo.worktree_path) {
               await removeIsolatedWorktree({
                 mainCwd,
                 worktreePath: worktreeInfo.worktree_path,
@@ -551,6 +670,31 @@ export function createSwarmTools(runtime) {
           // 2. Commit brief & member record (rollback if steering fails)
           let committed = null
           try {
+            if (adoptedFromMember) {
+              const srcMember = existingMembers[adoptedFromMember]
+              if (srcMember && !srcMember.killed) {
+                await runtime.disposeMemberAgent(swarmId, adoptedFromMember)
+                const killedAtSeq = store.headSeq(swarmId)
+                store.appendEvent(swarmId, {
+                  type: 'member.kill',
+                  actor: callerName,
+                  seq: killedAtSeq,
+                  payload: {
+                    name: adoptedFromMember,
+                    released: false,
+                    killed_at_seq: killedAtSeq,
+                    handover_to: memberName,
+                    reason: `Lossless worktree adoption by @${memberName}`,
+                  },
+                })
+              }
+              store.updateMember(swarmId, adoptedFromMember, m => ({
+                ...m,
+                worktree_handed_over: true,
+                handover_to: memberName,
+              }))
+            }
+
             committed = store.registerMemberWithBrief(swarmId, {
               name: memberName,
               session_id: sessionId,
@@ -564,6 +708,10 @@ export function createSwarmTools(runtime) {
               worktree_path: worktreeInfo.worktree_path,
               base_commit: worktreeInfo.base_commit,
               baseline_tree: worktreeInfo.baseline_commit,
+              owned_paths: effectiveOwnedPaths,
+              forbidden_paths: effectiveForbiddenPaths,
+              adopted_from: adoptedFromMember,
+              review_target: spec.review_target,
               fork_from: spec.fork,
               spawned_live_agent: Boolean(handle),
               brief: fullBrief,
@@ -596,7 +744,7 @@ export function createSwarmTools(runtime) {
             if (committed) {
               try { store.removeMemberRecord(swarmId, memberName) } catch {}
             }
-            if (worktreeInfo.workspace_mode !== 'inherit' && worktreeInfo.worktree_path) {
+            if (!adoptedFromMember && worktreeInfo.workspace_mode !== 'inherit' && worktreeInfo.worktree_path) {
               await removeIsolatedWorktree({
                 mainCwd,
                 worktreePath: worktreeInfo.worktree_path,
@@ -757,8 +905,68 @@ export function createSwarmTools(runtime) {
 
         let reviewedDiffHash = null
         let reviewedDiffHashes = null
+        let postArtifact = null
         const callerRecord = existingMembers[callerName]
         const callerCanBlock = Boolean(callerRecord && (callerRecord.can_block_merge === true || getRoleSpec(callerRecord.role).canBlockMerge))
+
+        // Zero-dirty-write gate: a reviewer running in an isolated review worktree must not mutate repo files (even via bash redirection)
+        if (val.verdict === 'approve' && callerCanBlock && callerRecord.workspace_mode !== 'inherit' && callerRecord.worktree_path) {
+          const ownDiff = await diffWorktree({
+            worktreePath: callerRecord.worktree_path,
+            baselineCommit: callerRecord.baseline_tree || callerRecord.base_commit,
+          })
+          if (ownDiff.ok && ownDiff.hasChanges) {
+            return {
+              ok: false,
+              dirty_files: ownDiff.files,
+              text: `[ROGUE_WRITE_BLOCKED: post_board] Reviewer @${callerName} modified repo file(s) inside its isolated review worktree (${ownDiff.files.join(', ')}). Reviewers must not mutate repo files (even via shell); clean up or use /tmp and re-verify cleanly.`,
+            }
+          }
+        }
+
+        // Objective worker submission snapshot: capture immutable commit SHA + diff metadata on events.jsonl for blind review projection
+        if (callerRecord?.role === 'worker' && val.kind === 'report') {
+          if (callerRecord.workspace_mode !== 'inherit' && callerRecord.worktree_path) {
+            const snap = await snapshotWorktreeCommit({
+              worktreePath: callerRecord.worktree_path,
+              baselineCommit: callerRecord.baseline_tree || callerRecord.base_commit,
+              label: `@${callerName}`,
+            })
+            if (snap.ok) {
+              postArtifact = {
+                worktree_path: callerRecord.worktree_path,
+                baseline_commit: snap.baselineCommit,
+                prev_commit: callerRecord.last_snapshot_commit || snap.prevCommitSha,
+                commit_sha: snap.commitSha,
+                diff_hash: snap.diffHash,
+                changed_files: snap.files,
+                ...(snap.hygieneFlags.length > 0 ? { diff_hygiene_flags: snap.hygieneFlags } : {}),
+              }
+              if (snap.commitSha && snap.commitSha !== callerRecord.last_snapshot_commit) {
+                store.updateMember(swarmId, callerName, m => ({ ...m, last_snapshot_commit: snap.commitSha }))
+              }
+            }
+          } else {
+            const swarmMetaForArt = store.readSwarm(swarmId)
+            const repoCwd = swarmMetaForArt?.project_root
+            if (repoCwd && fs.existsSync(repoCwd)) {
+              const headRes = await runGit(['rev-parse', '--short', 'HEAD'], { cwd: repoCwd, timeoutMs: 3_000 })
+              if (headRes.ok) {
+                const diffRes = await diffWorktree({ worktreePath: repoCwd, baselineCommit: 'HEAD' })
+                const hygieneFlags = diffRes.ok ? scanPatchHygiene(diffRes.patch) : []
+                postArtifact = {
+                  worktree_path: repoCwd,
+                  baseline_commit: headRes.stdout.trim(),
+                  commit_sha: headRes.stdout.trim(),
+                  diff_hash: diffRes.ok ? diffRes.diffHash : null,
+                  changed_files: diffRes.ok ? diffRes.files : [],
+                  ...(hygieneFlags.length > 0 ? { diff_hygiene_flags: hygieneFlags } : {}),
+                }
+              }
+            }
+          }
+        }
+
         if (val.verdict === 'approve' && callerCanBlock) {
           const verdictTargets = resolveVerdictTargets(
             { agent: callerName, target_member: val.target_member, mentions: val.mentions },
@@ -807,6 +1015,7 @@ export function createSwarmTools(runtime) {
           target_member: val.target_member,
           reviewed_diff_hash: reviewedDiffHash,
           reviewed_diff_hashes: reviewedDiffHashes,
+          artifact: postArtifact,
           supersedes: val.supersedes,
           escalate: val.escalate,
           silent: val.silent,
@@ -909,7 +1118,7 @@ export function createSwarmTools(runtime) {
 
   const readBoardTool = makeTool({
     name: 'read_board',
-    description: 'Read board posts after `since` (default: your last_read_seq). Supports `kinds`, `agent`, `channel`, `limit`, `hide_superseded`.',
+    description: 'Read board posts after `since` (default: your last_read_seq). Supports `kinds`, `agent`, `channel`, `limit`, `hide_superseded`, and read-only `seance_member` handover capsule inspection.',
     isConcurrencySafe: true,
     parameters: {
       properties: {
@@ -920,6 +1129,7 @@ export function createSwarmTools(runtime) {
         agent: { type: 'string', description: 'Author filter.' },
         limit: { type: 'integer', description: 'Max recent posts.' },
         hide_superseded: { type: 'boolean', description: 'Omit superseded posts.' },
+        seance_member: { type: 'string', description: 'Optional retired/existing member name to read a bounded (<=1500 char) capsule of its recent decisions and tool errors.' },
       },
     },
     async execute(args, exec) {
@@ -930,6 +1140,27 @@ export function createSwarmTools(runtime) {
         }
         const members = store.readMembers(swarmId)
         const caller = members[callerName]
+        const callerRole = caller?.role ?? 'worker'
+
+        if (typeof args?.seance_member === 'string' && args.seance_member.trim()) {
+          const targetName = args.seance_member.replace(/^@/, '').trim()
+          const targetRec = members[targetName]
+          if (!targetRec) {
+            return { ok: false, text: `[FORMAT_ERROR: read_board] seance_member "@${targetName}" does not exist.` }
+          }
+          const evs = typeof runtime.getMemberSessionEvents === 'function'
+            ? runtime.getMemberSessionEvents(targetRec.session_id)
+            : []
+          const capsule = extractMemberHandoverCapsule(evs, 1500)
+          return {
+            ok: true,
+            seance_member: targetName,
+            killed: targetRec.killed === true,
+            capsule,
+            text: `[SEANCE @${targetName} (${targetRec.role}, ${targetRec.killed ? 'retired' : 'active'})]\n${capsule}`,
+          }
+        }
+
         const sinceSeq = args && args.since !== undefined && Number.isInteger(Number(args.since)) && Number(args.since) >= 0
           ? Number(args.since)
           : (caller?.last_read_seq ?? 0)
@@ -971,7 +1202,8 @@ export function createSwarmTools(runtime) {
 
         const annotatedPosts = posts.map((p) => {
           if (!p || p.type === 'control') return p
-          const withTitle = p.title ? p : { ...p, title: deriveFallbackTitle(p.text, p.kind || 'post') }
+          const projected = projectPostForCaller(p, callerRole, members)
+          const withTitle = projected.title ? projected : { ...projected, title: deriveFallbackTitle(projected.text, projected.kind || 'post') }
           return supersededMap.has(p.seq)
             ? { ...withTitle, superseded_by: supersededMap.get(p.seq) }
             : withTitle
@@ -1067,12 +1299,13 @@ export function createSwarmTools(runtime) {
             }))
           }
           runtime.notifyProjectionChanged(swarmId)
-          const preview = pending.map(p => `#${p.seq} @${p.agent} (${p.kind}) ${p.title || deriveFallbackTitle(p.text)}\n${p.text}`).join('\n---\n')
+          const projectedPending = pending.map(p => projectPostForCaller(p, member?.role ?? 'worker', members))
+          const preview = projectedPending.map(p => `#${p.seq} @${p.agent} (${p.kind}) ${p.title || deriveFallbackTitle(p.text)}\n${p.text}`).join('\n---\n')
           return {
             ok: true,
             status: 'NEW_MESSAGES_ARRIVED',
-            posts: pending,
-            text: `[swarm_wait BLOCKED] +${pending.length} (#${pending[0].seq}..#${newest}):\n${preview}`,
+            posts: projectedPending,
+            text: `[swarm_wait BLOCKED] +${projectedPending.length} (#${projectedPending[0].seq}..#${newest}):\n${preview}`,
           }
         }
 
@@ -1114,7 +1347,7 @@ export function createSwarmTools(runtime) {
       const { swarmId } = runtime.resolveCaller(exec.agent)
       const fp = typeof runtime.getRuntimeFingerprint === 'function'
         ? runtime.getRuntimeFingerprint()
-        : { version: '0.5.1', commit: 'HEAD', loaded_at: '' }
+        : { version: '0.6.0', commit: 'HEAD', loaded_at: '' }
       if (!store.exists(swarmId)) {
         return {
           ok: false,
@@ -1145,14 +1378,23 @@ export function createSwarmTools(runtime) {
           const qPart = m.queue_position > 0 ? ` q=#${m.queue_position}` : ''
           const errPart = m.last_error ? ` ERR=${m.last_error.code}:${m.last_error.message}` : ''
           const blkPart = m.last_park_blocked_seq > 0 ? ` blk=#${m.last_park_blocked_seq}` : ''
+          const ctxPct = m.context_window > 0 && m.last_input_tokens > 0
+            ? Math.round((m.last_input_tokens / m.context_window) * 100)
+            : 0
           const ctxPart = m.context_window > 0 && m.last_input_tokens > 0
-            ? ` ctx=${formatCompactTokens(m.last_input_tokens)}/${formatCompactTokens(m.context_window)}(${Math.round((m.last_input_tokens / m.context_window) * 100)}%)`
+            ? ` ctx=${formatCompactTokens(m.last_input_tokens)}/${formatCompactTokens(m.context_window)}(${ctxPct}%)`
             : (m.last_input_tokens > 0 ? ` ctx=${formatCompactTokens(m.last_input_tokens)}` : '')
           const stepPart = m.stepSummary && m.status !== 'waiting' && m.status !== 'killed' ? ` | ${m.stepSummary}` : ''
           const budgetWarn = !m.killed && m.tool_call_count >= HIGH_TOOL_CALL_THRESHOLD
             ? ` [BUDGET_WARN: ${m.tool_call_count} tool calls]`
             : ''
-          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} ${route} ${m.workspace_mode} t=${m.turn_count} tc=${m.tool_call_count}${ctxPart}${lastTool}${qPart}${errPart} r=#${m.last_read_seq} w=#${m.wait_since} p=#${m.last_post_seq}${blkPart}${stepPart}${budgetWarn}`
+          const ctxWarn = !m.killed && ctxPct >= 80
+            ? ` [CTX_PRESSURE: ${ctxPct}%]`
+            : ''
+          const toolLoopWarn = !m.killed && (m.consecutive_tool_errors ?? 0) >= 3
+            ? ` [TOOL_LOOP_WARN: ${m.consecutive_tool_errors}x ${m.last_tool_error_name || 'tool'} errors]`
+            : ''
+          return `  - @${m.name} [${m.role}${m.can_block_merge ? ':gate' : ''}] status=${m.status} ${route} ${m.workspace_mode} t=${m.turn_count} tc=${m.tool_call_count}${ctxPart}${lastTool}${qPart}${errPart} r=#${m.last_read_seq} w=#${m.wait_since} p=#${m.last_post_seq}${blkPart}${stepPart}${budgetWarn}${ctxWarn}${toolLoopWarn}`
         }),
       ]
       return {
@@ -1215,20 +1457,90 @@ export function createSwarmTools(runtime) {
 
   const swarmLandTool = makeTool({
     name: 'swarm_land',
-    description: 'Inspect (`action: "diff"`) or merge (`action: "apply"`) a share/branch worktree member\'s incremental changes back into `project_root` / main workspace. Respects unresolved `[REJECT]` merge gates unless `override_reason` is provided.',
+    description: 'Inspect (`action: "diff"`), batch-preflight (`action: "preflight_all"`), or merge (`action: "apply"`) isolated worktree changes into `project_root` / main workspace. Enforces merge gates, diff-hash approval freshness, `[OWNERSHIP]`/`[FORBIDDEN]` scope, and sensitive-file blacklists unless `override_reason` is provided.',
     parameters: {
       properties: {
-        name: { type: 'string', description: 'Member name whose worktree to diff or land.' },
-        action: { type: 'string', enum: ['diff', 'apply'], description: '"diff" to inspect incremental changes, "apply" to preflight-check and apply onto main workspace.' },
-        override_reason: { type: 'string', description: 'Optional PM reason to override an active `[REJECT]` merge gate.' },
+        name: { type: 'string', description: 'Member name whose worktree to diff or land (omit for action="preflight_all").' },
+        action: { type: 'string', enum: ['diff', 'apply', 'preflight_all'], description: '"diff" to inspect changes, "preflight_all" to check all unlanded worktrees for main & cross-member conflicts, "apply" to verify and apply onto main workspace.' },
+        override_reason: { type: 'string', description: 'Optional PM reason to override an active merge gate or scope/sensitive block.' },
       },
-      required: ['name', 'action'],
+      required: ['action'],
     },
     async execute(args, exec) {
       const { swarmId, callerName, rootAgent } = runtime.resolveCaller(exec.agent)
       return await store.withLock(swarmId, async () => {
         const swarmMeta = store.readSwarm(swarmId)
         const members = store.readMembers(swarmId)
+        const mainCwd = swarmMeta?.project_root || rootAgent?.session?.header?.cwd || process.cwd()
+
+        if (args.action === 'preflight_all') {
+          const candidates = Object.entries(members)
+            .filter(([, m]) => (
+              m && !m.killed && !m.landed && !m.worktree_handed_over
+              && m.workspace_mode !== 'inherit' && m.worktree_path
+              && !(m.can_block_merge === true || getRoleSpec(m.role).canBlockMerge)
+            ))
+          const reports = []
+          const fileOwners = new Map()
+          for (const [mName, m] of candidates) {
+            const d = await diffWorktree({
+              worktreePath: m.worktree_path,
+              baselineCommit: m.baseline_tree || m.base_commit,
+            })
+            const scopeAudit = d.ok
+              ? auditChangedPaths({ files: d.files, ownedPaths: m.owned_paths, forbiddenPaths: m.forbidden_paths })
+              : { ok: false, paths: [], sensitive: [], forbidden: [], outOfScope: [] }
+            let applyClean = true
+            let conflictDetail = null
+            if (d.ok && d.hasChanges) {
+              const chk = await runGit(['-c', 'core.autocrlf=false', 'apply', '--check', '--whitespace=nowarn', '-'], {
+                cwd: mainCwd,
+                input: d.patch,
+              })
+              if (!chk.ok) {
+                applyClean = false
+                conflictDetail = chk.stderr.trim()
+              }
+            }
+            for (const p of scopeAudit.paths) {
+              if (!fileOwners.has(p)) fileOwners.set(p, [])
+              fileOwners.get(p).push(mName)
+            }
+            const activeRejs = store.computeActiveRejections(swarmId, { targetMember: mName })
+            const staleApps = d.ok && d.diffHash ? store.computeStaleApprovals(swarmId, mName, d.diffHash) : []
+            reports.push({
+              member: mName,
+              has_changes: d.hasChanges === true,
+              diff_hash: d.diffHash ?? null,
+              files: scopeAudit.paths,
+              apply_clean: applyClean,
+              ...(conflictDetail ? { conflict_detail: conflictDetail } : {}),
+              scope_ok: scopeAudit.ok,
+              scope_audit: scopeAudit,
+              hygiene_flags: d.ok ? scanPatchHygiene(d.patch) : [],
+              active_rejections: activeRejs.length,
+              stale_approvals: staleApps.length,
+            })
+          }
+          const overlaps = []
+          for (const [filePath, owners] of fileOwners.entries()) {
+            if (owners.length > 1) overlaps.push({ path: filePath, members: owners })
+          }
+          const allReady = overlaps.length === 0 && reports.every(r => r.apply_clean && r.scope_ok && r.active_rejections === 0 && r.stale_approvals === 0)
+          const summaryLines = [
+            `[swarm_land PREFLIGHT_ALL] ${reports.length} worktree(s) checked, all_ready=${allReady}, cross_overlaps=${overlaps.length}`,
+            ...reports.map(r => `  - @${r.member}: files=${r.files.length}, apply_clean=${r.apply_clean}, scope_ok=${r.scope_ok}, rej=${r.active_rejections}, stale=${r.stale_approvals}${r.hygiene_flags.length > 0 ? ', flags=' + r.hygiene_flags.join('|') : ''}`),
+            ...overlaps.map(o => `  ! OVERLAP: ${o.path} touched by ${o.members.map(n => '@' + n).join(', ')}`),
+          ]
+          return {
+            ok: true,
+            all_ready: allReady,
+            members: reports,
+            overlaps,
+            text: summaryLines.join('\n'),
+          }
+        }
+
         const targetName = String(args?.name ?? '').trim()
         const member = members[targetName]
         if (!member) {
@@ -1247,10 +1559,17 @@ export function createSwarmTools(runtime) {
           const staleApprovals = preDiff.ok && preDiff.diffHash
             ? store.computeStaleApprovals(swarmId, targetName, preDiff.diffHash)
             : []
+          const scopeAudit = preDiff.ok
+            ? auditChangedPaths({
+                files: preDiff.files,
+                ownedPaths: member.owned_paths,
+                forbiddenPaths: member.forbidden_paths,
+              })
+            : { ok: true, paths: [], sensitive: [], forbidden: [], outOfScope: [] }
           const overrideReason = typeof args.override_reason === 'string' && args.override_reason.trim()
             ? args.override_reason.trim()
             : null
-          if ((activeRejections.length > 0 || staleApprovals.length > 0) && !overrideReason) {
+          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok) && !overrideReason) {
             const parts = []
             if (activeRejections.length > 0) {
               const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
@@ -1260,17 +1579,26 @@ export function createSwarmTools(runtime) {
               const staleList = staleApprovals.map(a => `#${a.seq} by @${a.reviewer} (approved=${a.approved_diff_hash}, current=${a.current_diff_hash})`).join('; ')
               parts.push(`stale approval(s) after post-review edits: [${staleList}]`)
             }
+            if (!scopeAudit.ok) {
+              const scopeParts = []
+              if (scopeAudit.sensitive.length > 0) scopeParts.push(`sensitive/scratch=[${scopeAudit.sensitive.join(', ')}]`)
+              if (scopeAudit.forbidden.length > 0) scopeParts.push(`forbidden=[${scopeAudit.forbidden.join(', ')}]`)
+              if (scopeAudit.outOfScope.length > 0) scopeParts.push(`out_of_ownership=[${scopeAudit.outOfScope.join(', ')}]`)
+              parts.push(`scope violation(s): ${scopeParts.join('; ')}`)
+            }
             return {
               ok: false,
               ...(activeRejections.length > 0 ? { blocked_by_rejections: activeRejections } : {}),
               ...(staleApprovals.length > 0 ? { stale_approvals: staleApprovals } : {}),
-              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by ${parts.join(' and ')}. Re-verify and post a fresh verdict="approve", or pass override_reason to override.`,
+              ...(!scopeAudit.ok ? { scope_violations: scopeAudit } : {}),
+              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by ${parts.join(' and ')}. Resolve or pass override_reason to override.`,
             }
           }
-          if ((activeRejections.length > 0 || staleApprovals.length > 0) && overrideReason) {
+          if ((activeRejections.length > 0 || staleApprovals.length > 0 || !scopeAudit.ok) && overrideReason) {
             const refsList = [
               ...activeRejections.map(r => '#' + r.seq),
               ...staleApprovals.map(a => '#' + a.seq + '(stale)'),
+              ...(!scopeAudit.ok ? ['scope_audit'] : []),
             ].join(', ')
             store.appendBoardRecord(swarmId, {
               type: 'post',
@@ -1285,7 +1613,6 @@ export function createSwarmTools(runtime) {
           }
         }
 
-        const mainCwd = swarmMeta?.project_root || rootAgent?.session?.header?.cwd || process.cwd()
         const res = await landWorktree({
           mainCwd,
           worktreePath: member.worktree_path,
@@ -1296,10 +1623,23 @@ export function createSwarmTools(runtime) {
           return { ok: false, text: `[LAND_ERROR: swarm_land] ${res.error}` }
         }
         if (args.action === 'diff') {
+          const hygieneFlags = scanPatchHygiene(res.patch)
+          const scopeAudit = auditChangedPaths({
+            files: res.files,
+            ownedPaths: member.owned_paths,
+            forbiddenPaths: member.forbidden_paths,
+          })
+          const flagsNote = hygieneFlags.length > 0 ? `\n[DIFF_HYGIENE_FLAGS]: ${hygieneFlags.join(', ')}` : ''
+          const scopeNote = !scopeAudit.ok
+            ? `\n[SCOPE_WARN]: sensitive=[${scopeAudit.sensitive.join(', ')}], forbidden=[${scopeAudit.forbidden.join(', ')}], out_of_ownership=[${scopeAudit.outOfScope.join(', ')}]`
+            : ''
           return {
             ok: true,
             files: res.files,
-            text: `[swarm_land DIFF @${targetName}] Changed files (${res.files.length}): ${res.files.join(', ') || 'none'}\n\n${res.patch.slice(0, 6000)}`,
+            diff_hash: res.diffHash ?? null,
+            hygiene_flags: hygieneFlags,
+            scope_audit: scopeAudit,
+            text: `[swarm_land DIFF @${targetName}] Changed files (${res.files.length}): ${res.files.join(', ') || 'none'}${flagsNote}${scopeNote}\n\n${res.patch.slice(0, 6000)}`,
           }
         }
         store.updateMember(swarmId, targetName, m => ({ ...m, landed: true }))
@@ -1315,11 +1655,12 @@ export function createSwarmTools(runtime) {
 
   const swarmKillTool = makeTool({
     name: 'swarm_kill',
-    description: 'Retire a Swarm member and delete its isolated worktree. Blocks retiring a currently `working` or `queued` member unless `force: true` is passed (prompting to ask for handover notes / last words if valuable). If the member never started (`turn_count === 0 && last_post_seq === 0`), its name is cleanly released for reuse; otherwise the name stays tombstoned for audit history. Optional `handover_to` records responsibility handover.',
+    description: 'Retire a Swarm member and delete its isolated worktree (unless `keep_worktree: true` is passed for later `adopt_worktree_from` takeover). Use promptly to terminate low-efficiency, slacking, hallucinating, or context-polluted sessions and respawn clean replacements. Blocks retiring a currently `working` or `queued` member unless `force: true` is passed. If the member never started (`turn_count === 0 && last_post_seq === 0`), its name is released for reuse; otherwise it stays tombstoned for audit history.',
     parameters: {
       properties: {
         name: { type: 'string', description: 'Member name to retire.' },
         force: { type: 'boolean', description: 'Set true to force-kill a running/queued member or discard unmerged worktree edits intentionally.' },
+        keep_worktree: { type: 'boolean', description: 'Set true to preserve the member\'s isolated worktree on disk for a replacement session to adopt via `swarm_add(adopt_worktree_from)`.' },
         handover_to: { type: 'string', description: 'Optional member name taking over responsibility.' },
         reason: { type: 'string', description: 'Optional retirement/handover reason.' },
       },
@@ -1367,26 +1708,29 @@ export function createSwarmTools(runtime) {
         const target = liveOverlay ? { ...rawTarget, ...liveOverlay } : rawTarget
 
         const mainCwd = swarmMeta?.project_root || rootAgent?.session?.header?.cwd || process.cwd()
-        if ((target.workspace_mode === 'share' || target.workspace_mode === 'branch') && target.worktree_path && !target.landed) {
-          const rmRes = await removeIsolatedWorktree({
-            mainCwd,
-            worktreePath: target.worktree_path,
-            baselineCommit: target.baseline_tree || target.base_commit,
-            force: args.force === true,
-          })
-          if (!rmRes.ok) {
-            return {
-              ok: false,
-              text: `[SAFETY_BLOCK: swarm_kill] @${targetName} still has unmerged worktree changes (${(rmRes.files ?? []).join(', ')}). Run swarm_land({"name": "${targetName}", "action": "apply"}) first, or pass force=true to discard intentionally.`,
+        const keepWorktree = args.keep_worktree === true || target.worktree_handed_over === true
+        if (!keepWorktree) {
+          if ((target.workspace_mode === 'share' || target.workspace_mode === 'branch') && target.worktree_path && !target.landed) {
+            const rmRes = await removeIsolatedWorktree({
+              mainCwd,
+              worktreePath: target.worktree_path,
+              baselineCommit: target.baseline_tree || target.base_commit,
+              force: args.force === true,
+            })
+            if (!rmRes.ok) {
+              return {
+                ok: false,
+                text: `[SAFETY_BLOCK: swarm_kill] @${targetName} still has unmerged worktree changes (${(rmRes.files ?? []).join(', ')}). Run swarm_land({"name": "${targetName}", "action": "apply"}), pass keep_worktree=true (or adopt_worktree_from in swarm_add) to hand over edits, or pass force=true to discard intentionally.`,
+              }
             }
+          } else if (target.worktree_path && target.worktree_path !== mainCwd) {
+            await removeIsolatedWorktree({
+              mainCwd,
+              worktreePath: target.worktree_path,
+              baselineCommit: target.baseline_tree || target.base_commit,
+              force: true,
+            })
           }
-        } else if (target.worktree_path && target.worktree_path !== mainCwd) {
-          await removeIsolatedWorktree({
-            mainCwd,
-            worktreePath: target.worktree_path,
-            baselineCommit: target.baseline_tree || target.base_commit,
-            force: true,
-          })
         }
 
         await runtime.disposeMemberAgent(swarmId, targetName)

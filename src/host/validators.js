@@ -44,6 +44,56 @@ export const GENERIC_POST_TITLES = new Set([
   'untitled',
 ])
 
+/** Normalize optional ground-truth anchor items (array or multiline string) into bounded strings. */
+export function normalizeAnchors(raw) {
+  const items = Array.isArray(raw)
+    ? raw
+    : (typeof raw === 'string' ? raw.split(/\r?\n/) : [])
+  const out = []
+  for (const item of items) {
+    const cleaned = String(item ?? '').replace(/^[-*]\s*/, '').trim()
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned.slice(0, 300))
+    if (out.length >= 20) break
+  }
+  return out
+}
+
+/** Normalize explicit path/glob patterns to forward-slash relative form. */
+export function normalizePathPatterns(raw) {
+  const items = Array.isArray(raw) ? raw : []
+  const out = []
+  for (const item of items) {
+    const cleaned = String(item ?? '').trim().replace(/\\/g, '/').replace(/^\.\//, '')
+    if (cleaned && !out.includes(cleaned)) out.push(cleaned)
+  }
+  return out
+}
+
+/** Extract concrete path-like tokens (containing `/`, `.`, or `*`) from `[OWNERSHIP]` / `[FORBIDDEN]` brief sections. */
+export function parseBriefPathScopes(brief) {
+  const owned = []
+  const forbidden = []
+  if (typeof brief !== 'string' || !brief.trim()) return { owned, forbidden }
+
+  const sectionRe = /\[(OWNERSHIP|FORBIDDEN|DONE_CRITERIA|SHARD_TASK)\]([\s\S]*?)(?=\[(?:OWNERSHIP|FORBIDDEN|DONE_CRITERIA|SHARD_TASK)\]|$)/g
+  let match
+  while ((match = sectionRe.exec(brief)) !== null) {
+    const tag = match[1]
+    if (tag !== 'OWNERSHIP' && tag !== 'FORBIDDEN') continue
+    const target = tag === 'OWNERSHIP' ? owned : forbidden
+    const body = match[2] || ''
+    const tokens = body.split(/[\s,;`"'()]+/).map(t => t.replace(/^[-*]+/, '').trim()).filter(Boolean)
+    for (const tok of tokens) {
+      const cleaned = tok.replace(/\\/g, '/').replace(/^\.\//, '')
+      if (!cleaned || cleaned.startsWith('http://') || cleaned.startsWith('https://')) continue
+      if (cleaned.includes('/') || cleaned.includes('*') || /^[a-zA-Z0-9_.-]+\.[a-zA-Z0-9]{1,8}$/.test(cleaned)) {
+        if (!target.includes(cleaned)) target.push(cleaned)
+      }
+    }
+  }
+  return { owned, forbidden }
+}
+
 /** Build a structured self-healing validation failure. */
 function formatError(toolName, reason, exampleObj, extraNote = '') {
   const lines = [
@@ -107,12 +157,14 @@ export function validateSwarmInit(args) {
   const projectRoot = typeof args.project_root === 'string' && args.project_root.trim()
     ? args.project_root.trim()
     : null
+  const anchors = normalizeAnchors(args.anchors)
   return {
     ok: true,
     value: {
       title,
       concurrency_limit: limit,
       project_root: projectRoot,
+      anchors,
       default_provider: typeof args.default_provider === 'string' && args.default_provider.trim()
         ? args.default_provider.trim()
         : 'inherit',
@@ -308,6 +360,65 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
     }
   }
 
+  let adoptWorktreeFrom = null
+  if (args.adopt_worktree_from !== undefined && args.adopt_worktree_from !== null && String(args.adopt_worktree_from).trim() !== '') {
+    const srcName = String(args.adopt_worktree_from).replace(/^@/, '').trim()
+    const srcRec = existingMembers[srcName]
+    if (!srcRec || srcName === 'coordinator') {
+      return formatError('swarm_add', `adopt_worktree_from "@${srcName}" does not exist or cannot transfer a worktree.`, {
+        name: rawName,
+        role,
+        brief,
+      })
+    }
+    if (count !== 1) {
+      return formatError('swarm_add', 'adopt_worktree_from can only be used when spawning a single replacement member (n=1).', {
+        name: rawName,
+        role,
+        adopt_worktree_from: srcName,
+        brief,
+      })
+    }
+    if (srcRec.workspace_mode === 'inherit' || !srcRec.worktree_path || srcRec.worktree_handed_over === true) {
+      return formatError('swarm_add', `Member "@${srcName}" has no active isolated worktree available for adoption.`, {
+        name: rawName,
+        role,
+        brief,
+      })
+    }
+    adoptWorktreeFrom = srcName
+  }
+
+  let reviewTarget = null
+  if (args.review_target !== undefined && args.review_target !== null && String(args.review_target).trim() !== '') {
+    const rtName = String(args.review_target).replace(/^@/, '').trim()
+    const rtRec = existingMembers[rtName]
+    if (!rtRec || rtName === 'coordinator') {
+      return formatError('swarm_add', `review_target "@${rtName}" does not exist.`, {
+        name: rawName,
+        role,
+        brief,
+      })
+    }
+    if (count !== 1) {
+      return formatError('swarm_add', 'review_target can only be used when spawning a single reviewer (n=1).', {
+        name: rawName,
+        role,
+        review_target: rtName,
+        brief,
+      })
+    }
+    reviewTarget = rtName
+  }
+
+  const parsedScopes = parseBriefPathScopes(brief)
+  const ownedPaths = args.owned_paths !== undefined
+    ? normalizePathPatterns(args.owned_paths)
+    : []
+  const forbiddenPaths = args.forbidden_paths !== undefined
+    ? normalizePathPatterns(args.forbidden_paths)
+    : parsedScopes.forbidden
+
   const canBlockMerge = args.can_block_merge !== undefined
     ? Boolean(args.can_block_merge)
     : getRoleSpec(role).canBlockMerge
@@ -325,6 +436,10 @@ export function validateSwarmAdd(args, swarmMeta, existingMembers = {}, callerNa
       workspace,
       workspaceExplicit,
       brief,
+      owned_paths: ownedPaths,
+      forbidden_paths: forbiddenPaths,
+      adopt_worktree_from: adoptWorktreeFrom,
+      review_target: reviewTarget,
       provider: providerExplicit ? args.provider.trim() : (swarmMeta.default_provider ?? 'inherit'),
       model: modelExplicit ? args.model.trim() : (swarmMeta.default_model ?? 'inherit'),
       providerExplicit,
@@ -714,6 +829,7 @@ export function validateSwarmPlan(args) {
     value: {
       goal,
       current_wave: Number.isInteger(args.current_wave) ? args.current_wave : 1,
+      anchors: normalizeAnchors(args.anchors),
       waves: Array.isArray(args.waves) ? args.waves : [],
       tracks: Array.isArray(args.tracks) ? args.tracks : [],
     },

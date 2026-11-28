@@ -17,6 +17,8 @@ import { statusOf, DEFAULT_STARTUP_GRACE_MS } from './stop-hook.js'
 export const MAX_NUDGES_PER_STALL = 3
 export const AUTO_SLEEP_QUIET_TICKS = 5
 export const UNPARKED_IDLE_WINDOW_MS = 10 * 60 * 1000
+export const CONTEXT_PRESSURE_THRESHOLD = 0.80
+export const CONSECUTIVE_TOOL_ERROR_THRESHOLD = 3
 
 /**
  * Inspect per-member crash / zombie conditions independently of whether sibling
@@ -55,7 +57,40 @@ export function detectMemberHealthIssues({
       continue
     }
 
-    if (liveness.status === 'working' || liveness.status === 'queued') continue
+    if (liveness.status === 'working' || liveness.status === 'queued') {
+      const tele = liveness.telemetry || {}
+      const ctxWin = Number(tele.context_window ?? member.context_window) || 0
+      const ctxUsed = Number(tele.last_input_tokens ?? member.last_input_tokens) || 0
+      const ctxRatio = ctxWin > 0 ? ctxUsed / ctxWin : 0
+      if (ctxRatio >= CONTEXT_PRESSURE_THRESHOLD) {
+        const pct = Math.round(ctxRatio * 100)
+        issues.push({
+          kind: 'member_context_pressure',
+          advisory: true,
+          memberName: name,
+          target: 'coordinator',
+          seq: member.last_post_seq || member.brief_seq || 0,
+          signature: `member_context_pressure:${name}:${Math.floor(pct / 10) * 10}`,
+          title: `Watchdog advisory: @${name} context pressure (${pct}%)`,
+          prompt: `@coordinator [CONTEXT_PRESSURE_ALERT] Member @${name} reached ${pct}% context usage (${ctxUsed}/${ctxWin} tokens, tc=${member.tool_call_count ?? 0}). Consider lossless rotation via swarm_add({"adopt_worktree_from": "${name}", ...}) before context degradation.`,
+        })
+      }
+      const errStreak = Number(tele.consecutive_tool_errors ?? member.consecutive_tool_errors) || 0
+      if (errStreak >= CONSECUTIVE_TOOL_ERROR_THRESHOLD) {
+        const errTool = tele.last_tool_error_name || member.last_tool_error_name || member.last_tool_name || 'tool'
+        issues.push({
+          kind: 'member_tool_loop',
+          advisory: true,
+          memberName: name,
+          target: 'coordinator',
+          seq: member.last_post_seq || member.brief_seq || 0,
+          signature: `member_tool_loop:${name}:${errTool}:${Math.floor(errStreak / CONSECUTIVE_TOOL_ERROR_THRESHOLD)}`,
+          title: `Watchdog advisory: @${name} hit ${errStreak} consecutive ${errTool} errors`,
+          prompt: `@coordinator [TOOL_LOOP_ALERT] Member @${name} hit ${errStreak} consecutive ${errTool} failures (tc=${member.tool_call_count ?? 0}). Inspect and redirect or replace via swarm_kill / swarm_add(adopt_worktree_from).`,
+        })
+      }
+      continue
+    }
 
     if (liveness.status === 'unparked_idle') {
       issues.push({
@@ -128,7 +163,7 @@ export function detectSwarmStall({
     getMemberLiveness,
     nowMs,
     startupTimeoutMs,
-  })
+  }).filter(issue => issue.advisory !== true)
   if (healthIssues.length > 0) {
     const selected = (skipSignatures instanceof Set)
       ? (healthIssues.find(issue => !skipSignatures.has(issue.signature)) ?? healthIssues[0])
@@ -460,8 +495,9 @@ export class SwarmMonitorDaemon {
         }
       }
 
+      const maxStrikes = issue.advisory ? 1 : MAX_NUDGES_PER_STALL
       const prevCount = this.nudgeCounts.get(issue.signature) ?? 0
-      if (prevCount >= MAX_NUDGES_PER_STALL) {
+      if (prevCount >= maxStrikes) {
         suppressed.push({
           action: 'suppressed_duplicate',
           kind: issue.kind,

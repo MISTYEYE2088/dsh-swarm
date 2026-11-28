@@ -3614,6 +3614,379 @@ async function test_query_visible_posts_single_pass_channel_replay() {
   assert.equal(visibleSeqs.has(pAfterUnsub.seq), false)
 }
 
+async function test_isolated_review_worktree_catches_rogue_writes_and_blind_projection() {
+  const repoDir = path.join(tempRoot, 'blind-review-repo')
+  fs.mkdirSync(repoDir, { recursive: true })
+  await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
+  fs.writeFileSync(path.join(repoDir, 'base.js'), 'export const v = 1\n')
+  await runGit(['add', '.'], { cwd: repoDir })
+  await runGit(['commit', '-m', 'init'], { cwd: repoDir })
+
+  const registeredTools = new Map()
+  const steeredByAgent = new Map()
+  const fakeAgents = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      if (name === 'agents') {
+        return {
+          get(id) { return fakeAgents.get(id) },
+          async create(opts) {
+            const list = []
+            steeredByAgent.set(opts.sessionId, list)
+            const ag = {
+              id: opts.sessionId,
+              status: 'idle',
+              session: { header: { id: opts.sessionId, cwd: opts.meta?.cwd || repoDir } },
+              steer(m) { list.push(m) },
+            }
+            fakeAgents.set(opts.sessionId, ag)
+            return { agent: ag, dispose: async () => {} }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-blind-rev'), worktreesDir: path.join(tempRoot, 'wt-blind-rev') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-blind', status: 'idle', session: { header: { id: 'sess-blind', cwd: repoDir } }, steer() {} }
+  fakeAgents.set('sess-blind', coordAgent)
+
+  await registeredTools.get('swarm_init').execute(
+    {
+      title: 'Blind Projection & Review Worktree',
+      concurrency_limit: 4,
+      anchors: ['Authoritative spec: docs/spec.md', 'Constraint: no tape-out'],
+    },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'worker-a', role: 'worker', workspace: 'share', brief: '[OWNERSHIP]\na.js\n[FORBIDDEN]\nb.js\n[DONE_CRITERIA]\nimpl' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'arch-1', role: 'architect', brief: '[OWNERSHIP]\narch\n[FORBIDDEN]\ncode\n[DONE_CRITERIA]\nreview' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-1', role: 'verifier', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\ncode\n[DONE_CRITERIA]\nverify' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'rt-1', role: 'red_team', brief: '[OWNERSHIP]\naudit\n[FORBIDDEN]\ncode\n[DONE_CRITERIA]\nred team' },
+    { agent: coordAgent },
+  )
+
+  // Anchors auto-injected into every spawned brief
+  const workerBriefMsg = steeredByAgent.get('sess-blind__worker-a')[0].content[0].text
+  assert.match(workerBriefMsg, /\[GROUND_TRUTH_ANCHORS\]/)
+  assert.match(workerBriefMsg, /Authoritative spec: docs\/spec\.md/)
+
+  // Worker edits a.js with a sneaky GTEST_SKIP() and posts hype prose mentioning qa-1, arch-1, rt-1
+  const members = runtime.store.readMembers('sess-blind')
+  fs.writeFileSync(path.join(members['worker-a'].worktree_path, 'a.js'), 'export const x = 2\n// GTEST_SKIP()\n')
+
+  const postTool = registeredTools.get('post_board')
+  const readTool = registeredTools.get('read_board')
+  const workerPost = await postTool.execute(
+    {
+      title: 'All green 100% pass closing round zero bugs',
+      kind: 'report',
+      mentions: ['qa-1', 'arch-1', 'rt-1', 'coordinator'],
+      text: '@qa-1 @arch-1 @rt-1 @coordinator SECRET_WORKER_HYPE everything passed with zero defects!',
+    },
+    { agent: fakeAgents.get('sess-blind__worker-a') },
+  )
+  assert.equal(workerPost.ok, true)
+
+  // 1. Coordinator sees full worker prose AND snapshot commit artifact
+  const coordBoard = await readTool.execute({ since: 0, agent: 'worker-a' }, { agent: coordAgent })
+  assert.equal(coordBoard.posts.length, 1)
+  assert.match(coordBoard.posts[0].text, /SECRET_WORKER_HYPE/)
+  assert.ok(coordBoard.posts[0].artifact?.commit_sha, 'Worker report must attach snapshot commit SHA')
+  assert.ok(coordBoard.posts[0].artifact?.diff_hygiene_flags?.includes('added_skip_macro'))
+
+  // 2. Architect (blindToWorkerProse=false by default) still sees worker prose
+  const archBoard = await readTool.execute({ since: 0, agent: 'worker-a' }, { agent: fakeAgents.get('sess-blind__arch-1') })
+  assert.match(archBoard.posts[0].text, /SECRET_WORKER_HYPE/)
+
+  // 3. Verifier & Red Team (blindToWorkerProse=true) NEVER see worker title or text in wakeup or read_board!
+  const qaWakeups = steeredByAgent.get('sess-blind__qa-1')
+  const latestQaWake = qaWakeups[qaWakeups.length - 1].content[0].text
+  assert.equal(latestQaWake.includes('All green 100% pass'), false, 'Blind wakeup must NOT leak worker title')
+  assert.match(latestQaWake, /blind review: worker prose hidden/)
+
+  const qaBoard = await readTool.execute({ since: 0, agent: 'worker-a' }, { agent: fakeAgents.get('sess-blind__qa-1') })
+  assert.equal(qaBoard.posts[0].redacted_for_blind_review, true)
+  assert.equal(qaBoard.posts[0].text.includes('SECRET_WORKER_HYPE'), false, 'Verifier read_board must hide worker prose')
+  assert.equal(qaBoard.posts[0].title.includes('All green'), false, 'Verifier read_board must hide worker title')
+  assert.match(qaBoard.posts[0].text, /\[BLIND_REVIEW_ENVELOPE\]/)
+  assert.match(qaBoard.posts[0].text, /Commit SHA:/)
+  assert.match(qaBoard.posts[0].text, /added_skip_macro/)
+
+  const rtBoard = await readTool.execute({ since: 0, agent: 'worker-a' }, { agent: fakeAgents.get('sess-blind__rt-1') })
+  assert.equal(rtBoard.posts[0].redacted_for_blind_review, true)
+  assert.equal(rtBoard.posts[0].text.includes('SECRET_WORKER_HYPE'), false)
+
+  // Coordinator posts background -> Verifier DOES see Coordinator's post verbatim
+  await postTool.execute(
+    { title: 'Coordinator neutral background for QA', kind: 'decision', mentions: ['qa-1'], text: '@qa-1 Audit spec compliance on a.js.' },
+    { agent: coordAgent },
+  )
+  const qaCoordRead = await readTool.execute({ since: 0, agent: 'coordinator', kinds: ['decision'] }, { agent: fakeAgents.get('sess-blind__qa-1') })
+  assert.match(qaCoordRead.posts[0].text, /Audit spec compliance on a\.js/)
+
+  // 4. Isolated review snapshot worktree (review_target) + zero-dirty-write gate on approve
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-iso', role: 'verifier', review_target: 'worker-a', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nisolated verify' },
+    { agent: coordAgent },
+  )
+  const qaIsoRec = runtime.store.readMembers('sess-blind')['qa-iso']
+  assert.equal(qaIsoRec.workspace_mode, 'share')
+  assert.notEqual(qaIsoRec.worktree_path, repoDir)
+  assert.notEqual(qaIsoRec.worktree_path, members['worker-a'].worktree_path)
+  assert.equal(fs.existsSync(path.join(qaIsoRec.worktree_path, 'a.js')), true, 'Review snapshot worktree must contain worker-a diff')
+
+  // Simulate rogue shell write (`cat >`) inside reviewer worktree -> approve MUST be blocked!
+  fs.writeFileSync(path.join(qaIsoRec.worktree_path, 'a.js'), 'export const x = 999 // rogue reviewer patch\n')
+  const rogueApp = await postTool.execute(
+    { title: 'Approve after rogue edit', kind: 'review', verdict: 'approve', target_member: 'worker-a', mentions: ['coordinator'], text: '@coordinator [APPROVE] passed' },
+    { agent: fakeAgents.get('sess-blind__qa-iso') },
+  )
+  assert.equal(rogueApp.ok, false)
+  assert.match(rogueApp.text, /ROGUE_WRITE_BLOCKED/)
+
+  // Clean up rogue edit -> approve succeeds!
+  await runGit(['checkout', '--', 'a.js'], { cwd: qaIsoRec.worktree_path })
+  const cleanApp = await postTool.execute(
+    { title: 'Approve after clean verification', kind: 'review', verdict: 'approve', target_member: 'worker-a', mentions: ['coordinator'], text: '@coordinator [APPROVE] verified cleanly' },
+    { agent: fakeAgents.get('sess-blind__qa-iso') },
+  )
+  assert.equal(cleanApp.ok, true)
+}
+
+async function test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff() {
+  const repoDir = path.join(tempRoot, 'adopt-handoff-repo')
+  fs.mkdirSync(repoDir, { recursive: true })
+  await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
+  fs.writeFileSync(path.join(repoDir, 'base.txt'), 'v0\n')
+  await runGit(['add', '.'], { cwd: repoDir })
+  await runGit(['commit', '-m', 'init'], { cwd: repoDir })
+
+  const registeredTools = new Map()
+  const listeners = new Map()
+  const fakeCtx = {
+    on(ev, fn) { listeners.set(ev, fn); return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-adopt'), worktreesDir: path.join(tempRoot, 'wt-adopt') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-adopt', session: { header: { id: 'sess-adopt', cwd: repoDir } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'Adopt & Killed Gate Test', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-1', role: 'verifier', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nqa' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'worker-a', role: 'worker', workspace: 'share', brief: '[OWNERSHIP]\na.txt\n[FORBIDDEN]\nb.txt\n[DONE_CRITERIA]\na' },
+    { agent: coordAgent },
+  )
+
+  const wa = runtime.store.readMembers('sess-adopt')['worker-a']
+  fs.writeFileSync(path.join(wa.worktree_path, 'a.txt'), 'partial-work-from-a\n')
+
+  // Part 1: QA rejects worker-a, then Coordinator kills qa-1 -> rejection MUST NOT vanish!
+  const postTool = registeredTools.get('post_board')
+  const rejRes = await postTool.execute(
+    { title: 'REJECT worker-a: incomplete logic', kind: 'review', verdict: 'reject', target_member: 'worker-a', mentions: ['worker-a'], text: '@worker-a [REJECT] missing error handling' },
+    { agent: { id: 'sess-adopt__qa-1' } },
+  )
+  assert.equal(rejRes.ok, true)
+
+  const killQa = await registeredTools.get('swarm_kill').execute(
+    { name: 'qa-1', force: true, handover_to: 'qa-2', reason: 'Rotating verifier session' },
+    { agent: coordAgent },
+  )
+  assert.equal(killQa.ok, true)
+  const activeRejsAfterKill = runtime.store.computeActiveRejections('sess-adopt', { targetMember: 'worker-a' })
+  assert.equal(activeRejsAfterKill.length, 1, 'Killing a reviewer must NOT erase its unresolved rejection')
+  assert.equal(activeRejsAfterKill[0].reviewer_killed, true)
+
+  // Spawn replacement qa-2 (named in handover_to) and approve -> clears inherited rejection
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-2', role: 'verifier', brief: '[OWNERSHIP]\nqa\n[FORBIDDEN]\nsrc\n[DONE_CRITERIA]\nqa2' },
+    { agent: coordAgent },
+  )
+
+  // Part 2: Telemetry pressure & tool-loop detection + Watchdog advisory + Seance capsule
+  const emit = listeners.get('session/event')
+  const waSess = { id: 'sess-adopt__worker-a' }
+  emit(waSess, { type: 'turn/start', data: { turn: 1 } })
+  emit(waSess, { type: 'request/context', data: { contextWindow: 100_000 } })
+  emit(waSess, { type: 'assistant/message', data: { content: [{ type: 'text', text: 'Tried approach X, hit linker error.' }], usage: { inputTokens: 86_000, outputTokens: 500 } } })
+  for (let i = 0; i < 3; i += 1) {
+    emit(waSess, { type: 'tool/call', data: { name: 'bash' } })
+    emit(waSess, { type: 'tool/result', data: { name: 'bash', isError: true, content: `compile error attempt ${i + 1}` } })
+  }
+
+  const statusRes = await registeredTools.get('swarm_status').execute({}, { agent: coordAgent })
+  assert.match(statusRes.text, /\[CTX_PRESSURE: 86%\]/)
+  assert.match(statusRes.text, /\[TOOL_LOOP_WARN: 3x bash errors\]/)
+
+  const advisoryAlerts = []
+  const wd = new SwarmMonitorDaemon({
+    store: runtime.store,
+    swarmId: 'sess-adopt',
+    getMemberLiveness: (name, m) => runtime.getMemberLiveness('sess-adopt', name, m),
+    onPostStall: async (a) => { advisoryAlerts.push(a) },
+  })
+  const ht1 = await wd.healthTick(1_000_000)
+  assert.equal(ht1.handled.some(h => h.kind === 'member_context_pressure'), true)
+  assert.equal(ht1.handled.some(h => h.kind === 'member_tool_loop'), true)
+  const countAfterFirst = advisoryAlerts.length
+  await wd.healthTick(1_030_000)
+  assert.equal(advisoryAlerts.length, countAfterFirst, 'Advisory alerts must not spam on subsequent ticks')
+
+  // Seance read-only capsule
+  const seance = await registeredTools.get('read_board').execute({ seance_member: 'worker-a' }, { agent: coordAgent })
+  assert.equal(seance.ok, true)
+  assert.match(seance.capsule, /compile error attempt 3/)
+  assert.match(seance.capsule, /Tried approach X/)
+
+  // Lossless worktree adoption: spawn worker-a2 adopting worker-a's worktree!
+  const adoptRes = await registeredTools.get('swarm_add').execute(
+    {
+      name: 'worker-a2',
+      role: 'worker',
+      adopt_worktree_from: 'worker-a',
+      brief: '[OWNERSHIP]\na.txt\n[FORBIDDEN]\nb.txt\n[DONE_CRITERIA]\nfinish a.txt',
+    },
+    { agent: coordAgent },
+  )
+  assert.equal(adoptRes.ok, true, `adopt_worktree_from failed: ${adoptRes.text}`)
+  const membersAfter = runtime.store.readMembers('sess-adopt')
+  assert.equal(membersAfter['worker-a'].killed, true)
+  assert.equal(membersAfter['worker-a'].worktree_handed_over, true)
+  assert.equal(membersAfter['worker-a2'].worktree_path, wa.worktree_path)
+  assert.equal(fs.readFileSync(path.join(membersAfter['worker-a2'].worktree_path, 'a.txt'), 'utf8'), 'partial-work-from-a\n')
+
+  // qa-2 approves worker-a (clearing qa-1's inherited rejection) and worker-a2 lands cleanly!
+  await postTool.execute(
+    { title: 'QA-2 approves fixed handoff', kind: 'review', verdict: 'approve', target_member: 'worker-a', mentions: ['coordinator'], text: '@coordinator [APPROVE] inherited fix ok' },
+    { agent: { id: 'sess-adopt__qa-2' } },
+  )
+  const landA2 = await registeredTools.get('swarm_land').execute({ name: 'worker-a2', action: 'apply' }, { agent: coordAgent })
+  assert.equal(landA2.ok, true, `worker-a2 should land adopted worktree cleanly: ${landA2.text}`)
+  assert.equal(fs.readFileSync(path.join(repoDir, 'a.txt'), 'utf8'), 'partial-work-from-a\n')
+}
+
+async function test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all() {
+  const repoDir = path.join(tempRoot, 'scope-include-repo')
+  fs.mkdirSync(repoDir, { recursive: true })
+  await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
+  fs.writeFileSync(path.join(repoDir, '.gitignore'), '.env.local\n')
+  fs.writeFileSync(path.join(repoDir, '.worktreeinclude'), '.env.local\n')
+  fs.mkdirSync(path.join(repoDir, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(repoDir, 'lib'), { recursive: true })
+  fs.writeFileSync(path.join(repoDir, 'src', 'init.js'), 'export const a = 1\n')
+  await runGit(['add', '.'], { cwd: repoDir })
+  await runGit(['commit', '-m', 'init'], { cwd: repoDir })
+  // Create gitignored .env.local in main repo
+  fs.writeFileSync(path.join(repoDir, '.env.local'), 'LOCAL_PORT=9999\n')
+
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-scope-inc'), worktreesDir: path.join(tempRoot, 'wt-scope-inc') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-sc', session: { header: { id: 'sess-sc', cwd: repoDir } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'Scope & WorktreeInclude Test', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    {
+      name: 'w-src',
+      role: 'worker',
+      workspace: 'share',
+      owned_paths: ['src/**'],
+      forbidden_paths: ['secret/**'],
+      brief: '[OWNERSHIP]\nsrc/**\n[FORBIDDEN]\nsecret/**\n[DONE_CRITERIA]\nsrc ok',
+    },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    {
+      name: 'w-lib',
+      role: 'worker',
+      workspace: 'share',
+      owned_paths: ['lib/**'],
+      brief: '[OWNERSHIP]\nlib/**\n[FORBIDDEN]\nsrc/**\n[DONE_CRITERIA]\nlib ok',
+    },
+    { agent: coordAgent },
+  )
+
+  const members = runtime.store.readMembers('sess-sc')
+  const wtSrc = members['w-src'].worktree_path
+  const wtLib = members['w-lib'].worktree_path
+
+  // 1. `.worktreeinclude` synced gitignored `.env.local` into worktree WITHOUT polluting diffWorktree!
+  assert.equal(fs.readFileSync(path.join(wtSrc, '.env.local'), 'utf8'), 'LOCAL_PORT=9999\n')
+  const cleanDiff = await registeredTools.get('swarm_land').execute({ name: 'w-src', action: 'diff' }, { agent: coordAgent })
+  assert.equal(cleanDiff.files.length, 0, '.worktreeinclude gitignored files must not leak into worker patch')
+
+  // 2. Scope & sensitive-file blocking on swarm_land(apply)
+  fs.mkdirSync(path.join(wtSrc, 'secret'), { recursive: true })
+  fs.writeFileSync(path.join(wtSrc, 'src', 'ok.js'), 'export const ok = true\n')
+  fs.writeFileSync(path.join(wtSrc, 'secret', 'bad.js'), 'forbidden\n')
+  fs.writeFileSync(path.join(wtSrc, '.env'), 'SECRET_KEY=leaked\n')
+
+  const landTool = registeredTools.get('swarm_land')
+  const blockedApply = await landTool.execute({ name: 'w-src', action: 'apply' }, { agent: coordAgent })
+  assert.equal(blockedApply.ok, false)
+  assert.match(blockedApply.text, /scope violation/)
+  assert.equal(blockedApply.scope_violations.sensitive.includes('.env'), true)
+  assert.equal(blockedApply.scope_violations.forbidden.includes('secret/bad.js'), true)
+
+  // Clean up forbidden/sensitive files; introduce cross-member overlap on shared file to test preflight_all
+  fs.rmSync(path.join(wtSrc, 'secret'), { recursive: true, force: true })
+  fs.rmSync(path.join(wtSrc, '.env'), { force: true })
+  fs.writeFileSync(path.join(wtSrc, 'src', 'shared.js'), 'from src\n')
+  fs.mkdirSync(path.join(wtLib, 'src'), { recursive: true })
+  fs.mkdirSync(path.join(wtLib, 'lib'), { recursive: true })
+  fs.writeFileSync(path.join(wtLib, 'src', 'shared.js'), 'from lib\n')
+  fs.writeFileSync(path.join(wtLib, 'lib', 'util.js'), 'export const u = 1\n')
+
+  const pfBad = await landTool.execute({ action: 'preflight_all' }, { agent: coordAgent })
+  assert.equal(pfBad.ok, true)
+  assert.equal(pfBad.all_ready, false)
+  assert.equal(pfBad.overlaps.length, 1)
+  assert.equal(pfBad.overlaps[0].path, 'src/shared.js')
+
+  // Remove out-of-scope overlap from w-lib -> preflight_all reports all_ready=true!
+  fs.rmSync(path.join(wtLib, 'src', 'shared.js'), { force: true })
+  await runGit(['reset', '-q', '--', 'src/shared.js'], { cwd: wtLib })
+  const pfGood = await landTool.execute({ action: 'preflight_all' }, { agent: coordAgent })
+  assert.equal(pfGood.ok, true)
+  assert.equal(pfGood.all_ready, true)
+  assert.equal(pfGood.overlaps.length, 0)
+}
+
 async function test_plugin_runtime_contains_zero_cjk_characters() {
   const rootDir = fileURLToPath(new URL('..', import.meta.url))
   const runtimeFiles = [
@@ -3703,6 +4076,9 @@ try {
   await runTest('test_validators_require_recipient_for_lore_master_and_custom_roles', test_validators_require_recipient_for_lore_master_and_custom_roles)
   await runTest('test_restart_recovery_restarts_watchdog_and_lazy_resumes_members', test_restart_recovery_restarts_watchdog_and_lazy_resumes_members)
   await runTest('test_query_visible_posts_single_pass_channel_replay', test_query_visible_posts_single_pass_channel_replay)
+  await runTest('test_isolated_review_worktree_catches_rogue_writes_and_blind_projection', test_isolated_review_worktree_catches_rogue_writes_and_blind_projection)
+  await runTest('test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff', test_killed_reviewer_rejection_persists_and_adopt_worktree_handoff)
+  await runTest('test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all', test_worktree_scope_sensitive_gate_worktreeinclude_and_preflight_all)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

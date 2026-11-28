@@ -38,14 +38,14 @@ import {
   safeExportFilename,
 } from './src/host/log-export.js'
 
-export const PLUGIN_VERSION = '0.5.1'
+export const PLUGIN_VERSION = '0.6.0'
 export const PLUGIN_LOADED_AT = new Date().toISOString()
 
 function detectGitCommit() {
   try {
     const dir = path.dirname(fileURLToPath(import.meta.url))
     const headFile = path.join(dir, '.git', 'HEAD')
-    if (!fs.existsSync(headFile)) return 'release-0.5.1'
+    if (!fs.existsSync(headFile)) return 'release-0.6.0'
     const head = fs.readFileSync(headFile, 'utf8').trim()
     if (head.startsWith('ref: ')) {
       const refPath = path.join(dir, '.git', head.slice(5).trim())
@@ -53,7 +53,7 @@ function detectGitCommit() {
     }
     return head.slice(0, 8)
   } catch {
-    return 'release-0.5.1'
+    return 'release-0.6.0'
   }
 }
 
@@ -364,7 +364,18 @@ export function applyWith(ctx, config, deps = {}) {
         ...(t.last_input_tokens > 0 ? { last_input_tokens: t.last_input_tokens } : {}),
         ...(t.total_output_tokens > 0 ? { total_output_tokens: t.total_output_tokens } : {}),
         ...(t.context_window > 0 ? { context_window: t.context_window } : {}),
+        ...(t.consecutive_tool_errors > 0 ? { consecutive_tool_errors: t.consecutive_tool_errors } : {}),
+        ...(t.last_tool_error_name ? { last_tool_error_name: t.last_tool_error_name } : {}),
       }
+    },
+
+    getMemberSessionEvents(sessionId) {
+      if (!sessionId) return []
+      const direct = sessionEventsByAgent.get(sessionId)
+      if (Array.isArray(direct) && direct.length > 0) return direct
+      const live = ctx.get?.('agents')?.get?.(sessionId)
+      const fromLive = live?.session?.events?.()
+      return Array.isArray(fromLive) ? fromLive : []
     },
 
     getWatchdogStatus(swarmId) {
@@ -410,13 +421,22 @@ export function applyWith(ctx, config, deps = {}) {
       const liveAgent = ctx.get?.('agents')?.get?.(m.session_id)
         ?? memberHandles.get(`${swarmId}:${memberName}`)?.agent
       const events = sessionEventsByAgent.get(m.session_id) ?? []
-      return statusOf(m, {
+      const res = statusOf(m, {
         liveAgent,
         concurrencyGate,
         sessionEvents: events,
         ...(typeof opts.nowMs === 'number' ? { nowMs: opts.nowMs } : {}),
         ...(typeof opts.startupGraceMs === 'number' ? { startupGraceMs: opts.startupGraceMs } : {}),
       })
+      return {
+        ...res,
+        telemetry: {
+          last_input_tokens: m.last_input_tokens ?? 0,
+          context_window: m.context_window ?? 0,
+          consecutive_tool_errors: m.consecutive_tool_errors ?? 0,
+          last_tool_error_name: m.last_tool_error_name ?? null,
+        },
+      }
     },
 
     markTurnParked(agentId) {
@@ -1012,10 +1032,13 @@ export function applyWith(ctx, config, deps = {}) {
           const chPart = postRecord.channel && postRecord.channel !== 'main' ? ` #${postRecord.channel}` : ''
           const titlePart = postRecord.title ? `: ${postRecord.title}` : ''
           const targetRoleSpec = getRoleSpec(m.role)
+          const authorRole = members[postRecord.agent]?.role ?? 'worker'
+          const isBlindWorkerPost = targetRoleSpec.blindToWorkerProse === true && authorRole === 'worker' && postRecord.kind !== 'done'
           const rulesAnchor = formatReviewRules(targetRoleSpec.reviewRules, 'anchor')
           const anchorPart = rulesAnchor && postRecord.kind !== 'done' ? `\n${rulesAnchor}` : ''
           const blindAuditPart = (
-            targetRoleSpec.canBlockMerge
+            !isBlindWorkerPost
+            && targetRoleSpec.canBlockMerge
             && postRecord.agent !== targetName
             && postRecord.kind !== 'done'
             && hasLeadingAuditBias(`${postRecord.title || ''}\n${postRecord.text || ''}`)
@@ -1032,7 +1055,16 @@ export function applyWith(ctx, config, deps = {}) {
               escalatePart = `\n[ESCALATE_TO_HUMAN] @${postRecord.agent} rejected ${maxStreak} consecutive rounds—stop local patching and ask the user to arbitrate architecture/scope.`
             }
           }
-          const wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}${blindAuditPart}${escalatePart}`
+          let wakeText
+          if (isBlindWorkerPost) {
+            const art = postRecord.artifact
+            const artSummary = art
+              ? `${art.commit_sha ? 'commit ' + art.commit_sha : 'diff=' + (art.diff_hash || 'none')}, ${(art.changed_files ?? []).length} file(s)`
+              : 'new submission'
+            wakeText = `[board] #${postRecord.seq} @${postRecord.agent} submitted (${artSummary}; blind review: worker prose hidden, inspect commit/diff + coordinator background) -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}`
+          } else {
+            wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}${blindAuditPart}${escalatePart}`
+          }
           if (liveAgent.status === 'running' && typeof liveAgent.inject === 'function') {
             liveAgent.inject(buildSwarmSystemMessage(wakeText, `Board nudge #${postRecord.seq}`))
           } else {
@@ -1295,6 +1327,8 @@ export function applyWith(ctx, config, deps = {}) {
           last_input_tokens: 0,
           total_output_tokens: 0,
           context_window: 0,
+          consecutive_tool_errors: 0,
+          last_tool_error_name: null,
         }
         memberTelemetry.set(sid, t)
       }
@@ -1310,6 +1344,15 @@ export function applyWith(ctx, config, deps = {}) {
         t.last_error = null
         t.phase = 'RUNNING'
         scheduleTelemetryFlush(swarmId, false)
+      } else if (event.type === 'tool/result') {
+        const failed = event.data?.isError === true || Boolean(event.data?.error)
+        if (failed) {
+          t.consecutive_tool_errors = (t.consecutive_tool_errors ?? 0) + 1
+          t.last_tool_error_name = event.data?.name ?? t.last_tool_name ?? 'tool'
+        } else {
+          t.consecutive_tool_errors = 0
+          t.last_tool_error_name = null
+        }
       } else if (event.type === 'request/context') {
         if (typeof event.data?.contextWindow === 'number' && event.data.contextWindow > 0) {
           t.context_window = event.data.contextWindow
