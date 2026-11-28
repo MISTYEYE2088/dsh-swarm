@@ -462,6 +462,7 @@ async function test_worktree_syncs_dirty_files_and_isolates_worker_diff() {
   fs.mkdirSync(repoDir, { recursive: true })
 
   await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'core.autocrlf', 'false'], { cwd: repoDir })
   await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
   await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
   fs.writeFileSync(path.join(repoDir, 'base.txt'), 'line1\n', 'utf8')
@@ -537,6 +538,7 @@ async function test_worktree_land_conflict_preflight() {
   fs.mkdirSync(repoDir, { recursive: true })
 
   await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'core.autocrlf', 'false'], { cwd: repoDir })
   await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
   await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
   fs.writeFileSync(path.join(repoDir, 'shared.txt'), 'original\n', 'utf8')
@@ -1442,6 +1444,7 @@ async function test_project_root_subdir_git_worktree_isolation() {
   const subRepo = path.join(parentDir, 'sub-app')
   fs.mkdirSync(subRepo, { recursive: true })
   await runGit(['init'], { cwd: subRepo })
+  await runGit(['config', 'core.autocrlf', 'false'], { cwd: subRepo })
   await runGit(['config', 'user.name', 'Test'], { cwd: subRepo })
   await runGit(['config', 'user.email', 'test@local'], { cwd: subRepo })
   fs.writeFileSync(path.join(subRepo, 'app.js'), 'export const v = 1\n', 'utf8')
@@ -2199,6 +2202,7 @@ async function test_lore_master_role_and_tier_b_guardrails() {
   const gitDir = path.join(tempRoot, 'tier-b-repo')
   fs.mkdirSync(gitDir, { recursive: true })
   await runGit(['init'], { cwd: gitDir })
+  await runGit(['config', 'core.autocrlf', 'false'], { cwd: gitDir })
   await runGit(['config', 'user.email', 'test@example.com'], { cwd: gitDir })
   await runGit(['config', 'user.name', 'Test'], { cwd: gitDir })
   fs.writeFileSync(path.join(gitDir, 'README.md'), '# NIC Driver\n', 'utf8')
@@ -2911,9 +2915,8 @@ async function test_log_export_normal_conversation_epochs_zip_and_timeline() {
 
   const zipPath = path.join(tempRoot, 'normal-export.zip')
   fs.writeFileSync(zipPath, zipRes.body)
-  const pyInspect = execFileSync('python3', [
-    '-c',
-    `import zipfile, json, sys
+  const inspectZipArchive = async (archivePath) => {
+    const script = `import zipfile, json, sys
 z = zipfile.ZipFile(sys.argv[1])
 assert z.testzip() is None, "ZIP CRC check failed"
 names = z.namelist()
@@ -2921,10 +2924,56 @@ out = {}
 for n in names:
     rel = n.split("/", 1)[1]
     out[rel] = z.read(n).decode("utf-8")
-print(json.dumps(out))`,
-    zipPath,
-  ], { encoding: 'utf8' })
-  const extracted = JSON.parse(pyInspect)
+print(json.dumps(out))`
+    const candidates = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']
+    for (const pyBin of candidates) {
+      try {
+        const raw = execFileSync(pyBin, ['-c', script, archivePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+        return JSON.parse(raw)
+      } catch (err) {
+        if (err && err.code === 'ENOENT') continue
+        // On Windows Store python stub (exit 9009 / empty), try next or fallback
+      }
+    }
+    // Pure Node >= 22.2 fallback (central directory + inflateRawSync + zlib.crc32 verification)
+    const zlib = await import('node:zlib')
+    const buf = fs.readFileSync(archivePath)
+    let eocd = -1
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i -= 1) {
+      if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+    }
+    assert.ok(eocd >= 0, 'EOCD record missing in ZIP')
+    const totalEntries = buf.readUInt16LE(eocd + 10)
+    let cdOffset = buf.readUInt32LE(eocd + 16)
+    const out = {}
+    for (let idx = 0; idx < totalEntries; idx += 1) {
+      assert.equal(buf.readUInt32LE(cdOffset), 0x02014b50, 'Invalid CD signature')
+      const method = buf.readUInt16LE(cdOffset + 10)
+      const expectedCrc = buf.readUInt32LE(cdOffset + 16)
+      const compSize = buf.readUInt32LE(cdOffset + 20)
+      const nameLen = buf.readUInt16LE(cdOffset + 28)
+      const extraLen = buf.readUInt16LE(cdOffset + 30)
+      const commentLen = buf.readUInt16LE(cdOffset + 32)
+      const lfhOffset = buf.readUInt32LE(cdOffset + 42)
+      const fullName = buf.subarray(cdOffset + 46, cdOffset + 46 + nameLen).toString('utf8')
+      cdOffset += 46 + nameLen + extraLen + commentLen
+      if (fullName.endsWith('/')) continue
+      assert.equal(buf.readUInt32LE(lfhOffset), 0x04034b50, 'Invalid LFH signature')
+      const lfhNameLen = buf.readUInt16LE(lfhOffset + 26)
+      const lfhExtraLen = buf.readUInt16LE(lfhOffset + 28)
+      const dataStart = lfhOffset + 30 + lfhNameLen + lfhExtraLen
+      const compSlice = buf.subarray(dataStart, dataStart + compSize)
+      const rawBytes = method === 0 ? compSlice : zlib.inflateRawSync(compSlice)
+      if (typeof zlib.crc32 === 'function') {
+        assert.equal(zlib.crc32(rawBytes) >>> 0, expectedCrc >>> 0, `ZIP CRC mismatch for ${fullName}`)
+      }
+      const slash = fullName.indexOf('/')
+      const rel = slash >= 0 ? fullName.slice(slash + 1) : fullName
+      out[rel] = rawBytes.toString('utf8')
+    }
+    return out
+  }
+  const extracted = await inspectZipArchive(zipPath)
 
   // Verify exact epoch-split file structure inside the ZIP
   assert.ok(extracted['manifest.json'], 'ZIP must contain manifest.json')
@@ -2990,14 +3039,7 @@ print(json.dumps(out))`,
   assert.equal(optZip.statusCode, 200)
   const optZipPath = path.join(tempRoot, 'normal-opt.zip')
   fs.writeFileSync(optZipPath, optZip.body)
-  const optOut = JSON.parse(execFileSync('python3', [
-    '-c',
-    `import zipfile, json, sys
-z = zipfile.ZipFile(sys.argv[1])
-assert z.testzip() is None
-print(json.dumps({n.split("/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}))`,
-    optZipPath,
-  ], { encoding: 'utf8' }))
+  const optOut = await inspectZipArchive(optZipPath)
   assert.equal(Boolean(optOut['sessions/S001-red-team-auditor/epoch-00.jsonl']), false, 'includeSubagents=false must omit subagents')
   assert.ok(optOut['sessions/main/epoch-00.jsonl'].includes('SECRET_CHAIN_OF_THOUGHT_CHECK'), 'includeReasoning=true must restore reasoning')
   assert.ok(optOut['sessions/main/epoch-00.jsonl'].includes('NOISY_SKILL_CATALOG_TEXT'), 'includeInjections=true must restore harness injections')
@@ -3085,14 +3127,55 @@ async function test_log_export_swarm_blackboard_members_and_context_telemetry() 
 
   const swZipPath = path.join(tempRoot, 'swarm-export.zip')
   fs.writeFileSync(swZipPath, zipBuf)
-  const swExtracted = JSON.parse(execFileSync('python3', [
-    '-c',
-    `import zipfile, json, sys
+  const inspectSwarmZip = async (archivePath) => {
+    const script = `import zipfile, json, sys
 z = zipfile.ZipFile(sys.argv[1])
 assert z.testzip() is None
-print(json.dumps({n.split("/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}))`,
-    swZipPath,
-  ], { encoding: 'utf8' }))
+print(json.dumps({n.split("/", 1)[1]: z.read(n).decode("utf-8") for n in z.namelist()}))`
+    const candidates = process.platform === 'win32' ? ['python', 'python3'] : ['python3', 'python']
+    for (const pyBin of candidates) {
+      try {
+        const raw = execFileSync(pyBin, ['-c', script, archivePath], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+        return JSON.parse(raw)
+      } catch (err) {
+        if (err && err.code === 'ENOENT') continue
+      }
+    }
+    const zlib = await import('node:zlib')
+    const buf = fs.readFileSync(archivePath)
+    let eocd = -1
+    for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i -= 1) {
+      if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+    }
+    assert.ok(eocd >= 0, 'EOCD record missing in ZIP')
+    const totalEntries = buf.readUInt16LE(eocd + 10)
+    let cdOffset = buf.readUInt32LE(eocd + 16)
+    const out = {}
+    for (let idx = 0; idx < totalEntries; idx += 1) {
+      const method = buf.readUInt16LE(cdOffset + 10)
+      const expectedCrc = buf.readUInt32LE(cdOffset + 16)
+      const compSize = buf.readUInt32LE(cdOffset + 20)
+      const nameLen = buf.readUInt16LE(cdOffset + 28)
+      const extraLen = buf.readUInt16LE(cdOffset + 30)
+      const commentLen = buf.readUInt16LE(cdOffset + 32)
+      const lfhOffset = buf.readUInt32LE(cdOffset + 42)
+      const fullName = buf.subarray(cdOffset + 46, cdOffset + 46 + nameLen).toString('utf8')
+      cdOffset += 46 + nameLen + extraLen + commentLen
+      if (fullName.endsWith('/')) continue
+      const lfhNameLen = buf.readUInt16LE(lfhOffset + 26)
+      const lfhExtraLen = buf.readUInt16LE(lfhOffset + 28)
+      const dataStart = lfhOffset + 30 + lfhNameLen + lfhExtraLen
+      const compSlice = buf.subarray(dataStart, dataStart + compSize)
+      const rawBytes = method === 0 ? compSlice : zlib.inflateRawSync(compSlice)
+      if (typeof zlib.crc32 === 'function') {
+        assert.equal(zlib.crc32(rawBytes) >>> 0, expectedCrc >>> 0, `ZIP CRC mismatch for ${fullName}`)
+      }
+      const slash = fullName.indexOf('/')
+      out[slash >= 0 ? fullName.slice(slash + 1) : fullName] = rawBytes.toString('utf8')
+    }
+    return out
+  }
+  const swExtracted = await inspectSwarmZip(swZipPath)
 
   assert.ok(swExtracted['swarm/board.jsonl'], 'Swarm ZIP must contain swarm/board.jsonl')
   assert.ok(swExtracted['sessions/S001-impl-tx/epoch-00.jsonl'], 'Swarm ZIP must contain per-member epoch JSONL')
@@ -3166,6 +3249,369 @@ async function test_client_registers_export_header_utility_slot_and_builds_urls(
     registeredSlots.some(s => s.name === 'conversation.session.header.utilities' && s.id === 'dsh-swarm-export-log'),
     'Client must register dsh-swarm-export-log into conversation.session.header.utilities for both Swarm and normal chats',
   )
+}
+
+async function test_multi_worker_merge_gate_target_scoping_and_stale_approval_hash() {
+  const repoDir = path.join(tempRoot, 'multi-worker-gate-repo')
+  fs.mkdirSync(repoDir, { recursive: true })
+  await runGit(['init'], { cwd: repoDir })
+  await runGit(['config', 'user.name', 'Test'], { cwd: repoDir })
+  await runGit(['config', 'user.email', 'test@local'], { cwd: repoDir })
+  fs.writeFileSync(path.join(repoDir, 'base.txt'), 'init\n')
+  await runGit(['add', '.'], { cwd: repoDir })
+  await runGit(['commit', '-m', 'init'], { cwd: repoDir })
+
+  const registeredTools = new Map()
+  const fakeCtx = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { registeredTools.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const runtime = applyWith(fakeCtx, { swarmDir: path.join(tempRoot, 'e2e-multi-gate') }, { log: () => {}, warn: () => {} })
+  const coordAgent = { id: 'sess-mg', session: { header: { id: 'sess-mg', cwd: repoDir } } }
+
+  await registeredTools.get('swarm_init').execute({ title: 'Multi Worker Gate', concurrency_limit: 4 }, { agent: coordAgent })
+  await registeredTools.get('swarm_add').execute(
+    { name: 'qa-gate', role: 'verifier', brief: '[OWNERSHIP]\ntests/\n[FORBIDDEN]\nsrc/\n[DONE_CRITERIA]\nqa' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'worker-a', role: 'worker', workspace: 'share', brief: '[OWNERSHIP]\na.txt\n[FORBIDDEN]\nb.txt\n[DONE_CRITERIA]\na' },
+    { agent: coordAgent },
+  )
+  await registeredTools.get('swarm_add').execute(
+    { name: 'worker-b', role: 'worker', workspace: 'share', brief: '[OWNERSHIP]\nb.txt\n[FORBIDDEN]\na.txt\n[DONE_CRITERIA]\nb' },
+    { agent: coordAgent },
+  )
+
+  const members = runtime.store.readMembers('sess-mg')
+  fs.writeFileSync(path.join(members['worker-a'].worktree_path, 'a.txt'), 'a-v1\n')
+  fs.writeFileSync(path.join(members['worker-b'].worktree_path, 'b.txt'), 'b-v1\n')
+
+  const qaAgent = { id: 'sess-mg__qa-gate' }
+  const postTool = registeredTools.get('post_board')
+  const landTool = registeredTools.get('swarm_land')
+
+  // 1. QA rejects worker-a, then approves worker-b
+  const rejA1 = await postTool.execute(
+    { title: 'REJECT worker-a: missing edge check', kind: 'review', verdict: 'reject', mentions: ['worker-a'], text: '@worker-a [REJECT] Fix edge case in a.txt' },
+    { agent: qaAgent },
+  )
+  assert.equal(rejA1.ok, true)
+  assert.equal(rejA1.consecutive_rejects, 1)
+
+  const appB = await postTool.execute(
+    { title: 'APPROVE worker-b: b.txt verified', kind: 'review', verdict: 'approve', mentions: ['worker-b', 'coordinator'], text: '@worker-b @coordinator [APPROVE] b.txt passed all checks' },
+    { agent: qaAgent },
+  )
+  assert.equal(appB.ok, true)
+
+  // worker-a's rejection must STILL be active (not erased by approving worker-b!)
+  const allRejs = runtime.store.computeActiveRejections('sess-mg')
+  assert.equal(allRejs.length, 1)
+  assert.equal(allRejs[0].target_member, 'worker-a')
+  assert.equal(allRejs[0].seq, rejA1.seq)
+
+  // worker-b can land cleanly even while worker-a has an open rejection!
+  const landB = await landTool.execute({ name: 'worker-b', action: 'apply' }, { agent: coordAgent })
+  assert.equal(landB.ok, true, `worker-b should not be blocked by worker-a rejection: ${landB.text}`)
+  assert.equal(fs.readFileSync(path.join(repoDir, 'b.txt'), 'utf8'), 'b-v1\n')
+
+  // worker-a is still blocked from landing, and [done] is still blocked
+  const landABlocked = await landTool.execute({ name: 'worker-a', action: 'apply' }, { agent: coordAgent })
+  assert.equal(landABlocked.ok, false)
+  assert.match(landABlocked.text, /GATE_BLOCKED/)
+
+  const doneBlocked = await postTool.execute(
+    { title: 'Attempt premature close while worker-a open', kind: 'done', mentions: ['coordinator'], text: '[done] Trying to close' },
+    { agent: coordAgent },
+  )
+  assert.equal(doneBlocked.ok, false)
+  assert.match(doneBlocked.text, /GATE_BLOCKED/)
+
+  // 2. A 2nd reject on worker-a still hits consecutive_rejects=2 despite worker-b's approve in between
+  const rejA2 = await postTool.execute(
+    { title: 'REJECT worker-a round 2: still broken', kind: 'review', verdict: 'reject', target_member: 'worker-a', mentions: ['worker-a', 'coordinator'], text: '@worker-a @coordinator [REJECT] Still broken' },
+    { agent: qaAgent },
+  )
+  assert.equal(rejA2.consecutive_rejects, 2)
+  assert.match(rejA2.text, /\[ESCALATE_TO_HUMAN\]/)
+
+  // 3. worker-a fixes a.txt and QA approves -> records reviewed_diff_hash
+  fs.writeFileSync(path.join(members['worker-a'].worktree_path, 'a.txt'), 'a-v2-fixed\n')
+  const appA1 = await postTool.execute(
+    { title: 'APPROVE worker-a: a-v2 verified', kind: 'review', verdict: 'approve', target_member: 'worker-a', mentions: ['worker-a', 'coordinator'], text: '@worker-a @coordinator [APPROVE] a.txt verified' },
+    { agent: qaAgent },
+  )
+  assert.equal(appA1.ok, true)
+  assert.equal(runtime.store.computeActiveRejections('sess-mg').length, 0)
+
+  // 4. worker-a sneaks in an unreviewed edit AFTER approval -> stale approval blocks swarm_land!
+  fs.writeFileSync(path.join(members['worker-a'].worktree_path, 'a.txt'), 'a-v3-sneaky-edit\n')
+  const landAStale = await landTool.execute({ name: 'worker-a', action: 'apply' }, { agent: coordAgent })
+  assert.equal(landAStale.ok, false, 'Post-approval edit must invalidate approval hash and block landing')
+  assert.match(landAStale.text, /stale approval/i)
+  assert.equal(landAStale.stale_approvals.length, 1)
+
+  // 5. QA re-verifies and posts fresh approve -> landing succeeds!
+  const appA2 = await postTool.execute(
+    { title: 'APPROVE worker-a: re-verified a-v3', kind: 'review', verdict: 'approve', target_member: 'worker-a', mentions: ['worker-a', 'coordinator'], text: '@worker-a @coordinator [APPROVE] Re-verified a-v3' },
+    { agent: qaAgent },
+  )
+  assert.equal(appA2.ok, true)
+  const landAOk = await landTool.execute({ name: 'worker-a', action: 'apply' }, { agent: coordAgent })
+  assert.equal(landAOk.ok, true, `Fresh approval should allow landing: ${landAOk.text}`)
+  assert.equal(fs.readFileSync(path.join(repoDir, 'a.txt'), 'utf8'), 'a-v3-sneaky-edit\n')
+}
+
+async function test_watchdog_multi_member_no_starvation_and_sleep_grace() {
+  // Part A: Multiple failing members - exhausting member-a must never starve member-b alerts
+  const store = new SwarmStore(path.join(tempRoot, 'wd-multi-starve'))
+  store.initSwarm('sw-starve', { title: 'Watchdog Starvation', concurrency_confirmed: true })
+  store.registerMemberWithBrief('sw-starve', {
+    name: 'worker-a',
+    session_id: 'sw-starve__worker-a',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] a',
+  })
+  store.registerMemberWithBrief('sw-starve', {
+    name: 'worker-b',
+    session_id: 'sw-starve__worker-b',
+    role: 'worker',
+    brief: '[OWNERSHIP] b\n[FORBIDDEN] a\n[DONE_CRITERIA] b',
+  })
+  store.flushOffsets('sw-starve', {
+    'worker-a': { last_error: { code: 'E_A', message: 'crash A', turn: 1 } },
+  })
+
+  const postedAlerts = []
+  const wd = new SwarmMonitorDaemon({
+    store,
+    swarmId: 'sw-starve',
+    healthIntervalMs: 30_000,
+    onPostStall: async (alert) => { postedAlerts.push(alert) },
+  })
+
+  const baseT = 2_000_000
+  // Exhaust worker-a (3 alerts -> 4th is suppressed)
+  await wd.healthTick(baseT)
+  await wd.healthTick(baseT + 30_000)
+  await wd.healthTick(baseT + 60_000)
+  assert.equal(postedAlerts.length, 3)
+
+  // Now worker-b also crashes while worker-a is suppressed!
+  store.flushOffsets('sw-starve', {
+    'worker-b': { last_error: { code: 'E_B', message: 'crash B', turn: 1 } },
+  })
+  const res = await wd.healthTick(baseT + 90_000)
+  assert.equal(res.action, 'health_alert', 'worker-b must NOT be starved by suppressed worker-a')
+  assert.equal(res.memberName, 'worker-b')
+  assert.equal(res.suppressed.length, 1)
+  assert.equal(res.suppressed[0].memberName, 'worker-a')
+  assert.equal(postedAlerts.length, 4)
+  assert.match(postedAlerts[3].title, /@worker-b/)
+
+  // Part B: Sleep-jump compensation prevents false zombie alerts after laptop lid close
+  const storeSleep = new SwarmStore(path.join(tempRoot, 'wd-sleep-grace'))
+  storeSleep.initSwarm('sw-sleep', { title: 'Watchdog Sleep Grace', concurrency_confirmed: true })
+  const t0 = 5_000_000
+  storeSleep.registerMemberWithBrief('sw-sleep', {
+    name: 'fresh-worker',
+    session_id: 'sw-sleep__fresh-worker',
+    role: 'worker',
+    brief: '[OWNERSHIP] x\n[FORBIDDEN] y\n[DONE_CRITERIA] x',
+  })
+  storeSleep.updateMember('sw-sleep', 'fresh-worker', m => ({
+    ...m,
+    created_at: new Date(t0).toISOString(),
+    turn_count: 0,
+    last_post_seq: 0,
+  }))
+
+  const sleepAlerts = []
+  const wdSleep = new SwarmMonitorDaemon({
+    store: storeSleep,
+    swarmId: 'sw-sleep',
+    healthIntervalMs: 30_000,
+    startupTimeoutMs: 60_000,
+    onPostStall: async (alert) => { sleepAlerts.push(alert) },
+  })
+
+  // Normal tick at t0 + 10s: healthy (starting)
+  const h1 = await wdSleep.healthTick(t0 + 10_000)
+  assert.equal(h1.action, 'healthy')
+
+  // Simulate 10-minute OS sleep jump (delta = 600s > 4 * 30s) -> sleepGraceBonusMs absorbs jump
+  const h2 = await wdSleep.healthTick(t0 + 610_000)
+  assert.equal(h2.action, 'healthy', 'OS sleep jump must extend startup grace instead of false zombie alert')
+  assert.equal(sleepAlerts.length, 0)
+
+  // Normal awake time: +15s after wake (55s total awake < 60s) stays healthy; +30s after wake (70s >= 60s) flags zombie
+  const h3 = await wdSleep.healthTick(t0 + 625_000)
+  assert.equal(h3.action, 'healthy')
+  const h4 = await wdSleep.healthTick(t0 + 640_000)
+  assert.equal(h4.action, 'health_alert')
+  assert.equal(h4.kind, 'member_zombie')
+  assert.equal(h4.memberName, 'fresh-worker')
+}
+
+async function test_validators_require_recipient_for_lore_master_and_custom_roles() {
+  const { registerRole, unregisterRole } = await import('../src/host/prompts.js')
+  try {
+    registerRole('spec_reviewer', {
+      prompt: '# Spec reviewer',
+      canBlockMerge: true,
+    })
+    registerRole('open_logger', {
+      prompt: '# Open logger',
+      requireRecipientOnPost: false,
+    })
+
+    const members = {
+      coordinator: { role: 'coordinator', killed: false },
+      'lore-1': { role: 'lore_master', killed: false, last_read_seq: 2 },
+      'spec-1': { role: 'spec_reviewer', killed: false, last_read_seq: 2 },
+      'log-1': { role: 'open_logger', killed: false, last_read_seq: 2 },
+    }
+
+    const loreRes = validatePostBoard(
+      { title: 'Register offset table findings', text: 'Offset 0x104 controls TX queue doorbell.' },
+      members,
+      'lore-1',
+    )
+    assert.equal(loreRes.ok, false, 'lore_master must be blocked from posting unaddressed non-silent posts')
+    assert.match(loreRes.error, /must address at least one recipient/)
+
+    const customRes = validatePostBoard(
+      { title: 'Spec review notes without mention', text: 'Found two alignment mismatches in ring descriptor.' },
+      members,
+      'spec-1',
+    )
+    assert.equal(customRes.ok, false, 'custom registered role must inherit requireRecipientOnPost=true')
+    assert.match(customRes.error, /must address at least one recipient/)
+
+    const optOutRes = validatePostBoard(
+      { title: 'Broadcast log from opt-out role', text: 'Diagnostic trace recorded successfully.' },
+      members,
+      'log-1',
+    )
+    assert.equal(optOutRes.ok, true, 'role with requireRecipientOnPost=false should be allowed')
+  } finally {
+    unregisterRole('spec_reviewer')
+    unregisterRole('open_logger')
+  }
+}
+
+async function test_restart_recovery_restarts_watchdog_and_lazy_resumes_members() {
+  const swarmDir = path.join(tempRoot, 'e2e-restart-recovery')
+
+  // Phase 1: Initialize swarm and add a worker in runtime #1
+  const tools1 = new Map()
+  const fakeCtx1 = {
+    on() { return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'tools') return { register(t) { tools1.set(t.name, t); return () => {} } }
+      return undefined
+    },
+  }
+  const rt1 = applyWith(fakeCtx1, { swarmDir }, { log: () => {}, warn: () => {} })
+  const coord1 = { id: 'sess-restart', session: { header: { id: 'sess-restart', cwd: tempRoot } } }
+  await tools1.get('swarm_init').execute({ title: 'Restart Recovery Test', concurrency_limit: 4 }, { agent: coord1 })
+  await tools1.get('swarm_add').execute(
+    { name: 'worker-1', role: 'worker', workspace: 'inherit', brief: '[OWNERSHIP]\nsrc/\n[FORBIDDEN]\ntests/\n[DONE_CRITERIA]\nok' },
+    { agent: coord1 },
+  )
+  rt1.monitorDaemons.get('sess-restart')?.stop()
+
+  // Phase 2: Fresh runtime instance simulating DSH host restart (empty memberHandles & monitorDaemons)
+  const listeners2 = new Map()
+  const resumedCalls = []
+  const steeredByResumed = []
+  const fakeAgents2 = new Map()
+  const fakeCtx2 = {
+    on(event, fn) { listeners2.set(event, fn); return () => {} },
+    effect(fn) { return fn() },
+    get(name) {
+      if (name === 'agents') {
+        return {
+          get(id) { return fakeAgents2.get(id) },
+          async resume(opts) {
+            resumedCalls.push(opts)
+            const resumedAgent = {
+              id: opts.resumeSessionId,
+              status: 'idle',
+              session: { header: { id: opts.resumeSessionId, cwd: tempRoot } },
+              steer(msg) { steeredByResumed.push(msg) },
+            }
+            fakeAgents2.set(opts.resumeSessionId, resumedAgent)
+            return { agent: resumedAgent, dispose: async () => {} }
+          },
+        }
+      }
+      return undefined
+    },
+  }
+  const rt2 = applyWith(fakeCtx2, { swarmDir }, { log: () => {}, warn: () => {} })
+  const coord2 = { id: 'sess-restart', status: 'idle', session: { header: { id: 'sess-restart', cwd: tempRoot } }, steer() {} }
+  fakeAgents2.set('sess-restart', coord2)
+
+  // Resuming coordinator via agent/created must auto-restart Watchdog daemon for ACTIVE swarm
+  assert.equal(rt2.getWatchdogStatus('sess-restart'), null)
+  listeners2.get('agent/created')({ agent: coord2, source: 'resume' })
+  assert.equal(rt2.getWatchdogStatus('sess-restart')?.active, true, 'Watchdog must auto-restart when resuming an ACTIVE Swarm')
+
+  // Dispatching a wakeup to @worker-1 (not in memberHandles yet) must lazily call agentsSvc.resume() and wake it!
+  const post = rt2.store.appendBoardRecord('sess-restart', {
+    type: 'post',
+    agent: 'coordinator',
+    title: 'Resume task after host restart',
+    kind: 'report',
+    mentions: ['worker-1'],
+    text: '@worker-1 please continue after restart',
+  })
+  const wakeRes = await rt2.dispatchPostWakeups('sess-restart', post)
+  assert.deepEqual(wakeRes.woken, ['worker-1'])
+  assert.deepEqual(wakeRes.unreachable, [])
+  assert.equal(resumedCalls.length, 1)
+  assert.equal(resumedCalls[0].resumeSessionId, 'sess-restart__worker-1')
+  assert.equal(steeredByResumed.length, 1)
+  assert.match(steeredByResumed[0].content[0].text, /Resume task after host restart/)
+
+  rt2.monitorDaemons.get('sess-restart')?.stop()
+}
+
+async function test_query_visible_posts_single_pass_channel_replay() {
+  const store = new SwarmStore(path.join(tempRoot, 'single-pass-channels'))
+  store.initSwarm('sw-ch', { title: 'Single Pass Channel Replay', concurrency_confirmed: true })
+  store.registerMemberWithBrief('sw-ch', {
+    name: 'dev-1',
+    session_id: 'sw-ch__dev-1',
+    role: 'worker',
+    brief: '[OWNERSHIP] a\n[FORBIDDEN] b\n[DONE_CRITERIA] c',
+  })
+  store.appendBoardRecord('sw-ch', { type: 'control', action: 'channel.create', agent: 'coordinator', channel: 'backend' })
+  // Post before dev-1 subscribes -> NOT visible to dev-1
+  const pBeforeSub = store.appendBoardRecord('sw-ch', { type: 'post', agent: 'coordinator', channel: 'backend', title: 'Hidden before sub', text: 'secret before subscribe' })
+  store.appendBoardRecord('sw-ch', { type: 'control', action: 'channel.subscribe', agent: 'coordinator', target: 'dev-1', channel: 'backend' })
+  // Post while subscribed -> visible
+  const pWhileSub = store.appendBoardRecord('sw-ch', { type: 'post', agent: 'coordinator', channel: 'backend', title: 'Visible while sub', text: 'visible while subscribed' })
+  // Append 250 filler posts on main to verify fast O(N) scan
+  for (let i = 0; i < 250; i += 1) {
+    store.appendBoardRecord('sw-ch', { type: 'post', agent: 'coordinator', channel: 'main', title: `Batch progress floor ${i}`, text: `progress item ${i}` })
+  }
+  store.appendBoardRecord('sw-ch', { type: 'control', action: 'channel.unsubscribe', agent: 'coordinator', target: 'dev-1', channel: 'backend' })
+  // Post after unsubscribe -> NOT visible
+  const pAfterUnsub = store.appendBoardRecord('sw-ch', { type: 'post', agent: 'coordinator', channel: 'backend', title: 'Hidden after unsub', text: 'hidden after unsubscribe' })
+
+  const visible = store.queryVisiblePosts('sw-ch', 'dev-1', 0)
+  const visibleSeqs = new Set(visible.map(r => r.seq))
+  assert.equal(visibleSeqs.has(pBeforeSub.seq), false)
+  assert.equal(visibleSeqs.has(pWhileSub.seq), true)
+  assert.equal(visibleSeqs.has(pAfterUnsub.seq), false)
 }
 
 async function test_plugin_runtime_contains_zero_cjk_characters() {
@@ -3252,6 +3698,11 @@ try {
   await runTest('test_log_export_normal_conversation_epochs_zip_and_timeline', test_log_export_normal_conversation_epochs_zip_and_timeline)
   await runTest('test_log_export_swarm_blackboard_members_and_context_telemetry', test_log_export_swarm_blackboard_members_and_context_telemetry)
   await runTest('test_client_registers_export_header_utility_slot_and_builds_urls', test_client_registers_export_header_utility_slot_and_builds_urls)
+  await runTest('test_multi_worker_merge_gate_target_scoping_and_stale_approval_hash', test_multi_worker_merge_gate_target_scoping_and_stale_approval_hash)
+  await runTest('test_watchdog_multi_member_no_starvation_and_sleep_grace', test_watchdog_multi_member_no_starvation_and_sleep_grace)
+  await runTest('test_validators_require_recipient_for_lore_master_and_custom_roles', test_validators_require_recipient_for_lore_master_and_custom_roles)
+  await runTest('test_restart_recovery_restarts_watchdog_and_lazy_resumes_members', test_restart_recovery_restarts_watchdog_and_lazy_resumes_members)
+  await runTest('test_query_visible_posts_single_pass_channel_replay', test_query_visible_posts_single_pass_channel_replay)
   await runTest('test_plugin_runtime_contains_zero_cjk_characters', test_plugin_runtime_contains_zero_cjk_characters)
 } finally {
   fs.rmSync(tempRoot, { recursive: true, force: true })

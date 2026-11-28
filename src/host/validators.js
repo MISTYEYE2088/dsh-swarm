@@ -521,17 +521,18 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
   const memberMentions = silent ? [] : [...resolvedMentions]
   const caller = existingMembers[callerName]
   const callerRole = caller?.role ?? 'worker'
+  const callerRoleSpec = getRoleSpec(callerRole)
   const isDonePost = text.includes('[done]') || kind === 'done'
   if (
     !silent
-    && (callerRole === 'worker' || callerRole === 'architect' || callerRole === 'verifier')
+    && callerRoleSpec.requireRecipientOnPost
     && memberMentions.length === 0
     && channelMentions.size === 0
     && !isDonePost
   ) {
-    const defaultTarget = callerRole === 'worker'
-      ? (activeNames.find(n => getRoleSpec(existingMembers[n]?.role).canBlockMerge) ?? 'coordinator')
-      : 'coordinator'
+    const defaultTarget = callerRoleSpec.canBlockMerge
+      ? 'coordinator'
+      : (activeNames.find(n => n !== callerName && getRoleSpec(existingMembers[n]?.role).canBlockMerge) ?? 'coordinator')
     return formatError(
       'post_board',
       `As ${callerRole} (@${callerName}), you must address at least one recipient (e.g. @${defaultTarget}), or explicitly pass "silent": true to log without waking anyone.`,
@@ -543,6 +544,29 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
         text: `@${defaultTarget} ${text}`,
       },
     )
+  }
+
+  let targetMember = null
+  if (args.target_member !== undefined && args.target_member !== null && String(args.target_member).trim() !== '') {
+    const rawTarget = String(args.target_member).replace(/^@/, '').trim()
+    if (rawTarget === '*') {
+      targetMember = '*'
+    } else {
+      const targetRec = existingMembers[rawTarget]
+      if (!targetRec) {
+        return formatError(
+          'post_board',
+          `target_member "@${rawTarget}" does not exist. Active members: ${rosterSummary} (or "*" for swarm-wide).`,
+          {
+            title,
+            mentions: memberMentions.length > 0 ? memberMentions : ['coordinator'],
+            target_member: '*',
+            text,
+          },
+        )
+      }
+      targetMember = rawTarget
+    }
   }
 
   const channel = typeof args.channel === 'string' && args.channel.trim()
@@ -583,6 +607,7 @@ export function validatePostBoard(args, existingMembers = {}, callerName = 'coor
       refs: Array.isArray(args.refs) ? args.refs.map(Number).filter(n => Number.isSafeInteger(n) && n >= 1) : [],
       kind,
       verdict,
+      target_member: targetMember,
       supersedes,
       escalate,
       silent,

@@ -195,6 +195,9 @@ export function registerRole(name, spec = {}) {
     requireParkOnStop: spec.requireParkOnStop !== undefined
       ? Boolean(spec.requireParkOnStop)
       : (prev ? prev.requireParkOnStop : roleName !== 'coordinator'),
+    requireRecipientOnPost: spec.requireRecipientOnPost !== undefined
+      ? Boolean(spec.requireRecipientOnPost)
+      : (prev ? prev.requireRecipientOnPost : roleName !== 'coordinator' && roleName !== 'monitor'),
     defaultProvider: spec.defaultProvider !== undefined
       ? String(spec.defaultProvider ?? '').trim()
       : (prev ? prev.defaultProvider : ''),
@@ -232,6 +235,7 @@ export function getRoleSpec(role) {
     autoShareInGit: false,
     priorityTier: key === 'monitor' ? 'low' : 'worker',
     requireParkOnStop: key !== 'coordinator' && key !== 'monitor',
+    requireRecipientOnPost: key !== 'coordinator' && key !== 'monitor',
     defaultProvider: '',
     defaultModel: '',
     preferredModelKeywords: Object.freeze([]),
@@ -256,6 +260,7 @@ registerRole('coordinator', {
   autoShareInGit: false,
   priorityTier: 'coordinator',
   requireParkOnStop: false,
+  requireRecipientOnPost: false,
   prompt: COORDINATOR_SOP_PROMPT,
 })
 registerRole('worker', {

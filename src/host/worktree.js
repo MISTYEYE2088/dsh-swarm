@@ -6,6 +6,7 @@
 //   command string). Every git invocation uses `spawn('git', [...argv], { shell: false, windowsHide: true })`.
 
 import { spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 
@@ -184,12 +185,16 @@ export async function diffWorktree({ worktreePath, baselineCommit }) {
     ? nameRes.stdout.split('\n').map(l => l.trim()).filter(Boolean)
     : []
   const patch = diffRes.ok ? diffRes.stdout : ''
+  const diffHash = diffRes.ok
+    ? createHash('sha256').update(patch, 'utf8').digest('hex').slice(0, 16)
+    : null
 
   return {
     ok: diffRes.ok,
     hasChanges: files.length > 0 || patch.trim().length > 0,
     files,
     patch,
+    diffHash,
     ...(diffRes.ok ? {} : { error: diffRes.stderr.trim() }),
   }
 }
@@ -208,6 +213,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
       hasChanges: diff.hasChanges,
       files: diff.files,
       patch: diff.patch,
+      diffHash: diff.diffHash,
     }
   }
   if (!diff.hasChanges) {
@@ -220,7 +226,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
     }
   }
 
-  const checkRes = await runGit(['apply', '--check', '--whitespace=nowarn', '-'], {
+  const checkRes = await runGit(['-c', 'core.autocrlf=false', 'apply', '--check', '--whitespace=nowarn', '-'], {
     cwd: mainCwd,
     input: diff.patch,
   })
@@ -234,7 +240,7 @@ export async function landWorktree({ mainCwd, worktreePath, baselineCommit, acti
     }
   }
 
-  const applyRes = await runGit(['apply', '--whitespace=nowarn', '-'], {
+  const applyRes = await runGit(['-c', 'core.autocrlf=false', 'apply', '--whitespace=nowarn', '-'], {
     cwd: mainCwd,
     input: diff.patch,
   })

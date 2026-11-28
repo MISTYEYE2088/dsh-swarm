@@ -133,11 +133,8 @@ export function readJsonlSync(filePath) {
   return records
 }
 
-// #FUNC Replay control frames up to `atSeq` to compute existing channels and member subscriptions.
-// #NOT  Does not trust cached channel lists as historical truth.
-// #EDGE-IN Archiving a channel removes it from active channels at later seqs → test_event_sourced_channels_replay
-// #WHY  `type === 'control'` frames allow the UI and router to reconstruct channel visibility at any historical floor.
-export function replayChannelsAt(records, atSeq = Infinity) {
+/** Create a mutable incremental channel/subscription tracker for single-pass board replay. */
+function createChannelTracker() {
   const activeChannels = new Set(['main'])
   const archivedChannels = new Set()
   const subscriptions = new Map()
@@ -147,38 +144,82 @@ export function replayChannelsAt(records, atSeq = Infinity) {
     return subscriptions.get(name)
   }
 
+  return {
+    activeChannels,
+    archivedChannels,
+    subscriptions,
+    ensureMember,
+    subscriptionSetOf(memberName) {
+      return subscriptions.get(memberName) ?? new Set(['main'])
+    },
+  }
+}
+
+/** Apply one board record onto an incremental channel tracker in O(1). */
+function applyChannelRecord(tracker, rec) {
+  if (!rec || typeof rec.seq !== 'number') return
+  if (rec.agent && typeof rec.agent === 'string') tracker.ensureMember(rec.agent)
+  if (rec.type !== 'control') return
+  const ch = typeof rec.channel === 'string' ? rec.channel.replace(/^#/, '') : ''
+  if (!ch || ch === 'main') return
+
+  if (rec.action === 'channel.create') {
+    tracker.archivedChannels.delete(ch)
+    tracker.activeChannels.add(ch)
+    if (rec.agent) tracker.ensureMember(rec.agent).add(ch)
+  } else if (rec.action === 'channel.subscribe') {
+    const target = rec.target || rec.agent
+    if (tracker.activeChannels.has(ch) && target) tracker.ensureMember(target).add(ch)
+  } else if (rec.action === 'channel.unsubscribe') {
+    const target = rec.target || rec.agent
+    if (target) tracker.ensureMember(target).delete(ch)
+  } else if (rec.action === 'channel.archive') {
+    tracker.activeChannels.delete(ch)
+    tracker.archivedChannels.add(ch)
+    for (const set of tracker.subscriptions.values()) set.delete(ch)
+  }
+}
+
+// #FUNC Replay control frames up to `atSeq` to compute existing channels and member subscriptions.
+// #NOT  Does not trust cached channel lists as historical truth.
+// #EDGE-IN Archiving a channel removes it from active channels at later seqs → test_event_sourced_channels_replay
+// #WHY  `type === 'control'` frames allow the UI and router to reconstruct channel visibility at any historical floor.
+export function replayChannelsAt(records, atSeq = Infinity) {
+  const tracker = createChannelTracker()
   for (const rec of records) {
     if (!rec || typeof rec.seq !== 'number' || rec.seq > atSeq) continue
-    if (rec.agent && typeof rec.agent === 'string') ensureMember(rec.agent)
-    if (rec.type !== 'control') continue
-    const ch = typeof rec.channel === 'string' ? rec.channel.replace(/^#/, '') : ''
-    if (!ch || ch === 'main') continue
-
-    if (rec.action === 'channel.create') {
-      archivedChannels.delete(ch)
-      activeChannels.add(ch)
-      if (rec.agent) ensureMember(rec.agent).add(ch)
-    } else if (rec.action === 'channel.subscribe') {
-      const target = rec.target || rec.agent
-      if (activeChannels.has(ch) && target) ensureMember(target).add(ch)
-    } else if (rec.action === 'channel.unsubscribe') {
-      const target = rec.target || rec.agent
-      if (target) ensureMember(target).delete(ch)
-    } else if (rec.action === 'channel.archive') {
-      activeChannels.delete(ch)
-      archivedChannels.add(ch)
-      for (const set of subscriptions.values()) set.delete(ch)
-    }
+    applyChannelRecord(tracker, rec)
   }
 
   return {
-    channels: [...activeChannels],
-    archived: [...archivedChannels],
+    channels: [...tracker.activeChannels],
+    archived: [...tracker.archivedChannels],
     subscriptionsOf(memberName) {
-      const set = subscriptions.get(memberName)
+      const set = tracker.subscriptions.get(memberName)
       return set ? [...set] : ['main']
     },
   }
+}
+
+/** Resolve target member name(s) for a review verdict post, defaulting to `['*']` for swarm-wide verdicts. */
+export function resolveVerdictTargets(rec, members = {}) {
+  if (!rec) return ['*']
+  if (typeof rec.target_member === 'string' && rec.target_member.trim()) {
+    return [rec.target_member.replace(/^@/, '').trim()]
+  }
+  const matched = []
+  for (const raw of (rec.mentions ?? [])) {
+    const name = String(raw ?? '').replace(/^@/, '').trim()
+    if (!name || name === 'coordinator' || name === 'all' || name === 'monitor' || name === rec.agent) continue
+    if (!members[name]) continue
+    if (!matched.includes(name)) matched.push(name)
+  }
+  if (matched.length === 0) return ['*']
+  const nonGate = matched.filter((name) => {
+    const m = members[name]
+    return !(m.can_block_merge === true || getRoleSpec(m.role).canBlockMerge)
+  })
+  return nonGate.length > 0 ? nonGate : matched
 }
 
 /** Extract `@name` and `@#channel` mentions from markdown text. */
@@ -725,6 +766,15 @@ export class SwarmStore {
         kind: entry.kind ?? 'report',
         title: resolvedTitle,
         ...(entry.verdict && VALID_VERDICTS.includes(entry.verdict) ? { verdict: entry.verdict } : {}),
+        ...(typeof entry.target_member === 'string' && entry.target_member.trim()
+          ? { target_member: entry.target_member.replace(/^@/, '').trim() }
+          : {}),
+        ...(typeof entry.reviewed_diff_hash === 'string' && entry.reviewed_diff_hash.trim()
+          ? { reviewed_diff_hash: entry.reviewed_diff_hash.trim() }
+          : {}),
+        ...(entry.reviewed_diff_hashes && typeof entry.reviewed_diff_hashes === 'object' && Object.keys(entry.reviewed_diff_hashes).length > 0
+          ? { reviewed_diff_hashes: entry.reviewed_diff_hashes }
+          : {}),
         ...(supersedes.length > 0 ? { supersedes } : {}),
         ...(entry.escalate === true ? { escalate: true } : {}),
         ...(entry.silent === true ? { silent: true } : {}),
@@ -833,12 +883,15 @@ export class SwarmStore {
     return { member: this.readMembers(swarmId)[spec.name], briefPost }
   }
 
-  /** Compute unresolved `[REJECT]` merge-gate blocks and per-reviewer consecutive reject streaks from `events.jsonl`. */
-  computeActiveRejections(swarmId) {
+  // #FUNC Compute unresolved `[REJECT]` merge-gate blocks and consecutive reject streaks keyed by `(reviewer, target_member)`.
+  // #NOT  Never lets approving `@worker-b` clear an open rejection against `@worker-a`, and never blocks `@worker-b` from landing because of `@worker-a`.
+  // #EDGE-IN Approving `@worker-b` preserves `@worker-a`'s active rejection and `targetMember` filtering lets `@worker-b` land cleanly → test_multi_worker_merge_gate_target_scoping_and_stale_approval_hash
+  // #WHY  Keying `byKey` by `${rec.agent}::${target}` isolates multi-worker review lifecycles while keeping global `'*'` verdicts backward-compatible.
+  computeActiveRejections(swarmId, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
     const supersededBy = computeSupersededMap(records)
-    const byReviewer = new Map()
+    const byKey = new Map()
     const rejectStreaks = new Map()
 
     for (const rec of records) {
@@ -854,28 +907,95 @@ export class SwarmStore {
       const isApprove = rec.verdict === 'approve'
         || (rec.kind === 'review' && (/\[VERDICT:\s*ALL\s*PASS\]/i.test(text) || /\[APPROVE\b/i.test(text)) && !/\[REJECT\b/i.test(text))
 
+      if (!isReject && !isApprove) continue
+      const targets = resolveVerdictTargets(rec, members)
+
       if (isReject) {
         if (!supersededBy.has(rec.seq)) {
-          const nextStreak = (rejectStreaks.get(rec.agent) ?? 0) + 1
-          rejectStreaks.set(rec.agent, nextStreak)
-          byReviewer.set(rec.agent, {
-            seq: rec.seq,
-            reviewer: rec.agent,
-            role: author.role,
-            title: rec.title || deriveFallbackTitle(text, 'Rejection'),
-            mentions: rec.mentions ?? [],
-            time: rec.time,
-            consecutive_rejects: nextStreak,
-            summary: text.slice(0, 180),
-          })
+          for (const target of targets) {
+            const key = `${rec.agent}::${target}`
+            const nextStreak = (rejectStreaks.get(key) ?? 0) + 1
+            rejectStreaks.set(key, nextStreak)
+            byKey.set(key, {
+              seq: rec.seq,
+              reviewer: rec.agent,
+              target_member: target,
+              role: author.role,
+              title: rec.title || deriveFallbackTitle(text, 'Rejection'),
+              mentions: rec.mentions ?? [],
+              time: rec.time,
+              consecutive_rejects: nextStreak,
+              summary: text.slice(0, 180),
+            })
+          }
         }
       } else if (isApprove) {
-        rejectStreaks.set(rec.agent, 0)
-        byReviewer.delete(rec.agent)
+        if (targets.includes('*')) {
+          const prefix = `${rec.agent}::`
+          for (const k of [...byKey.keys()]) {
+            if (k.startsWith(prefix)) byKey.delete(k)
+          }
+          for (const k of [...rejectStreaks.keys()]) {
+            if (k.startsWith(prefix)) rejectStreaks.set(k, 0)
+          }
+        } else {
+          for (const target of targets) {
+            const key = `${rec.agent}::${target}`
+            rejectStreaks.set(key, 0)
+            byKey.delete(key)
+          }
+        }
       }
     }
 
-    return [...byReviewer.values()]
+    const all = [...byKey.values()]
+    const filterTarget = typeof options.targetMember === 'string' && options.targetMember.trim()
+      ? options.targetMember.trim()
+      : null
+    if (!filterTarget) return all
+    return all.filter(r => r.target_member === '*' || r.target_member === filterTarget)
+  }
+
+  /** Detect latest active reviewer approvals for `targetMember` whose recorded `reviewed_diff_hash` no longer matches `currentDiffHash`. */
+  computeStaleApprovals(swarmId, targetMember, currentDiffHash) {
+    if (!targetMember || !currentDiffHash) return []
+    const records = this.readBoard(swarmId)
+    const members = this.readMembers(swarmId)
+    const supersededBy = computeSupersededMap(records)
+    const latestByReviewer = new Map()
+
+    for (const rec of records) {
+      if (!rec || rec.type === 'control' || supersededBy.has(rec.seq)) continue
+      const author = members[rec.agent]
+      if (!author || author.killed) continue
+      const canBlock = author.can_block_merge === true || getRoleSpec(author.role).canBlockMerge
+      if (!canBlock) continue
+      if (rec.verdict !== 'approve') continue
+
+      let recordedHash = null
+      if (rec.reviewed_diff_hashes && typeof rec.reviewed_diff_hashes[targetMember] === 'string') {
+        recordedHash = rec.reviewed_diff_hashes[targetMember]
+      } else if (typeof rec.reviewed_diff_hash === 'string' && rec.reviewed_diff_hash) {
+        const targets = resolveVerdictTargets(rec, members)
+        if (targets.includes(targetMember)) {
+          recordedHash = rec.reviewed_diff_hash
+        }
+      }
+      if (!recordedHash) continue
+
+      latestByReviewer.set(rec.agent, {
+        seq: rec.seq,
+        reviewer: rec.agent,
+        role: author.role,
+        target_member: targetMember,
+        approved_diff_hash: recordedHash,
+        current_diff_hash: currentDiffHash,
+        title: rec.title || deriveFallbackTitle(rec.text, 'Approval'),
+        time: rec.time,
+      })
+    }
+
+    return [...latestByReviewer.values()].filter(a => a.approved_diff_hash !== currentDiffHash)
   }
 
   // #FUNC Append a `plan.update` event to `events.jsonl` while enforcing the 64 KB zero-trust size limit.
@@ -998,7 +1118,10 @@ export class SwarmStore {
     return { wakeTargets, silentTargets }
   }
 
-  /** Query unread posts for `memberName` after `sinceSeq` on subscribed channels. */
+  // #FUNC Query unread posts for `memberName` after `sinceSeq` on subscribed channels in a single O(N) pass.
+  // #NOT  Never re-replays the full channel control history inside the per-record loop.
+  // #EDGE-IN Channel subscribe/unsubscribe/archive transitions across hundreds of posts produce identical visibility to point-in-time replay in O(N) time → test_query_visible_posts_single_pass_channel_replay
+  // #WHY  Updating `createChannelTracker` incrementally via `applyChannelRecord` removes the O(N^2) replay stall on long swarms.
   queryVisiblePosts(swarmId, memberName, sinceSeq = 0, options = {}) {
     const records = this.readBoard(swarmId)
     const members = this.readMembers(swarmId)
@@ -1008,17 +1131,19 @@ export class SwarmStore {
       ? options.wakeKinds
       : null
 
+    const tracker = createChannelTracker()
     const results = []
     for (const rec of records) {
-      if (!rec || rec.seq <= sinceSeq) continue
+      if (!rec) continue
+      applyChannelRecord(tracker, rec)
+      if (rec.seq <= sinceSeq) continue
       if (rec.type === 'control') {
         if (!mentionsOnly && !wakeKinds) results.push(rec)
         continue
       }
       if (mentionsOnly && rec.silent === true) continue
 
-      const channelState = replayChannelsAt(records, rec.seq)
-      const subs = new Set(channelState.subscriptionsOf(memberName))
+      const subs = tracker.subscriptionSetOf(memberName)
       const directMention = (rec.mentions ?? []).includes(memberName)
         || (member?.group && (rec.mentions ?? []).includes(member.group))
         || ((rec.mentions ?? []).includes('all') && member?.role !== 'monitor')

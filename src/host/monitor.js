@@ -37,7 +37,7 @@ export function detectMemberHealthIssues({
   for (const [name, member] of Object.entries(members)) {
     if (!member || member.killed || member.role === 'coordinator' || member.role === 'monitor') continue
     const liveness = typeof getMemberLiveness === 'function'
-      ? getMemberLiveness(name, member)
+      ? getMemberLiveness(name, member, { nowMs, startupGraceMs: startupTimeoutMs })
       : statusOf(member, { nowMs, startupGraceMs: startupTimeoutMs })
 
     if (member.last_error || liveness.status === 'error') {
@@ -105,6 +105,7 @@ export function detectSwarmStall({
   getMemberLiveness,
   nowMs = Date.now(),
   startupTimeoutMs = DEFAULT_STARTUP_GRACE_MS,
+  skipSignatures = null,
 }) {
   const swarm = store.readSwarm(swarmId)
   if (!swarm || swarm.status !== 'ACTIVE') {
@@ -129,23 +130,25 @@ export function detectSwarmStall({
     startupTimeoutMs,
   })
   if (healthIssues.length > 0) {
-    const first = healthIssues[0]
+    const selected = (skipSignatures instanceof Set)
+      ? (healthIssues.find(issue => !skipSignatures.has(issue.signature)) ?? healthIssues[0])
+      : healthIssues[0]
     return {
       stalled: true,
-      kind: first.kind,
-      memberName: first.memberName,
-      target: first.target,
-      seq: first.seq || latestPost?.seq || 0,
-      signature: first.signature,
-      title: first.title,
-      prompt: first.prompt,
+      kind: selected.kind,
+      memberName: selected.memberName,
+      target: selected.target,
+      seq: selected.seq || latestPost?.seq || 0,
+      signature: selected.signature,
+      title: selected.title,
+      prompt: selected.prompt,
     }
   }
 
   for (const [name, member] of Object.entries(members)) {
     if (member.killed || member.role === 'monitor') continue
     const liveness = typeof getMemberLiveness === 'function'
-      ? getMemberLiveness(name, member)
+      ? getMemberLiveness(name, member, { nowMs, startupGraceMs: startupTimeoutMs })
       : statusOf(member, { nowMs, startupGraceMs: startupTimeoutMs })
     if (liveness.status === 'working' || liveness.status === 'queued') {
       return {
@@ -284,6 +287,8 @@ export class SwarmMonitorDaemon {
     this.quietTicks = 0
     this.alertsPosted = 0
     this.lastCheckAt = null
+    this.lastHealthTickMs = null
+    this.sleepGraceBonusMs = 0
     this.lastSeenHeadSeq = this.store ? this.store.headSeq(this.swarmId) : 0
     this.sleeping = false
     this.timer = null
@@ -345,127 +350,162 @@ export class SwarmMonitorDaemon {
     }
   }
 
-  // #FUNC Run one fast per-member health inspection, auto-resuming single `unparked_idle` slips and escalating to board explanation + `@coordinator` when a member slips >=2 times within `UNPARKED_IDLE_WINDOW_MS` (10m).
-  // #NOT  Never spams repeated 30s board alerts during the same 10-minute window after escalating an `unparked_idle` member.
+  // #FUNC Run one fast per-member health inspection across all failing members, compensating for OS sleep jumps and auto-resuming/escalating `unparked_idle`, `zombie`, and `error` seats without alert starvation.
+  // #NOT  Never returns early on `issues[0]` suppression when `issues[1..N]` still need nudges or alerts, and never spams repeated 30s board alerts during the same 10-minute window.
   // #EDGE-IN Two `unparked_idle` hits by the same member within 10 minutes post a board alert requiring `@member` explanation and `@coordinator` decision, while a hit after >10 minutes resets cleanly to a direct auto-resume whip → test_blind_audit_alert_two_round_escalation_and_unparked_idle_whip
-  // #WHY  Tracking per-member `unparkedIdleHits` across `UNPARKED_IDLE_WINDOW_MS` catches models that argue with a 30s auto-resume whip and drop unparked again with an incremented turn count.
+  // #EDGE-IN When member A is already suppressed at `MAX_NUDGES_PER_STALL` or in its 10m cooldown, `healthTick` still alerts for member B in the same tick → test_watchdog_multi_member_no_starvation_and_sleep_grace
+  // #EDGE-IN A wall-clock jump exceeding `healthIntervalMs * 4` extends `sleepGraceBonusMs` so a waking laptop does not false-flag `starting` members as `zombie` → test_watchdog_multi_member_no_starvation_and_sleep_grace
+  // #WHY  Iterating all `issues` with `sleepGraceBonusMs` prevents one suppressed member from starving sibling alerts and prevents host sleep pauses from triggering false zombie kills.
   async healthTick(nowMs = Date.now()) {
     if (this.sleeping) return { action: 'sleeping' }
+    if (this.lastHealthTickMs !== null) {
+      const tickDelta = nowMs - this.lastHealthTickMs
+      if (tickDelta > this.healthIntervalMs * 4) {
+        this.sleepGraceBonusMs += (tickDelta - this.healthIntervalMs)
+      }
+    }
+    this.lastHealthTickMs = nowMs
     this.lastCheckAt = new Date(nowMs).toISOString()
+
+    const effectiveStartupTimeoutMs = this.startupTimeoutMs + this.sleepGraceBonusMs
     const issues = detectMemberHealthIssues({
       store: this.store,
       swarmId: this.swarmId,
       getMemberLiveness: this.getMemberLiveness,
       nowMs,
-      startupTimeoutMs: this.startupTimeoutMs,
+      startupTimeoutMs: effectiveStartupTimeoutMs,
     })
     if (issues.length === 0) return { action: 'healthy' }
 
-    const first = issues[0]
-    if (first.kind === 'member_unparked_idle') {
-      const lastEscAt = this.unparkedIdleEscalatedAt.get(first.memberName)
-      if (lastEscAt !== undefined && (nowMs - lastEscAt) <= this.unparkedIdleWindowMs) {
-        return {
-          action: 'suppressed_duplicate',
-          kind: first.kind,
-          memberName: first.memberName,
-          signature: first.signature,
+    const handled = []
+    const suppressed = []
+
+    for (const issue of issues) {
+      if (issue.kind === 'member_unparked_idle') {
+        const lastEscAt = this.unparkedIdleEscalatedAt.get(issue.memberName)
+        if (lastEscAt !== undefined && (nowMs - lastEscAt) <= this.unparkedIdleWindowMs) {
+          suppressed.push({
+            action: 'suppressed_duplicate',
+            kind: issue.kind,
+            memberName: issue.memberName,
+            signature: issue.signature,
+          })
+          continue
         }
-      }
 
-      const recentHits = (this.unparkedIdleHits.get(first.memberName) ?? [])
-        .filter(ts => (nowMs - ts) <= this.unparkedIdleWindowMs)
-      recentHits.push(nowMs)
-      this.unparkedIdleHits.set(first.memberName, recentHits)
+        const recentHits = (this.unparkedIdleHits.get(issue.memberName) ?? [])
+          .filter(ts => (nowMs - ts) <= this.unparkedIdleWindowMs)
+        recentHits.push(nowMs)
+        this.unparkedIdleHits.set(issue.memberName, recentHits)
 
-      if (recentHits.length === 1 && typeof this.onAutoNudge === 'function') {
-        const nudged = await this.onAutoNudge(first.memberName, first.nudgePrompt ?? null)
-        if (nudged) {
-          return {
-            action: 'auto_nudged_unparked_idle',
-            memberName: first.memberName,
-            signature: first.signature,
-            hitsInWindow: 1,
+        if (recentHits.length === 1 && typeof this.onAutoNudge === 'function') {
+          const nudged = await this.onAutoNudge(issue.memberName, issue.nudgePrompt ?? null)
+          if (nudged) {
+            handled.push({
+              action: 'auto_nudged_unparked_idle',
+              memberName: issue.memberName,
+              signature: issue.signature,
+              hitsInWindow: 1,
+            })
+            continue
           }
         }
+
+        this.unparkedIdleEscalatedAt.set(issue.memberName, nowMs)
+        this.unparkedIdleHits.delete(issue.memberName)
+
+        if (typeof this.onPostStall === 'function') {
+          this.alertsPosted += 1
+          await this.onPostStall({
+            target: issue.target,
+            targets: issue.targets ?? [issue.target, issue.memberName],
+            title: issue.title,
+            text: issue.prompt,
+            kind: 'alert',
+            escalate: true,
+            refs: issue.seq > 0 ? [issue.seq] : [],
+            signature: issue.signature,
+            attempt: recentHits.length,
+          })
+          this.lastSeenHeadSeq = this.store.headSeq(this.swarmId)
+        }
+
+        handled.push({
+          action: 'health_alert',
+          kind: issue.kind,
+          memberName: issue.memberName,
+          target: issue.target,
+          targets: issue.targets ?? [issue.target, issue.memberName],
+          signature: issue.signature,
+          hitsInWindow: recentHits.length,
+          attempt: recentHits.length,
+        })
+        continue
       }
 
-      this.unparkedIdleEscalatedAt.set(first.memberName, nowMs)
-      this.unparkedIdleHits.delete(first.memberName)
+      if (
+        issue.kind === 'member_zombie'
+        && !this.autoNudgedZombies.has(issue.signature)
+        && typeof this.onAutoNudge === 'function'
+      ) {
+        this.autoNudgedZombies.add(issue.signature)
+        const nudged = await this.onAutoNudge(issue.memberName, issue.nudgePrompt ?? null)
+        if (nudged) {
+          handled.push({
+            action: 'auto_nudged_zombie',
+            memberName: issue.memberName,
+            signature: issue.signature,
+          })
+          continue
+        }
+      }
+
+      const prevCount = this.nudgeCounts.get(issue.signature) ?? 0
+      if (prevCount >= MAX_NUDGES_PER_STALL) {
+        suppressed.push({
+          action: 'suppressed_duplicate',
+          kind: issue.kind,
+          memberName: issue.memberName,
+          signature: issue.signature,
+          count: prevCount + 1,
+        })
+        continue
+      }
+
+      const count = prevCount + 1
+      this.nudgeCounts.set(issue.signature, count)
 
       if (typeof this.onPostStall === 'function') {
         this.alertsPosted += 1
         await this.onPostStall({
-          target: first.target,
-          targets: first.targets ?? [first.target, first.memberName],
-          title: first.title,
-          text: first.prompt,
+          target: issue.target,
+          targets: issue.targets,
+          title: issue.title,
+          text: issue.prompt,
           kind: 'alert',
           escalate: true,
-          refs: first.seq > 0 ? [first.seq] : [],
-          signature: first.signature,
-          attempt: recentHits.length,
+          refs: issue.seq > 0 ? [issue.seq] : [],
+          signature: issue.signature,
+          attempt: count,
         })
         this.lastSeenHeadSeq = this.store.headSeq(this.swarmId)
       }
 
-      return {
+      handled.push({
         action: 'health_alert',
-        kind: first.kind,
-        memberName: first.memberName,
-        target: first.target,
-        targets: first.targets ?? [first.target, first.memberName],
-        signature: first.signature,
-        hitsInWindow: recentHits.length,
-        attempt: recentHits.length,
-      }
-    }
-
-    if (
-      first.kind === 'member_zombie'
-      && !this.autoNudgedZombies.has(first.signature)
-      && typeof this.onAutoNudge === 'function'
-    ) {
-      this.autoNudgedZombies.add(first.signature)
-      const nudged = await this.onAutoNudge(first.memberName, first.nudgePrompt ?? null)
-      if (nudged) {
-        return {
-          action: 'auto_nudged_zombie',
-          memberName: first.memberName,
-          signature: first.signature,
-        }
-      }
-    }
-
-    const count = (this.nudgeCounts.get(first.signature) ?? 0) + 1
-    this.nudgeCounts.set(first.signature, count)
-    if (count > MAX_NUDGES_PER_STALL) {
-      return { action: 'suppressed_duplicate', signature: first.signature, count }
-    }
-
-    if (typeof this.onPostStall === 'function') {
-      this.alertsPosted += 1
-      await this.onPostStall({
-        target: first.target,
-        targets: first.targets,
-        title: first.title,
-        text: first.prompt,
-        kind: 'alert',
-        escalate: true,
-        refs: first.seq > 0 ? [first.seq] : [],
-        signature: first.signature,
+        kind: issue.kind,
+        memberName: issue.memberName,
+        target: issue.target,
+        signature: issue.signature,
         attempt: count,
       })
-      this.lastSeenHeadSeq = this.store.headSeq(this.swarmId)
     }
 
+    const primary = handled[0] ?? suppressed[0] ?? { action: 'healthy' }
     return {
-      action: 'health_alert',
-      kind: first.kind,
-      memberName: first.memberName,
-      target: first.target,
-      signature: first.signature,
-      attempt: count,
+      ...primary,
+      handled,
+      suppressed,
     }
   }
 
@@ -484,12 +524,18 @@ export class SwarmMonitorDaemon {
       this.lastSeenHeadSeq = headSeq
     }
 
+    const skipSignatures = new Set()
+    for (const [sig, cnt] of this.nudgeCounts.entries()) {
+      if (cnt >= MAX_NUDGES_PER_STALL) skipSignatures.add(sig)
+    }
+
     const diagnosis = detectSwarmStall({
       store: this.store,
       swarmId: this.swarmId,
       getMemberLiveness: this.getMemberLiveness,
       nowMs,
-      startupTimeoutMs: this.startupTimeoutMs,
+      startupTimeoutMs: this.startupTimeoutMs + this.sleepGraceBonusMs,
+      skipSignatures,
     })
 
     if (diagnosis.done) {

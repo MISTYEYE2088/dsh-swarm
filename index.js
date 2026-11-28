@@ -402,7 +402,7 @@ export function applyWith(ctx, config, deps = {}) {
       }
     },
 
-    getMemberLiveness(swarmId, memberName, memberRecord) {
+    getMemberLiveness(swarmId, memberName, memberRecord, opts = {}) {
       const raw = memberRecord ?? store.readMembers(swarmId)[memberName]
       if (!raw) return { status: 'unknown', stepSummary: null }
       const overlay = runtime.getMemberTelemetry(raw.session_id)
@@ -414,6 +414,8 @@ export function applyWith(ctx, config, deps = {}) {
         liveAgent,
         concurrencyGate,
         sessionEvents: events,
+        ...(typeof opts.nowMs === 'number' ? { nowMs: opts.nowMs } : {}),
+        ...(typeof opts.startupGraceMs === 'number' ? { startupGraceMs: opts.startupGraceMs } : {}),
       })
     },
 
@@ -899,6 +901,70 @@ export function applyWith(ctx, config, deps = {}) {
       return handle
     },
 
+    // #FUNC Lazily resume a persisted child member session via `agentsSvc.resume`, restoring `memberHandles`, `agentMembership`, and role setup after host restarts or model hot-swaps.
+    // #NOT  Never resumes killed members or the coordinator session, and returns null cleanly if `agentsSvc.resume` is unavailable.
+    // #EDGE-IN After a host restart with empty `memberHandles`, waking an active child member lazily calls `agentsSvc.resume` and delivers the board wakeup → test_restart_recovery_restarts_watchdog_and_lazy_resumes_members
+    // #WHY  Sharing `resumeMemberAgent` between `dispatchPostWakeups` and `hotSwapMemberModel` prevents restart-induced `unreachable` wakeups with zero duplicated resume setup.
+    async resumeMemberAgent({ swarmId, memberName, member, resolvedRoute = null, provider = null, model = null, rootAgent = null }) {
+      const members = store.readMembers(swarmId)
+      const m = member ?? members[memberName]
+      if (!m || m.killed || memberName === 'coordinator' || !m.session_id) return null
+
+      const resolvedRoot = rootAgent ?? ctx.get?.('agents')?.get?.(swarmId) ?? null
+      const agentsSvc = runtime.getService('agents', resolvedRoot)
+      if (!agentsSvc || typeof agentsSvc.resume !== 'function') return null
+
+      const swarmMeta = store.readSwarm(swarmId)
+      const effectiveRoute = resolvedRoute ?? await runtime.resolveModelRoute({
+        requestedProvider: provider ?? m.applied_provider,
+        requestedModel: model ?? m.applied_model,
+        role: m.role,
+        rootAgent: resolvedRoot,
+        swarmMeta,
+      })
+      const nextProvider = effectiveRoute.provider || provider || m.applied_provider
+      const nextModel = effectiveRoute.model || model || m.applied_model
+
+      const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
+      const rolePrompt = renderRolePrompt(m.role, {
+        memberName,
+        groupName: m.group ?? 'none',
+        workspaceMode: m.workspace_mode,
+        cwd: m.worktree_path ?? swarmMeta?.project_root ?? resolvedRoot?.session?.header?.cwd ?? process.cwd(),
+        briefSeq: m.brief_seq ?? 1,
+        brief: '',
+        lastReadSeq: m.last_read_seq ?? 0,
+        verifierName,
+      })
+      const resumed = await agentsSvc.resume({
+        resumeSessionId: m.session_id,
+        ...(resolvedRoot ? { parentAgent: resolvedRoot } : {}),
+        agentOptions: {
+          ...(nextProvider && nextProvider !== 'inherit' ? { provider: nextProvider } : {}),
+          ...(nextModel && nextModel !== 'inherit' ? { model: nextModel } : {}),
+          ...(effectiveRoute.maxTokens !== undefined ? { maxTokens: effectiveRoute.maxTokens } : {}),
+        },
+        setup: runtime.buildChildSetup({
+          swarmId,
+          memberName,
+          member: m,
+          rolePrompt,
+          resolvedRoute: effectiveRoute,
+          rootAgent: resolvedRoot,
+          isCreate: false,
+        }),
+      })
+      if (resumed?.agent) {
+        memberHandles.set(`${swarmId}:${memberName}`, resumed)
+        agentMembership.set(m.session_id, {
+          swarmId,
+          memberName,
+          role: m.role,
+        })
+      }
+      return resumed
+    },
+
     async dispatchPostWakeups(swarmId, postRecord) {
       const { wakeTargets, silentTargets } = store.resolveWakeRoutingForPost(swarmId, postRecord)
       const members = store.readMembers(swarmId)
@@ -923,7 +989,20 @@ export function applyWith(ctx, config, deps = {}) {
           continue
         }
         const handle = memberHandles.get(`${swarmId}:${targetName}`)
-        const liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
+        let liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
+
+        if (!liveAgent && targetName !== 'coordinator' && m.session_id) {
+          try {
+            const resumed = await runtime.resumeMemberAgent({
+              swarmId,
+              memberName: targetName,
+              member: m,
+            })
+            liveAgent = resumed?.agent ?? null
+          } catch (err) {
+            warn(`lazy resume for @${targetName} failed: ${String(err)}`)
+          }
+        }
 
         if (liveAgent && typeof liveAgent.steer === 'function') {
           store.updateMember(swarmId, targetName, curr => ({
@@ -945,9 +1024,12 @@ export function applyWith(ctx, config, deps = {}) {
             : ''
           let escalatePart = ''
           if (targetName === 'coordinator' && postRecord.verdict === 'reject') {
-            const rej = store.computeActiveRejections(swarmId).find(r => r.reviewer === postRecord.agent)
-            if (rej && rej.consecutive_rejects >= 2) {
-              escalatePart = `\n[ESCALATE_TO_HUMAN] @${postRecord.agent} rejected ${rej.consecutive_rejects} consecutive rounds—stop local patching and ask the user to arbitrate architecture/scope.`
+            const matchingRejs = store.computeActiveRejections(swarmId).filter(r => r.seq === postRecord.seq)
+            const maxStreak = matchingRejs.length > 0
+              ? Math.max(...matchingRejs.map(r => r.consecutive_rejects ?? 1))
+              : 0
+            if (maxStreak >= 2) {
+              escalatePart = `\n[ESCALATE_TO_HUMAN] @${postRecord.agent} rejected ${maxStreak} consecutive rounds—stop local patching and ask the user to arbitrate architecture/scope.`
             }
           }
           const wakeText = `[board] #${postRecord.seq} @${postRecord.agent} (${postRecord.kind}${chPart})${titlePart} -> read_board(since=${m.last_read_seq ?? 0})${anchorPart}${blindAuditPart}${escalatePart}`
@@ -1000,38 +1082,17 @@ export function applyWith(ctx, config, deps = {}) {
       }
 
       let memberAlive = false
-      if (agentsSvc && typeof agentsSvc.resume === 'function') {
-        const verifierName = Object.keys(members).find(n => !members[n].killed && members[n].role === 'verifier') ?? 'verifier'
-        const rolePrompt = renderRolePrompt(m.role, {
-          memberName,
-          groupName: m.group ?? 'none',
-          workspaceMode: m.workspace_mode,
-          cwd: m.worktree_path ?? swarmMeta?.project_root ?? rootAgent?.session?.header?.cwd ?? process.cwd(),
-          briefSeq: m.brief_seq ?? 1,
-          brief: '',
-          lastReadSeq: m.last_read_seq ?? 0,
-          verifierName,
-        })
-        const resumed = await agentsSvc.resume({
-          resumeSessionId: m.session_id,
-          ...(rootAgent ? { parentAgent: rootAgent } : {}),
-          agentOptions: {
-            ...(nextProvider ? { provider: nextProvider } : {}),
-            ...(nextModel ? { model: nextModel } : {}),
-            ...(resolvedRoute.maxTokens !== undefined ? { maxTokens: resolvedRoute.maxTokens } : {}),
-          },
-          setup: runtime.buildChildSetup({
-            swarmId,
-            memberName,
-            member: m,
-            rolePrompt,
-            resolvedRoute,
-            rootAgent,
-            isCreate: false,
-          }),
-        })
-        memberHandles.set(key, resumed)
-        memberAlive = Boolean(resumed?.agent)
+      const resumed = await runtime.resumeMemberAgent({
+        swarmId,
+        memberName,
+        member: m,
+        resolvedRoute,
+        provider: nextProvider,
+        model: nextModel,
+        rootAgent,
+      })
+      if (resumed?.agent) {
+        memberAlive = true
         resumed.agent.steer(
           buildSwarmSystemMessage(
             `[Swarm Model Switch] Your active model has been hot-swapped to ${nextProvider}/${nextModel} (reason: ${reason}). Call read_board({"since": ${m.last_read_seq ?? 0}}) and resume your unfinished work.`,
@@ -1094,12 +1155,20 @@ export function applyWith(ctx, config, deps = {}) {
         swarmId,
         intervalMs: settings.monitorIntervalMs,
         healthIntervalMs: settings.healthIntervalMs,
-        getMemberLiveness: (memberName, member) => runtime.getMemberLiveness(swarmId, memberName, member),
+        getMemberLiveness: (memberName, member, opts) => runtime.getMemberLiveness(swarmId, memberName, member, opts),
         onAutoNudge: async (memberName, customPrompt = null) => {
           const m = store.readMembers(swarmId)[memberName]
           if (!m || m.killed) return false
           const handle = memberHandles.get(`${swarmId}:${memberName}`)
-          const liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
+          let liveAgent = handle?.agent ?? ctx.get?.('agents')?.get?.(m.session_id)
+          if (!liveAgent && (m.turn_count ?? 0) > 0 && m.session_id) {
+            try {
+              const resumed = await runtime.resumeMemberAgent({ swarmId, memberName, member: m })
+              liveAgent = resumed?.agent ?? null
+            } catch (err) {
+              warn(`watchdog lazy resume for @${memberName} failed: ${String(err)}`)
+            }
+          }
           if (!liveAgent || typeof liveAgent.steer !== 'function') return false
           const msgText = customPrompt
             || `[Watchdog Auto-Nudge] You were assigned as @${memberName} (Brief #${m.brief_seq ?? 1}), but showed no activity after 60s. Call read_board({"since": 0}) and begin immediately.`
@@ -1381,18 +1450,29 @@ export function applyWith(ctx, config, deps = {}) {
     mountToolsOn(ctx.get('tools'))
   }
 
-  // Re-expose scoped Swarm tools automatically when an existing Swarm session is resumed
+  // Re-expose scoped Swarm tools & restart Watchdog automatically when an existing Swarm session is resumed
   const disposeAgentCreated = ctx.on('agent/created', (payload) => {
     const agent = payload?.agent
     if (!agent || typeof agent.id !== 'string') return
     if (store.exists(agent.id)) {
       runtime.activateCoordinatorMode(agent)
       runtime.enableSwarmToolsOnAgent(agent, 'coordinator')
+      if (store.readSwarm(agent.id)?.status === 'ACTIVE') {
+        runtime.ensureMonitorDaemon(agent.id)
+      }
       return
     }
     if (agent.id.includes('__')) {
-      const prefix = agent.id.split('__')[0]
-      if (prefix && store.exists(prefix)) {
+      const idx = agent.id.indexOf('__')
+      const prefix = agent.id.slice(0, idx)
+      const memberName = agent.id.slice(idx + 2)
+      if (prefix && memberName && store.exists(prefix)) {
+        const m = store.readMembers(prefix)[memberName]
+        agentMembership.set(agent.id, {
+          swarmId: prefix,
+          memberName,
+          role: m?.role ?? 'worker',
+        })
         runtime.enableSwarmToolsOnAgent(agent, 'worker')
       }
     }

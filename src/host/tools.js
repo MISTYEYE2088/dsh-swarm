@@ -10,6 +10,7 @@ import path from 'node:path'
 import {
   replayChannelsAt,
   replaySwarmEvents,
+  resolveVerdictTargets,
   extractScreenshotsFromPosts,
   computeSupersededMap,
   deriveFallbackTitle,
@@ -25,7 +26,7 @@ import {
 } from './validators.js'
 import { buildSwarmSystemMessage } from './stop-hook.js'
 import { getRoleSpec, getSpawnableRoles } from './prompts.js'
-import { runGit, createIsolatedWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
+import { runGit, createIsolatedWorktree, diffWorktree, landWorktree, removeIsolatedWorktree } from './worktree.js'
 import { formatCompactTokens } from './log-export.js'
 
 const TEXT_OUTPUT_SCHEMA = Object.freeze({
@@ -674,6 +675,7 @@ export function createSwarmTools(runtime) {
         channel: { type: 'string', description: 'Channel name (default: "main").' },
         kind: { type: 'string', enum: [...VALID_POST_KINDS], description: 'brief|report|question|review|decision|alert|done.' },
         verdict: { type: 'string', enum: [...VALID_VERDICTS], description: 'reject (blocks merge/done), approve, or override.' },
+        target_member: { type: 'string', description: 'Optional target member name for scoped review verdicts (e.g. "worker-a", or "*" for swarm-wide).' },
         supersedes: { type: 'array', items: { type: 'integer' }, description: 'Earlier floor numbers obsoleted by this post.' },
         escalate: { type: 'boolean', description: 'Bypass recipients\' wake_kinds filter.' },
         silent: { type: 'boolean', description: 'Log without waking anyone.' },
@@ -753,6 +755,44 @@ export function createSwarmTools(runtime) {
           ? `${val.text}\n\n[GATE_OVERRIDE by @${callerName}]: ${val.override_reason}`
           : val.text
 
+        let reviewedDiffHash = null
+        let reviewedDiffHashes = null
+        const callerRecord = existingMembers[callerName]
+        const callerCanBlock = Boolean(callerRecord && (callerRecord.can_block_merge === true || getRoleSpec(callerRecord.role).canBlockMerge))
+        if (val.verdict === 'approve' && callerCanBlock) {
+          const verdictTargets = resolveVerdictTargets(
+            { agent: callerName, target_member: val.target_member, mentions: val.mentions },
+            existingMembers,
+          )
+          if (verdictTargets.length === 1 && verdictTargets[0] !== '*') {
+            const tm = existingMembers[verdictTargets[0]]
+            if (tm && tm.workspace_mode !== 'inherit' && tm.worktree_path) {
+              const d = await diffWorktree({
+                worktreePath: tm.worktree_path,
+                baselineCommit: tm.baseline_tree || tm.base_commit,
+              })
+              if (d.ok && d.diffHash) reviewedDiffHash = d.diffHash
+            }
+          } else {
+            const candidates = verdictTargets.includes('*')
+              ? Object.entries(existingMembers)
+                  .filter(([, m]) => !m.killed && !m.landed && m.workspace_mode !== 'inherit' && m.worktree_path)
+                  .map(([n]) => n)
+              : verdictTargets
+            const hashMap = {}
+            for (const targetName of candidates) {
+              const tm = existingMembers[targetName]
+              if (!tm || tm.workspace_mode === 'inherit' || !tm.worktree_path) continue
+              const d = await diffWorktree({
+                worktreePath: tm.worktree_path,
+                baselineCommit: tm.baseline_tree || tm.base_commit,
+              })
+              if (d.ok && d.diffHash) hashMap[targetName] = d.diffHash
+            }
+            if (Object.keys(hashMap).length > 0) reviewedDiffHashes = hashMap
+          }
+        }
+
         const postRecord = store.appendBoardRecord(swarmId, {
           type: 'post',
           agent: callerName,
@@ -764,6 +804,9 @@ export function createSwarmTools(runtime) {
           refs: val.refs,
           kind: val.kind,
           verdict: val.verdict,
+          target_member: val.target_member,
+          reviewed_diff_hash: reviewedDiffHash,
+          reviewed_diff_hashes: reviewedDiffHashes,
           supersedes: val.supersedes,
           escalate: val.escalate,
           silent: val.silent,
@@ -828,8 +871,10 @@ export function createSwarmTools(runtime) {
 
         let consecutiveRejects = 0
         if (postRecord.verdict === 'reject') {
-          const activeRej = store.computeActiveRejections(swarmId).find(r => r.reviewer === callerName)
-          consecutiveRejects = activeRej?.consecutive_rejects ?? 1
+          const matchingRejs = store.computeActiveRejections(swarmId).filter(r => r.seq === postRecord.seq)
+          consecutiveRejects = matchingRejs.length > 0
+            ? Math.max(...matchingRejs.map(r => r.consecutive_rejects ?? 1))
+            : 1
         }
         const escalateHumanNote = consecutiveRejects >= 2
           ? `\n[ESCALATE_TO_HUMAN] @${callerName} reached ${consecutiveRejects} consecutive rejects—stop local patching and ask the user to arbitrate architecture/scope.`
@@ -1084,7 +1129,7 @@ export function createSwarmTools(runtime) {
         ? `Watchdog: ${wd.active ? 'ACTIVE' : 'SLEEPING'} (health=${wd.healthIntervalSec}s, stall=${wd.stallIntervalSec}s, alerts=${wd.alertsPosted}${wd.lastCheckAt ? ', last_check=' + wd.lastCheckAt : ''})`
         : 'Watchdog: standby'
       const rejLine = snap.activeRejections.length > 0
-        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}(${r.role}${r.consecutive_rejects >= 2 ? ', x' + r.consecutive_rejects + ' ESCALATE_TO_HUMAN' : ''}): ${r.title}`).join(', ')}`
+        ? `Active Merge-Gate Rejections (${snap.activeRejections.length}): ${snap.activeRejections.map(r => `#${r.seq} @${r.reviewer}${r.target_member && r.target_member !== '*' ? '->@' + r.target_member : ''}(${r.role}${r.consecutive_rejects >= 2 ? ', x' + r.consecutive_rejects + ' ESCALATE_TO_HUMAN' : ''}): ${r.title}`).join(', ')}`
         : 'Active Merge-Gate Rejections: none'
 
       const HIGH_TOOL_CALL_THRESHOLD = 80
@@ -1194,27 +1239,48 @@ export function createSwarmTools(runtime) {
         }
 
         if (args.action === 'apply') {
-          const activeRejections = store.computeActiveRejections(swarmId)
+          const activeRejections = store.computeActiveRejections(swarmId, { targetMember: targetName })
+          const preDiff = await diffWorktree({
+            worktreePath: member.worktree_path,
+            baselineCommit: member.baseline_tree || member.base_commit,
+          })
+          const staleApprovals = preDiff.ok && preDiff.diffHash
+            ? store.computeStaleApprovals(swarmId, targetName, preDiff.diffHash)
+            : []
           const overrideReason = typeof args.override_reason === 'string' && args.override_reason.trim()
             ? args.override_reason.trim()
             : null
-          if (activeRejections.length > 0 && !overrideReason) {
-            const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
+          if ((activeRejections.length > 0 || staleApprovals.length > 0) && !overrideReason) {
+            const parts = []
+            if (activeRejections.length > 0) {
+              const list = activeRejections.map(r => `#${r.seq} by @${r.reviewer} (${r.role}): ${r.title}`).join('; ')
+              parts.push(`unresolved rejection(s): [${list}]`)
+            }
+            if (staleApprovals.length > 0) {
+              const staleList = staleApprovals.map(a => `#${a.seq} by @${a.reviewer} (approved=${a.approved_diff_hash}, current=${a.current_diff_hash})`).join('; ')
+              parts.push(`stale approval(s) after post-review edits: [${staleList}]`)
+            }
             return {
               ok: false,
-              blocked_by_rejections: activeRejections,
-              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by unresolved rejection(s): [${list}]. Resolve and get verdict="approve", or pass override_reason to override.`,
+              ...(activeRejections.length > 0 ? { blocked_by_rejections: activeRejections } : {}),
+              ...(staleApprovals.length > 0 ? { stale_approvals: staleApprovals } : {}),
+              text: `[GATE_BLOCKED: swarm_land] Landing @${targetName} blocked by ${parts.join(' and ')}. Re-verify and post a fresh verdict="approve", or pass override_reason to override.`,
             }
           }
-          if (activeRejections.length > 0 && overrideReason) {
+          if ((activeRejections.length > 0 || staleApprovals.length > 0) && overrideReason) {
+            const refsList = [
+              ...activeRejections.map(r => '#' + r.seq),
+              ...staleApprovals.map(a => '#' + a.seq + '(stale)'),
+            ].join(', ')
             store.appendBoardRecord(swarmId, {
               type: 'post',
               agent: callerName,
               kind: 'decision',
               verdict: 'override',
+              target_member: targetName,
               silent: true,
               title: `Gate override: land @${targetName}`,
-              text: `[GATE_OVERRIDE] @${callerName} landed @${targetName} overriding rejection(s) ${activeRejections.map(r => '#' + r.seq).join(', ')}: ${overrideReason}`,
+              text: `[GATE_OVERRIDE] @${callerName} landed @${targetName} overriding gate block(s) ${refsList}: ${overrideReason}`,
             })
           }
         }
